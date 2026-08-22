@@ -674,39 +674,16 @@ local function classOf(g: any, s: any): string
 	return SEAM
 end
 
-local function ringsOfGrid(g: any, c: any, stats: any)
+-- The ring's NODES, before anything is fitted to them: ordered boundary cell
+-- centres, their class, and their integer lattice coordinates.
+--
+-- Extracted so the fit is not the only thing that can read a ring. LineFit
+-- consumes `lat` directly — integer cells are its whole contract, and it must
+-- see the same ring the fit sees, apex nodes and all, or it is being measured
+-- against different ground.
+local function ringNodesOf(g: any, c: any, stats: any)
 	local isBlock = not g.fallback and g.n ~= nil
 	local step = g.step
-
-	local toWorld
-	if isBlock then
-		-- A point in the host's face coordinates is a point ON the host's face
-		-- plane, so heights are exact by construction: nothing is sampled from a
-		-- neighbouring cell and a vertex cannot pick up a height from the wrong
-		-- side of a cliff.
-		toWorld = function(p: P2): Vector3
-			return g.origin + g.u * p.x + g.v * p.z
-		end
-	else
-		-- Fallback grid: coordinates are world XZ and the surface is not one
-		-- plane, so a point takes the height of the highest cell touching it.
-		toWorld = function(p: P2): Vector3
-			local iu, iv = math.floor(p.x / step), math.floor(p.z / step)
-			local bestY = nil
-			for du = -1, 1 do
-				for dv = -1, 1 do
-					local cell = g.index[(iu + du) .. ":" .. (iv + dv)]
-					if cell and (not bestY or cell.pos.Y > bestY) then bestY = cell.pos.Y end
-				end
-			end
-			return Vector3.new(p.x, bestY or 0, p.z)
-		end
-	end
-
-	-- is a point in the grid's own face coordinates on a live cell?
-	local function inMask(a: number, b: number): boolean
-		return g.index[math.floor(a / step) .. ":" .. math.floor(b / step)] ~= nil
-	end
 
 	local cliff = nil
 	if not isBlock then
@@ -715,10 +692,7 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 		end
 	end
 
-	-- A ring is built in the grid's 2D face coordinates and only converted to
-	-- world once outer-vs-hole is known, because a ring that could not be fitted
-	-- is treated differently depending on which it is.
-	local rings: {any} = {}
+	local out: {any} = {}
 	for _, loop in ipairs(traceMask(g.cells, g.index, cliff)) do
 		-- Ordered boundary cell CENTRES. A corner cell contributes two edges and
 		-- the duplicate carries no information, so collapse it.
@@ -771,7 +745,90 @@ local function ringsOfGrid(g: any, c: any, stats: any)
 			stats.edges += 1
 			stats[k] += 1
 		end
-		if #pts < 3 then continue end
+		if #pts >= 3 then
+			out[#out + 1] = { pts = pts, cls = cls, lat = lat, owner = owner }
+		end
+	end
+	return out
+end
+
+-- Every ring of every grid, as integer lattice cells plus the world position of
+-- each node. This is the fit's input, handed over unfitted.
+function Boundary.ringCells(localData: any, cfg: Config?)
+	local c = merged(cfg)
+	local stats = { edges = 0, seam = 0, wall = 0, drop = 0, apexNodes = 0 }
+	local out: {any} = {}
+	for part, g in pairs(localData.grids) do
+		local step = g.step
+		local isBlock = not g.fallback and g.n ~= nil
+		local toWorld
+		if isBlock then
+			toWorld = function(p: P2): Vector3 return g.origin + g.u * p.x + g.v * p.z end
+		else
+			toWorld = function(p: P2): Vector3
+				local iu, iv = math.floor(p.x / step), math.floor(p.z / step)
+				local bestY = nil
+				for du = -1, 1 do
+					for dv = -1, 1 do
+						local cell = g.index[(iu + du) .. ":" .. (iv + dv)]
+						if cell and (not bestY or cell.pos.Y > bestY) then bestY = cell.pos.Y end
+					end
+				end
+				return Vector3.new(p.x, bestY or 0, p.z)
+			end
+		end
+		for _, r in ipairs(ringNodesOf(g, c, stats)) do
+			local world = table.create(#r.pts)
+			for i, p in ipairs(r.pts) do world[i] = toWorld(p) end
+			out[#out + 1] = {
+				part = part, fallback = g.fallback,
+				lat = r.lat, cls = r.cls, world = world,
+			}
+		end
+	end
+	return { rings = out, stats = stats, config = c }
+end
+
+local function ringsOfGrid(g: any, c: any, stats: any)
+	local isBlock = not g.fallback and g.n ~= nil
+	local step = g.step
+
+	local toWorld
+	if isBlock then
+		-- A point in the host's face coordinates is a point ON the host's face
+		-- plane, so heights are exact by construction: nothing is sampled from a
+		-- neighbouring cell and a vertex cannot pick up a height from the wrong
+		-- side of a cliff.
+		toWorld = function(p: P2): Vector3
+			return g.origin + g.u * p.x + g.v * p.z
+		end
+	else
+		-- Fallback grid: coordinates are world XZ and the surface is not one
+		-- plane, so a point takes the height of the highest cell touching it.
+		toWorld = function(p: P2): Vector3
+			local iu, iv = math.floor(p.x / step), math.floor(p.z / step)
+			local bestY = nil
+			for du = -1, 1 do
+				for dv = -1, 1 do
+					local cell = g.index[(iu + du) .. ":" .. (iv + dv)]
+					if cell and (not bestY or cell.pos.Y > bestY) then bestY = cell.pos.Y end
+				end
+			end
+			return Vector3.new(p.x, bestY or 0, p.z)
+		end
+	end
+
+	-- is a point in the grid's own face coordinates on a live cell?
+	local function inMask(a: number, b: number): boolean
+		return g.index[math.floor(a / step) .. ":" .. math.floor(b / step)] ~= nil
+	end
+
+	-- A ring is built in the grid's 2D face coordinates and only converted to
+	-- world once outer-vs-hole is known, because a ring that could not be fitted
+	-- is treated differently depending on which it is.
+	local rings: {any} = {}
+	for _, node in ipairs(ringNodesOf(g, c, stats)) do
+		local pts, cls = node.pts, node.cls
 
 		-- A RING TOO THIN TO SURVIVE THE FIT. DESIGN.md step 8 warns about this
 		-- and the old implementation hit it on 165 of 169 holes: the two long
