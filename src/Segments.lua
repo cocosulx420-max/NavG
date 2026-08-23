@@ -190,4 +190,92 @@ function Segments.cutPoints(res: Result): { Vector3 }
 	return pts
 end
 
+--------------------------------------------------------------------------
+-- Looking at it
+--------------------------------------------------------------------------
+
+-- Draw the split polyline into `workspace.NVGN_Debug.Segments`.
+--
+-- ONE PART PER SEGMENT, drawn as the straight chord from its first node to its
+-- last -- so what is on screen is the FITTED line, not the ring it was fitted
+-- to. If a drawn bar visibly leaves the ring of nodes under it, that is the
+-- corridor tolerance being spent, and it is real, not a drawing artifact.
+--
+-- Colours are Boundary's, so this reads against the existing class view:
+-- red wall, blue drop, green seam. Corners are white balls and the class cuts
+-- are yellow ones, deliberately DIFFERENT shapes of information -- a white ball
+-- is a claim about the shape of the ground, a yellow one is only a change of
+-- label and is allowed to sit mid-straightaway.
+function Segments.visualize(res: Result, opts: any?, parent: Instance?): number
+	if typeof(opts) == "Instance" then parent = opts :: Instance; opts = nil end
+	local o = opts or {}
+	local classes = o.classes  -- e.g. { seam = false } to hide the seams
+	local thick = o.thickness or 0.28
+	local root = parent or workspace
+	local dbg = root:FindFirstChild("NVGN_Debug")
+	if not dbg then
+		dbg = Instance.new("Folder"); dbg.Name = "NVGN_Debug"; dbg.Parent = root
+	end
+	local old = dbg:FindFirstChild("Segments")
+	if old then old:Destroy() end
+	local folder = Instance.new("Folder"); folder.Name = "Segments"; folder.Parent = dbg
+
+	local COL = {
+		wall = Color3.fromRGB(255, 80, 80),
+		drop = Color3.fromRGB(80, 170, 255),
+		seam = Color3.fromRGB(90, 255, 120),
+	}
+	local n = 0
+
+	local function ball(pos: Vector3, size: number, col: Color3, name: string)
+		local b = Instance.new("Part")
+		b.Name = name
+		b.Shape = Enum.PartType.Ball
+		b.Size = Vector3.new(size, size, size)
+		b.Position = pos
+		b.Anchored = true; b.CanCollide = false; b.CanQuery = false; b.CanTouch = false
+		b.Material = Enum.Material.Neon; b.Color = col
+		b.Parent = folder
+		n += 1
+	end
+
+	for _, r in ipairs(res.rings) do
+		local world = r.ring.world
+		for _, sg in ipairs(r.segments) do
+			if classes and classes[sg.class] == false then continue end
+			local a, b = world[sg.i0], world[sg.i1]
+			local d = b - a
+			local len = d.Magnitude
+			-- A zero-length piece has no direction to build a CFrame from; it is
+			-- still worth seeing, as a dot.
+			if len < 1e-3 then
+				ball(a, thick * 2, COL[sg.class] or Color3.new(1, 1, 1), "dot")
+			else
+				local bar = Instance.new("Part")
+				bar.Name = sg.class
+				bar.Size = Vector3.new(thick, thick, len)
+				bar.CFrame = CFrame.lookAt(a + d * 0.5, b)
+				bar.Anchored = true; bar.CanCollide = false
+				bar.CanQuery = false; bar.CanTouch = false
+				bar.Material = Enum.Material.Neon
+				bar.Color = COL[sg.class] or Color3.new(1, 1, 1)
+				bar.Parent = folder
+				n += 1
+			end
+		end
+	end
+
+	if o.corners ~= false then
+		for _, p in ipairs(Segments.cornerPoints(res)) do
+			ball(p, 0.7, Color3.fromRGB(255, 255, 255), "corner")
+		end
+	end
+	if o.cuts ~= false then
+		for _, p in ipairs(Segments.cutPoints(res)) do
+			ball(p, 0.5, Color3.fromRGB(255, 225, 60), "cut")
+		end
+	end
+	return n
+end
+
 return Segments
