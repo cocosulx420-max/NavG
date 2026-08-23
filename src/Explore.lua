@@ -34,9 +34,33 @@
 -- The boundary is a node with a wall or a dropoff. There is no seam here and
 -- there is nothing to ignore later, because a seam is never counted.
 --
--- Geometry is judged in PLAN VIEW on the world XZ lattice at `step` -- integers,
--- so the corridor test stays exact. Y is carried on the output and is never part
--- of a decision. FLAGGED, NOT BLESSED: this is my choice, not a measured one.
+-- GEOMETRY IS JUDGED ON THE PART'S OWN LATTICE. This is the whole reason
+-- `LocalGrid` samples each block part on its own axes: a rotated part's rim
+-- lands on whole lattice lines, so there is no staircase to fit away and the
+-- integers are EXACT, not rounded.
+--
+-- An earlier version of this file rounded world positions onto one global XZ
+-- lattice instead, to keep the corridor test in integers. That threw the
+-- guarantee away and manufactured staircases out of straight lines: a measured
+-- 32-node run stepping a dead-straight (-0.99, +0.14) each time came out as
+-- (-29,-10) (-30,-10) (-31,-10) (-32,-9) ... and rule 2 broke it 1.45 cells off
+-- a chord it should have been exactly on. The rule was right; the input was a
+-- lie.
+--
+-- So: a run is measured in the lattice of the grid it STARTED on.
+--   * While the run stays on that part -- almost all of it -- coordinates are
+--     the cell's own `ui, vi`. Exact integers, zero rounding.
+--   * Where a run crosses onto another part there is no shared lattice, so the
+--     foreign node is converted into the run's frame. To keep that conversion
+--     from being the same half-cell lie at a smaller scale, every coordinate is
+--     carried at SUBDIV units per cell, so a converted node is off by at most
+--     1/(2*SUBDIV) of a cell instead of 1/2. Native coordinates stay exact --
+--     they are just multiplied by SUBDIV.
+--
+-- Everything stays integer, so the corridor test is still an exact cross product
+-- and identical input still gives byte-identical output.
+--
+-- Y is carried on the output and is never part of a decision.
 
 local Explore = {}
 
@@ -54,6 +78,10 @@ export type Config = {
 	probe: number?,      -- how far to explore a branch option before judging it
 	maxRuns: number?,    -- tripwire; default 4 runs per node
 }
+
+-- Sub-cell units. Native lattice coordinates are exact at any value; this only
+-- sets how finely a FOREIGN node lands when converted into the run's frame.
+local SUBDIV = 8
 
 local DEFAULT = {
 	minDot = -0.30,
@@ -91,6 +119,10 @@ export type World = {
 	drop: { boolean },
 	u: { Vector3? },        -- the owning grid's face axes, kept for drawing
 	nrm: { Vector3? },
+	gid: { number },        -- which grid owns this node
+	ui: { number },         -- its cell on THAT grid's lattice, exact
+	vi: { number },
+	frames: { any },        -- per-grid origin/u/v, to convert a foreign node
 	wallMask: { number },
 	dropMask: { number },
 	cell: { { x: number, z: number } },
@@ -114,7 +146,11 @@ function Explore.world(localData: any, cfg: Config?): World
 
 	local pos, out, wall, drop = {}, {}, {}, {}
 	local uAx, nAx, wMask, dMask = {}, {}, {}, {}
+	local gid, ui, vi = {}, {}, {}
+	local frames = {}
 	for _, g in pairs(localData.grids) do
+		frames[#frames + 1] = g
+		local gi = #frames
 		for _, cell in ipairs(g.cells) do
 			if cell.wall or cell.dropoff then
 				pos[#pos + 1] = cell.pos
@@ -127,18 +163,15 @@ function Explore.world(localData: any, cfg: Config?): World
 				nAx[#pos] = (not g.fallback) and g.n or nil
 				wMask[#pos] = cell.wallMask or 0
 				dMask[#pos] = cell.dropMask or 0
+				-- THE EXACT COORDINATES: the cell's own place on its own lattice
+				gid[#pos] = gi
+				ui[#pos] = cell.ui
+				vi[#pos] = cell.vi
 			end
 		end
 	end
 
 	local n = #pos
-	local cellOf = table.create(n)
-	for i = 1, n do
-		cellOf[i] = {
-			x = math.floor(pos[i].X / step + 0.5),
-			z = math.floor(pos[i].Z / step + 0.5),
-		}
-	end
 
 	local B = step * 1.5
 	local hash: { [string]: { number } } = {}
@@ -213,7 +246,31 @@ function Explore.world(localData: any, cfg: Config?): World
 
 	return { pos = pos, wall = wall, drop = drop, u = uAx, nrm = nAx,
 		wallMask = wMask, dropMask = dMask,
-		cell = cellOf, out = out, nbr = nbr, step = step, n = n }
+		gid = gid, ui = ui, vi = vi, frames = frames,
+		out = out, nbr = nbr, step = step, n = n }
+end
+
+--------------------------------------------------------------------------
+-- Coordinates, in the frame of whichever part the run started on
+--------------------------------------------------------------------------
+
+-- Native node: exact, just scaled to sub-cell units. Foreign node: projected
+-- onto the frame's own axes and rounded to the nearest sub-cell unit, which is
+-- the only place any rounding happens at all.
+local function coordIn(W: World, frame: number, i: number): (number, number)
+	if W.gid[i] == frame then
+		return W.ui[i] * SUBDIV, W.vi[i] * SUBDIV
+	end
+	local g = W.frames[frame]
+	local step = W.step
+	local p = W.pos[i]
+	if g.fallback or not g.u or not g.v or not g.origin then
+		return math.round(p.X / step * SUBDIV), math.round(p.Z / step * SUBDIV)
+	end
+	local rel = p - g.origin
+	local a = rel:Dot(g.u) / step - 0.5
+	local b = rel:Dot(g.v) / step - 0.5
+	return math.round(a * SUBDIV), math.round(b * SUBDIV)
 end
 
 --------------------------------------------------------------------------
@@ -237,21 +294,23 @@ end
 -- Rule 2. Every node of the run against the chord from the run's start to the
 -- candidate. Integer cross product against a rational tolerance, cross
 -- multiplied -- no floats in the decision, no square root taken.
-local function corridor(W: World, run: { number }, cand: number, tolNum: number, tolDen: number): (boolean, number?)
-	local a = W.cell[run[1]]
-	local k = W.cell[cand]
-	local dx, dz = k.x - a.x, k.z - a.z
+local function corridor(W: World, frame: number, run: { number }, cand: number, tolNum: number, tolDen: number): (boolean, number?)
+	local ax, az = coordIn(W, frame, run[1])
+	local kx, kz = coordIn(W, frame, cand)
+	local dx, dz = kx - ax, kz - az
 	if dx == 0 and dz == 0 then return false, nil end
 	local best, bestPos = -1, nil
 	for p = 2, #run do
-		local q = W.cell[run[p]]
-		local cr = dx * (q.z - a.z) - dz * (q.x - a.x)
+		local qx, qz = coordIn(W, frame, run[p])
+		local cr = dx * (qz - az) - dz * (qx - ax)
 		if cr < 0 then cr = -cr end
 		if cr > best then best, bestPos = cr, p end
 	end
 	if bestPos == nil then return false, nil end
+	-- The tolerance is in CELLS, so it is scaled to sub-cell units to match.
+	local tn = tolNum * SUBDIV
 	local dd = dx * dx + dz * dz
-	local fail = (best * best * tolDen * tolDen) > (tolNum * tolNum * dd)
+	local fail = (best * best * tolDen * tolDen) > (tn * tn * dd)
 	return fail, bestPos
 end
 
@@ -275,6 +334,9 @@ export type Run = {
 -- longest is the one the line continues along. A branch that immediately breaks
 -- is a different line arriving, and it is simply not taken.
 local function grow(W: World, start: number, cameFrom: number, c: any, probe: boolean?, walked: { [string]: boolean }?): Run
+	-- THE RUN'S FRAME is the lattice of the part it started on. It is fixed for
+	-- the life of the run, so the whole run is measured against one ruler.
+	local frame = W.gid[start]
 	local run = { start }
 	local used = { false, false, false, false }
 	local prev, cur = cameFrom, start
@@ -315,16 +377,22 @@ local function grow(W: World, start: number, cameFrom: number, c: any, probe: bo
 			nxt = bestJ
 		end
 
-		local a, b = W.cell[cur], W.cell[nxt]
-		local dx, dz = b.x - a.x, b.z - a.z
+		local ax, az = coordIn(W, frame, cur)
+		local bx, bz = coordIn(W, frame, nxt)
+		local dx, dz = bx - ax, bz - az
 
-		-- RULE 1, before committing.
-		if locked(used, dx, dz) then
+		-- RULE 1, before committing. A step within the frame's own part is
+		-- exactly +/-SUBDIV or 0; a converted one can carry a unit or two of
+		-- rounding, so anything under half a cell is not a direction.
+		local dead = SUBDIV // 2
+		local sx = (dx > dead) and 1 or ((dx < -dead) and -1 or 0)
+		local sz = (dz > dead) and 1 or ((dz < -dead) and -1 or 0)
+		if locked(used, sx, sz) then
 			return { nodes = run, reason = "dirlock" }
 		end
 
 		-- RULE 2, against the whole run behind.
-		local fail, bestPos = corridor(W, run, nxt, c.tolNum, c.tolDen)
+		local fail, bestPos = corridor(W, frame, run, nxt, c.tolNum, c.tolDen)
 		if fail then
 			local offset = (bestPos :: number) - 1
 			if offset < 2 then return { nodes = run, reason = "guard" } end
@@ -333,7 +401,7 @@ local function grow(W: World, start: number, cameFrom: number, c: any, probe: bo
 			return { nodes = cut, reason = "corridor" }
 		end
 
-		mark(used, dx, dz)
+		mark(used, sx, sz)
 		run[#run + 1] = nxt
 		seen[nxt] = true
 		prev, cur = cur, nxt
