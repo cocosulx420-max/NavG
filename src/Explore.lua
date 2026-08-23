@@ -203,7 +203,7 @@ end
 
 export type Run = {
 	nodes: { number },
-	reason: string,   -- "dirlock" | "corridor" | "guard" | "dead end" | "lap"
+	reason: string,   -- "dirlock" | "corridor" | "guard" | "dead end" | "probe" | "fork"
 }
 
 -- Grow one run from `start`, having arrived from `cameFrom` (0 = nowhere).
@@ -230,6 +230,12 @@ local function grow(W: World, start: number, cameFrom: number, c: any, probe: bo
 		local nxt: number
 		if #cands == 1 then
 			nxt = cands[1]
+		elseif probe then
+			-- A PROBE DOES NOT PROBE. It is measuring how far this option runs
+			-- before the pattern breaks, and hitting a fork is itself a reason to
+			-- stop measuring. Without this the recursion has no bottom -- it
+			-- overflowed the stack on the first real run.
+			return { nodes = run, reason = "fork" }
 		else
 			-- EXPLORE EACH ONE, take the one that goes furthest before breaking.
 			local bestLen, bestJ = -1, cands[1]
