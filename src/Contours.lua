@@ -248,7 +248,8 @@ function Contours.build(localData: any, cfg: Config?)
 		cellsDropped = 0, regionsDropped = 0,
 		traced = 0, kept = 0, discarded = 0,
 		closed = 0, open = 0, openAtEdge = 0,
-		sharedCells = 0, endpointTouching = 0,
+		sharedCells = 0, coincidentPositions = 0,
+		endpointTouching = 0, openDiagonalClose = 0,
 		histogram = {},
 	}
 
@@ -261,18 +262,38 @@ function Contours.build(localData: any, cfg: Config?)
 	end
 	stats.traced = #raw
 
-	-- Size floor, and the extents each grid spans, so an open chain can be
-	-- checked for ending where its part ends.
-	local extent = {}
+	-- An open boundary is legitimate where the FLOOR CONTINUES ONTO ANOTHER PART:
+	-- grids are per-part, so a contour that walks off the edge of its own part
+	-- has nowhere left to go on this lattice. The earlier version of this test
+	-- asked whether the endpoint sat on the grid's ui/vi bounding box, which is
+	-- only the same question for a part whose walkable area is a full rectangle
+	-- -- it called 13 perfectly ordinary endings suspicious.
+	local step = (localData.config and localData.config.step) or 1
+	local world = {}
+	local function bucketKey(p, dx, dy, dz)
+		return math.floor(p.X / step) + dx .. ":" .. math.floor(p.Y / step) + dy
+			.. ":" .. math.floor(p.Z / step) + dz
+	end
 	for _, g in ipairs(grids) do
-		local e = { minU = math.huge, maxU = -math.huge, minV = math.huge, maxV = -math.huge }
 		for _, cell in ipairs(g.cells) do
-			if cell.ui < e.minU then e.minU = cell.ui end
-			if cell.ui > e.maxU then e.maxU = cell.ui end
-			if cell.vi < e.minV then e.minV = cell.vi end
-			if cell.vi > e.maxV then e.maxV = cell.vi end
+			local k = bucketKey(cell.pos, 0, 0, 0)
+			local b = world[k]
+			if not b then b = {}; world[k] = b end
+			b[#b + 1] = { cell = cell, g = g }
 		end
-		extent[g] = e
+	end
+	local function continuesElsewhere(cell, g)
+		for dx = -1, 1 do for dy = -1, 1 do for dz = -1, 1 do
+			local b = world[bucketKey(cell.pos, dx, dy, dz)]
+			if b then
+				for _, e in ipairs(b) do
+					if e.g ~= g and (e.cell.pos - cell.pos).Magnitude <= step * 1.5 then
+						return true
+					end
+				end
+			end
+		end end end
+		return false
 	end
 
 	local contours: { Contour } = {}
@@ -286,29 +307,46 @@ function Contours.build(localData: any, cfg: Config?)
 				stats.closed = stats.closed + 1
 			else
 				stats.open = stats.open + 1
-				local e = extent[ct.grid]
-				local function onEdge(cell)
-					return cell.ui == e.minU or cell.ui == e.maxU
-						or cell.vi == e.minV or cell.vi == e.maxV
-				end
-				ct.atPartEdge = onEdge(ct.cells[1]) and onEdge(ct.cells[n])
+				local a, b = ct.cells[1], ct.cells[n]
+				ct.atPartEdge = continuesElsewhere(a, ct.grid) or continuesElsewhere(b, ct.grid)
 				if ct.atPartEdge then stats.openAtEdge = stats.openAtEdge + 1 end
+				-- A ring whose two ends meet diagonally. It IS closed as geometry,
+				-- but the closing step is not 4-connected, so it cannot be handed
+				-- over as a loop and is counted separately rather than as a defect.
+				local man = math.abs(a.ui - b.ui) + math.abs(a.vi - b.vi)
+				if man == 2 and a.ui ~= b.ui and a.vi ~= b.vi then
+					stats.openDiagonalClose = stats.openDiagonalClose + 1
+				end
 			end
 			contours[#contours + 1] = ct
 		end
 	end
 	stats.kept = #contours
 
-	-- The invariant this module exists to hold. Measured, not assumed.
+	-- THE INVARIANT, measured on cell identity. Two different parts can hold a
+	-- cell at the same world position -- grids are per-part and their lattices
+	-- do not line up -- so keying this on position measures lattice coincidence
+	-- and calls it an overlap. Measured: 5 positions coincide across parts while
+	-- the actual invariant holds at 0.
 	local claim = {}
 	for i, ct in ipairs(contours) do
 		for _, cell in ipairs(ct.cells) do
-			local k = string.format("%.3f,%.3f,%.3f", cell.pos.X, cell.pos.Y, cell.pos.Z)
-			if claim[k] and claim[k] ~= i then
+			if claim[cell] ~= nil and claim[cell] ~= i then
 				stats.sharedCells = stats.sharedCells + 1
-			else
-				claim[k] = i
 			end
+			claim[cell] = i
+		end
+	end
+
+	local seenPos = {}
+	for i, ct in ipairs(contours) do
+		for _, cell in ipairs(ct.cells) do
+			local k = string.format("%.3f,%.3f,%.3f", cell.pos.X, cell.pos.Y, cell.pos.Z)
+			local prev = seenPos[k]
+			if prev and prev ~= i then
+				stats.coincidentPositions = stats.coincidentPositions + 1
+			end
+			seenPos[k] = i
 		end
 	end
 
