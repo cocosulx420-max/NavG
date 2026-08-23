@@ -135,24 +135,64 @@ function Explore.world(localData: any, cfg: Config?): World
 		b[#b + 1] = i
 	end
 
+	-- Neighbours come in two kinds and the difference matters.
+	--
+	-- A DIAGONAL LINK HAS TO BE ADMITTED, or a boundary running at 45 degrees has
+	-- no links at all -- its neighbours sit at sqrt(2) and a 4-connected radius
+	-- cannot see them, so every node on it becomes an island.
+	--
+	-- BUT AN ADMITTED DIAGONAL IS ALSO A SHORTCUT ACROSS EVERY STAIRCASE JOG, and
+	-- those shortcuts let a walk step diagonally backwards, which trips rule 1 and
+	-- chops runs to nothing: without this the mean run was 4.1 nodes, with 680
+	-- dirlock breaks over 1475 runs.
+	--
+	-- THE CHORD RULE, and there is no tolerance in it: drop a diagonal link when
+	-- its two ends already share a 4-connected neighbour. Going the long way round
+	-- through that shared neighbour IS the chain; the diagonal is the shortcut.
 	local R = step * c.radius
-	local nbr = table.create(n)
+	local nearR = step * 1.05
+	local near, diag = table.create(n), table.create(n)
 	for i = 1, n do
 		local p = pos[i]
 		local bx, by, bz = math.floor(p.X/B), math.floor(p.Y/B), math.floor(p.Z/B)
-		local a = {}
+		near[i], diag[i] = {}, {}
 		for dx = -1, 1 do for dy = -1, 1 do for dz = -1, 1 do
 			local b = hash[(bx+dx) .. ":" .. (by+dy) .. ":" .. (bz+dz)]
 			if b then
 				for _, j in ipairs(b) do
-					if j ~= i and (pos[j] - p).Magnitude <= R then
-						if (not out[i]) or (not out[j]) or out[i]:Dot(out[j]) > c.minDot then
-							a[#a + 1] = j
+					if j ~= i then
+						local d = (pos[j] - p).Magnitude
+						if d <= R and ((not out[i]) or (not out[j]) or out[i]:Dot(out[j]) > c.minDot) then
+							if d <= nearR then
+								table.insert(near[i], j)
+							else
+								table.insert(diag[i], j)
+							end
 						end
 					end
 				end
 			end
 		end end end
+	end
+
+	local nearSet = table.create(n)
+	for i = 1, n do
+		local t = {}
+		for _, j in ipairs(near[i]) do t[j] = true end
+		nearSet[i] = t
+	end
+
+	local nbr = table.create(n)
+	for i = 1, n do
+		local a = {}
+		for _, j in ipairs(near[i]) do a[#a + 1] = j end
+		for _, j in ipairs(diag[i]) do
+			local chord = false
+			for k in pairs(nearSet[i]) do
+				if nearSet[j][k] then chord = true break end
+			end
+			if not chord then a[#a + 1] = j end
+		end
 		nbr[i] = a
 	end
 
