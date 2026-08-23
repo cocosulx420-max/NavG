@@ -39,9 +39,17 @@
 --   when its two ends already share a 4-connected neighbour. That link is a
 --   shortcut across a jog, not a link in the chain. No tolerance in it.
 --
--- Cut chains wherever the degree is not 2. A branch is a real place for a chain
--- to end: measured, the 157 branch nodes are planks and steps running into the
--- surface they sit on, which is a genuine T-join and not an artifact.
+-- A CHAIN RUNS THROUGH A BRANCH, it does not stop at one. Cutting at every
+-- branch looks principled and is not: it forced both ends of 257 open chains to
+-- be vertices -- an open chain's endpoints are vertices by LineFit's contract --
+-- and that alone doubled the corner count from 464 to 924 while producing 163
+-- two-node stubs. A branch is not a corner. It is a place where a THIRD line
+-- arrives, and the two lines that were already there carry straight on.
+--
+-- So at a branch, the arriving edge is paired with the edge that most nearly
+-- continues it, and the walk goes through. An edge with no such continuation --
+-- the plank actually running into the ground -- is the only thing that ends a
+-- chain there.
 --
 -- THE FIT IS IN PLAN VIEW. `LineFit` is 2D and integer by contract, and a chain
 -- that climbs a staircase is neither planar nor on any part's lattice -- there
@@ -65,12 +73,14 @@ export type Config = {
 	minDot: number?,       -- same-side threshold; plateau is [-0.50, -0.10]
 	nearMult: number?,     -- 4-connected radius, in steps
 	diagMult: number?,     -- 8-connected radius, in steps
+	throughDot: number?,   -- how straight an edge pair must be to walk through
 }
 
 local DEFAULT = {
 	minDot = -0.30,
 	nearMult = 1.05,
 	diagMult = 1.45,
+	throughDot = -0.5,
 }
 
 export type Node = {
@@ -219,62 +229,104 @@ function Chains.build(localData: any, cfg: Config?): Result
 	end
 	st.edges = st.edges // 2
 
-	-- WALK. Every edge belongs to exactly one chain. Start from the nodes that
-	-- are not plain chain interior -- endpoints and branches -- and walk each of
-	-- their edges until the next such node. Whatever edges are left over after
-	-- that are pure cycles with no branch anywhere on them.
+	-- PAIR THE EDGES AT EVERY BRANCH. Two edges continue each other when the
+	-- walk arrives along one and leaves along the other in nearly the same
+	-- direction, so the test is on the dot of the two outgoing directions:
+	-- -1 is dead straight through. Greedy, most-straight pair first, and an
+	-- edge stays unpaired if nothing continues it.
+	--
+	-- `throughDot` is the one number here. It is not doing fine work -- a
+	-- continuation is near -1 and an arriving third line is near 0 -- so
+	-- anywhere in the middle behaves the same.
+	local throughDot: number = c.throughDot or -0.5
+	local pairAt: { { [number]: number } } = {}
+	for i = 1, #nodes do
+		local a = adj[i]
+		pairAt[i] = {}
+		if #a >= 3 then
+			local dirs = {}
+			for k, j in ipairs(a) do
+				local d = nodes[j].pos - nodes[i].pos
+				dirs[k] = (d.Magnitude > 1e-6) and d.Unit or Vector3.zero
+			end
+			local cands = {}
+			for x = 1, #a do
+				for y = x + 1, #a do
+					cands[#cands + 1] = { x = x, y = y, dot = dirs[x]:Dot(dirs[y]) }
+				end
+			end
+			table.sort(cands, function(p1, p2) return p1.dot < p2.dot end)
+			local taken = {}
+			for _, cd in ipairs(cands) do
+				if cd.dot < throughDot and not taken[cd.x] and not taken[cd.y] then
+					taken[cd.x], taken[cd.y] = true, true
+					pairAt[i][a[cd.x]] = a[cd.y]
+					pairAt[i][a[cd.y]] = a[cd.x]
+				end
+			end
+		end
+	end
+
+	-- Where does the walk go, arriving at `cur` from `prev`?
+	local function stepFrom(prev: number, cur: number): number?
+		local a = adj[cur]
+		if #a == 2 then
+			local nxt = a[1]
+			if nxt == prev then nxt = a[2] end
+			return nxt
+		elseif #a >= 3 then
+			return pairAt[cur][prev]
+		end
+		return nil
+	end
+
+	-- WALK. Every edge belongs to exactly one chain. Start from the edges that
+	-- nothing continues -- a degree-1 end, or an unpaired edge at a branch --
+	-- then whatever is left over is a cycle.
 	local seenEdge: { [string]: boolean } = {}
 	local function edgeKey(a: number, b: number): string
 		return (a < b) and (a .. ":" .. b) or (b .. ":" .. a)
 	end
 	local chains: { Chain } = {}
 
-	for i = 1, #nodes do
-		if #adj[i] ~= 2 then
-			for _, first in ipairs(adj[i]) do
-				if not seenEdge[edgeKey(i, first)] then
-					seenEdge[edgeKey(i, first)] = true
-					local run = { i, first }
-					local prev, cur = i, first
-					while #adj[cur] == 2 do
-						local nxt = adj[cur][1]
-						if nxt == prev then nxt = adj[cur][2] end
-						local k = edgeKey(cur, nxt)
-						if seenEdge[k] then break end
-						seenEdge[k] = true
-						run[#run + 1] = nxt
-						prev, cur = cur, nxt
-					end
-					chains[#chains + 1] = { nodes = run, closed = false }
-					st.open += 1
-					if #run <= 3 then st.fragments += 1 end
-				end
-			end
+	local function walkFrom(i: number, first: number, closed: boolean)
+		seenEdge[edgeKey(i, first)] = true
+		local run = { i, first }
+		local prev, cur = i, first
+		while true do
+			local nxt = stepFrom(prev, cur)
+			if nxt == nil then break end
+			local k = edgeKey(cur, nxt)
+			if seenEdge[k] then break end
+			seenEdge[k] = true
+			prev, cur = cur, nxt
+			if closed and cur == i then break end
+			run[#run + 1] = cur
+		end
+		chains[#chains + 1] = { nodes = run, closed = closed }
+		if closed then st.cycles += 1 else
+			st.open += 1
+			if #run <= 3 then st.fragments += 1 end
 		end
 	end
 
 	for i = 1, #nodes do
-		if #adj[i] == 2 then
-			for _, first in ipairs(adj[i]) do
-				if not seenEdge[edgeKey(i, first)] then
-					seenEdge[edgeKey(i, first)] = true
-					local run = { i, first }
-					local prev, cur = i, first
-					while cur ~= i do
-						local nxt = adj[cur][1]
-						if nxt == prev then nxt = adj[cur][2] end
-						if not nxt then break end
-						local k = edgeKey(cur, nxt)
-						if seenEdge[k] then break end
-						seenEdge[k] = true
-						prev, cur = cur, nxt
-						if cur == i then break end
-						run[#run + 1] = cur
-					end
-					chains[#chains + 1] = { nodes = run, closed = true }
-					st.cycles += 1
+		local a = adj[i]
+		if #a == 1 then
+			if not seenEdge[edgeKey(i, a[1])] then walkFrom(i, a[1], false) end
+		elseif #a >= 3 then
+			for _, j in ipairs(a) do
+				-- an edge nothing continues is where a chain genuinely ends
+				if pairAt[i][j] == nil and not seenEdge[edgeKey(i, j)] then
+					walkFrom(i, j, false)
 				end
 			end
+		end
+	end
+	-- Anything still unwalked has no loose end anywhere on it: a cycle.
+	for i = 1, #nodes do
+		for _, j in ipairs(adj[i]) do
+			if not seenEdge[edgeKey(i, j)] then walkFrom(i, j, true) end
 		end
 	end
 	st.chains = #chains
