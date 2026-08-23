@@ -229,11 +229,11 @@ end
 -- boundary that forks.
 --
 -- Deterministic: candidates are ordered by (ui, vi), never by table order.
-local function traceGrid(g: any, keep: any, out: { Contour })
+local function traceGrid(g: any, keep: any, out: { Contour }, seam: any)
 	local boundary = {}
 	local list = {}
 	for k, c in pairs(keep) do
-		if c.wall or c.dropoff then
+		if (c.wall or c.dropoff) and not (seam and seam(c, g)) then
 			boundary[k] = c
 			list[#list + 1] = c
 		end
@@ -356,12 +356,29 @@ function Contours.build(localData: any, cfg: Config?)
 		histogram = {},
 	}
 
+	-- Every walkable cell keyed by world position, so a reported wall can be
+	-- checked against what is actually standing there.
+	local step = (localData.config and localData.config.step) or 1
+	local world = {}
+	for _, g in ipairs(grids) do
+		for _, cell in ipairs(g.cells) do
+			local k = math.floor(cell.pos.X / step) .. ":" .. math.floor(cell.pos.Y / step)
+				.. ":" .. math.floor(cell.pos.Z / step)
+			local b = world[k]
+			if not b then b = {}; world[k] = b end
+			b[#b + 1] = { cell = cell, g = g }
+		end
+	end
+	local function seam(cell, g)
+		return walledOnlyByRamp(cell, g, world, step)
+	end
+
 	local raw: { Contour } = {}
 	for _, g in ipairs(grids) do
 		local keep, dropped, regions = keepWideRegions(g, c.minWidthCells)
 		stats.cellsDropped = stats.cellsDropped + dropped
 		stats.regionsDropped = stats.regionsDropped + regions
-		traceGrid(g, keep, raw)
+		traceGrid(g, keep, raw, seam)
 	end
 	stats.traced = #raw
 
