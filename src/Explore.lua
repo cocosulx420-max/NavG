@@ -87,6 +87,8 @@ end
 
 export type World = {
 	pos: { Vector3 },
+	wall: { boolean },
+	drop: { boolean },
 	cell: { { x: number, z: number } },
 	out: { Vector3? },
 	nbr: { { number } },
@@ -106,12 +108,14 @@ function Explore.world(localData: any, cfg: Config?): World
 	if cfg then for k, v in pairs(cfg) do if v ~= nil then c[k] = v end end end
 	local step = c.step or (localData.config and localData.config.step) or 1
 
-	local pos, out = {}, {}
+	local pos, out, wall, drop = {}, {}, {}, {}
 	for _, g in pairs(localData.grids) do
 		for _, cell in ipairs(g.cells) do
 			if cell.wall or cell.dropoff then
 				pos[#pos + 1] = cell.pos
 				out[#pos] = facing(g, cell)
+				wall[#pos] = cell.wall or false
+				drop[#pos] = cell.dropoff or false
 			end
 		end
 	end
@@ -196,7 +200,7 @@ function Explore.world(localData: any, cfg: Config?): World
 		nbr[i] = a
 	end
 
-	return { pos = pos, cell = cellOf, out = out, nbr = nbr, step = step, n = n }
+	return { pos = pos, wall = wall, drop = drop, cell = cellOf, out = out, nbr = nbr, step = step, n = n }
 end
 
 --------------------------------------------------------------------------
@@ -419,7 +423,17 @@ end
 -- Looking at it
 --------------------------------------------------------------------------
 
-function Explore.visualize(res: Result, parent: Instance?): number
+-- The ordinary node view, with the corners called out.
+--
+-- Nodes carry LocalGrid's palette so this reads the same as the classes view --
+-- red wall, blue dropoff, purple both -- and a corner is the SAME node drawn
+-- green and a little larger. A corner is not a different kind of thing; it is
+-- one of these nodes that a rule stopped on, and it should look like that.
+function Explore.visualize(res: Result, opts: any?, parent: Instance?): number
+	if typeof(opts) == "Instance" then parent = opts :: Instance; opts = nil end
+	local o = opts or {}
+	local nodeSize = o.nodeSize or 0.9
+	local cornerSize = o.cornerSize or 1.25
 	local root = parent or workspace
 	local dbg = root:FindFirstChild("NVGN_Debug")
 	if not dbg then
@@ -428,15 +442,47 @@ function Explore.visualize(res: Result, parent: Instance?): number
 	local old = dbg:FindFirstChild("Explore")
 	if old then old:Destroy() end
 	local f = Instance.new("Folder"); f.Name = "Explore"; f.Parent = dbg
+
+	local WALL = Color3.fromRGB(255, 70, 70)
+	local DROP = Color3.fromRGB(70, 160, 255)
+	local BOTH = Color3.fromRGB(220, 90, 255)
+	local CORNER = Color3.fromRGB(0, 255, 90)
+
+	local W = res.world
 	local n = 0
-	for _, p in ipairs(res.corners) do
+
+	local function dot(pos: Vector3, size: number, col: Color3, name: string)
 		local b = Instance.new("Part")
-		b.Name = "corner"; b.Shape = Enum.PartType.Ball
-		b.Size = Vector3.new(0.8, 0.8, 0.8); b.Position = p
+		b.Name = name
+		b.Shape = Enum.PartType.Ball
+		b.Size = Vector3.new(size, size, size)
+		b.Position = pos
 		b.Anchored = true; b.CanCollide = false; b.CanQuery = false; b.CanTouch = false
-		b.Material = Enum.Material.Neon; b.Color = Color3.fromRGB(0, 255, 120)
+		b.Material = Enum.Material.Neon
+		b.Color = col
 		b.Parent = f
 		n += 1
+	end
+
+	-- A corner is identified by POSITION, because that is all `corners` carries.
+	-- Rounded to a tenth of a stud so a node and its own corner cannot miss each
+	-- other on a float comparison.
+	local isCorner: { [string]: boolean } = {}
+	local function key(p: Vector3): string
+		return string.format("%.1f:%.1f:%.1f", p.X, p.Y, p.Z)
+	end
+	for _, p in ipairs(res.corners) do isCorner[key(p)] = true end
+
+	for i = 1, W.n do
+		local p = W.pos[i]
+		if isCorner[key(p)] then
+			dot(p, cornerSize, CORNER, "corner")
+		else
+			local col = DROP
+			if W.wall[i] and W.drop[i] then col = BOTH
+			elseif W.wall[i] then col = WALL end
+			dot(p, nodeSize, col, "node")
+		end
 	end
 	return n
 end
