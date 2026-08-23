@@ -47,10 +47,6 @@
 local Contours = {}
 
 local DIR4 = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }
-local DIR8 = {
-	{ 1, 0 }, { 1, 1 }, { 0, 1 }, { -1, 1 },
-	{ -1, 0 }, { -1, -1 }, { 0, -1 }, { 1, -1 },
-}
 
 export type Config = {
 	-- A region must be at least this many cells wide to be traced.
@@ -155,57 +151,6 @@ end
 -- Tracing
 --------------------------------------------------------------------------
 
--- A WALL YOU CAN WALK UP IS NOT A WALL.
---
--- `LocalGrid` marks a cell as `wall` when a surface stands above it, and a ramp
--- meeting the floor does exactly that: measured at the base of the ClipRamp, the
--- ground cells are `wall = true` because the ramp rises 0.65 studs over one cell
--- beside them. That is a 33 degree slope, and this pipeline already calls
--- anything up to `maxSlope` (65 degrees) walkable -- you step straight onto it.
---
--- So it is not a wall, it is the seam where floor meets ramp, and a seam is not
--- a boundary. Tracing it produced short stubs along the ramp's foot duplicating
--- the clean line the ramp's own edge already gives.
---
--- A blocked direction is discounted when a WALKABLE cell sits where the block
--- was reported, within the slope the pipeline already accepts. A cell whose
--- every blocked direction is discounted that way is not on the boundary at all.
--- Drops are never discounted -- a drop is a drop.
-local function wallIsWalkable(cell, g, world, step, maxSlope)
-	local mask = cell.wallMask or 0
-	if mask == 0 then return false end
-	if (cell.dropMask or 0) ~= 0 then return false end
-	local tan = math.tan(math.rad(maxSlope))
-	for bit, d in ipairs(DIR8) do
-		if bit32.band(mask, bit32.lshift(1, bit - 1)) ~= 0 then
-			local off
-			if not g.fallback and g.u and g.v then
-				off = g.u * (d[1] * step) + g.v * (d[2] * step)
-			else
-				off = Vector3.new(d[1] * step, 0, d[2] * step)
-			end
-			local want = cell.pos + off
-			local found = false
-			local bx, by, bz = math.floor(want.X / step), math.floor(want.Y / step), math.floor(want.Z / step)
-			for dx = -1, 1 do for dy = -2, 2 do for dz = -1, 1 do
-				local b = world[(bx + dx) .. ":" .. (by + dy) .. ":" .. (bz + dz)]
-				if b then
-					for _, e in ipairs(b) do
-						local v = e.cell.pos - cell.pos
-						local horiz = Vector3.new(v.X, 0, v.Z).Magnitude
-						if horiz <= step * 1.5 and horiz > 0.01
-							and math.abs(v.Y) <= horiz * tan then
-							found = true
-						end
-					end
-				end
-			end end end
-			if not found then return false end
-		end
-	end
-	return true
-end
-
 -- Walk the boundary so that every cell lands in exactly one contour.
 --
 -- The old harness started a chain from every edge of every branch node, which
@@ -216,11 +161,11 @@ end
 -- boundary that forks.
 --
 -- Deterministic: candidates are ordered by (ui, vi), never by table order.
-local function traceGrid(g: any, keep: any, out: { Contour }, seam: any)
+local function traceGrid(g: any, keep: any, out: { Contour })
 	local boundary = {}
 	local list = {}
 	for k, c in pairs(keep) do
-		if (c.wall or c.dropoff) and not (seam and seam(c, g)) then
+		if c.wall or c.dropoff then
 			boundary[k] = c
 			list[#list + 1] = c
 		end
@@ -343,30 +288,12 @@ function Contours.build(localData: any, cfg: Config?)
 		histogram = {},
 	}
 
-	-- Every walkable cell on the map, keyed by world position, so a reported wall
-	-- can be checked against what is actually standing there.
-	local step = (localData.config and localData.config.step) or 1
-	local maxSlope = (localData.config and localData.config.maxSlope) or 65
-	local world = {}
-	for _, g in ipairs(grids) do
-		for _, cell in ipairs(g.cells) do
-			local k = math.floor(cell.pos.X / step) .. ":" .. math.floor(cell.pos.Y / step)
-				.. ":" .. math.floor(cell.pos.Z / step)
-			local b = world[k]
-			if not b then b = {}; world[k] = b end
-			b[#b + 1] = { cell = cell, g = g }
-		end
-	end
-	local function seam(cell, g)
-		return wallIsWalkable(cell, g, world, step, maxSlope)
-	end
-
 	local raw: { Contour } = {}
 	for _, g in ipairs(grids) do
 		local keep, dropped, regions = keepWideRegions(g, c.minWidthCells)
 		stats.cellsDropped = stats.cellsDropped + dropped
 		stats.regionsDropped = stats.regionsDropped + regions
-		traceGrid(g, keep, raw, seam)
+		traceGrid(g, keep, raw)
 	end
 	stats.traced = #raw
 
@@ -376,9 +303,19 @@ function Contours.build(localData: any, cfg: Config?)
 	-- asked whether the endpoint sat on the grid's ui/vi bounding box, which is
 	-- only the same question for a part whose walkable area is a full rectangle
 	-- -- it called 13 perfectly ordinary endings suspicious.
+	local step = (localData.config and localData.config.step) or 1
+	local world = {}
 	local function bucketKey(p, dx, dy, dz)
 		return math.floor(p.X / step) + dx .. ":" .. math.floor(p.Y / step) + dy
 			.. ":" .. math.floor(p.Z / step) + dz
+	end
+	for _, g in ipairs(grids) do
+		for _, cell in ipairs(g.cells) do
+			local k = bucketKey(cell.pos, 0, 0, 0)
+			local b = world[k]
+			if not b then b = {}; world[k] = b end
+			b[#b + 1] = { cell = cell, g = g }
+		end
 	end
 	local function continuesElsewhere(cell, g)
 		for dx = -1, 1 do for dy = -1, 1 do for dz = -1, 1 do
