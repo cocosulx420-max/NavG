@@ -21,7 +21,7 @@ local HandMarks = {}
 
 export type Mark = { name: string, pos: Vector3 }
 
-HandMarks.marks: {Mark} = {
+local MARKS: {Mark} = {
 	{ name = "case 6", pos = Vector3.new(-7.9453, 1.4319, 47.7335) },
 	{ name = "case1", pos = Vector3.new(-20.6635, 1.4319, 43.4620) },
 	{ name = "case2", pos = Vector3.new(-22.1944, 1.4319, 32.5690) },
@@ -42,12 +42,16 @@ HandMarks.marks: {Mark} = {
 	{ name = "w8_d0", pos = Vector3.new(-9.4548, 3.4319, 44.3028) },
 }
 
+-- A field cannot carry a type annotation in Luau, so the list is annotated as a
+-- local and then attached. It is the same table, not a copy.
+HandMarks.marks = MARKS
+
 -- How many marks have a point within `radius` studs. The corner stage's recall
 -- score, and the number to beat is 18.
 function HandMarks.score(points: {Vector3}, radius: number?): (number, {string})
 	local r = radius or 2.0
 	local hit, missed = 0, {}
-	for _, m in ipairs(HandMarks.marks) do
+	for _, m in ipairs(MARKS) do
 		local best = math.huge
 		for _, p in ipairs(points) do
 			local d = (p - m.pos).Magnitude
@@ -73,7 +77,7 @@ function HandMarks.restore(folder: Instance?): number
 	if not nc then return 0 end
 	local dots = nc:GetChildren()
 	local n = 0
-	for _, m in ipairs(HandMarks.marks) do
+	for _, m in ipairs(MARKS) do
 		local best, bd = nil, math.huge
 		for _, d in ipairs(dots) do
 			if d:IsA("BasePart") then
