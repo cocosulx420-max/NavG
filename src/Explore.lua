@@ -52,6 +52,7 @@ export type Config = {
 	tolNum: number?,
 	tolDen: number?,
 	probe: number?,      -- how far to explore a branch option before judging it
+	maxRuns: number?,    -- tripwire; default 4 runs per node
 }
 
 local DEFAULT = {
@@ -309,6 +310,11 @@ function Explore.corners(W: World, cfg: Config?): Result
 	-- gets walked exactly once; a run refuses an edge already walked, so a closed
 	-- boundary stops itself after one lap instead of re-finding the same corners
 	-- forever. That was the first version's bug and it hung Studio for 120s.
+	-- A TRIPWIRE, not a rule. Every run must claim at least one fresh edge, so
+	-- the sweep cannot need more runs than there are edges. If it ever does, the
+	-- termination invariant is broken and this stops in a second instead of
+	-- wedging Studio, which it did once and which costs the user their session.
+	local maxRuns = c.maxRuns or (W.n * 4)
 	local walked: { [string]: boolean } = {}
 	local touched = table.create(W.n, false)
 	local corners: { Vector3 } = {}
@@ -339,6 +345,9 @@ function Explore.corners(W: World, cfg: Config?): Result
 			while true do
 				local r = grow(W, cur, from, c, false, walked)
 				runs += 1
+				if runs > maxRuns then
+					error(string.format("Explore: %d runs on %d nodes -- a run is not claiming a fresh edge", runs, W.n))
+				end
 				stats[r.reason] = (stats[r.reason] or 0) + 1
 				if #r.nodes < 2 then
 					touched[cur] = true
