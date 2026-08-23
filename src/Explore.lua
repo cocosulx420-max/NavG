@@ -89,6 +89,10 @@ export type World = {
 	pos: { Vector3 },
 	wall: { boolean },
 	drop: { boolean },
+	u: { Vector3? },        -- the owning grid's face axes, kept for drawing
+	nrm: { Vector3? },
+	wallMask: { number },
+	dropMask: { number },
 	cell: { { x: number, z: number } },
 	out: { Vector3? },
 	nbr: { { number } },
@@ -109,6 +113,7 @@ function Explore.world(localData: any, cfg: Config?): World
 	local step = c.step or (localData.config and localData.config.step) or 1
 
 	local pos, out, wall, drop = {}, {}, {}, {}
+	local uAx, nAx, wMask, dMask = {}, {}, {}, {}
 	for _, g in pairs(localData.grids) do
 		for _, cell in ipairs(g.cells) do
 			if cell.wall or cell.dropoff then
@@ -116,6 +121,12 @@ function Explore.world(localData: any, cfg: Config?): World
 				out[#pos] = facing(g, cell)
 				wall[#pos] = cell.wall or false
 				drop[#pos] = cell.dropoff or false
+				-- kept so the view can lie the node flat on ITS OWN face, the way
+				-- LocalGrid draws it, instead of inventing a shape for it
+				uAx[#pos] = (not g.fallback) and g.u or nil
+				nAx[#pos] = (not g.fallback) and g.n or nil
+				wMask[#pos] = cell.wallMask or 0
+				dMask[#pos] = cell.dropMask or 0
 			end
 		end
 	end
@@ -200,7 +211,9 @@ function Explore.world(localData: any, cfg: Config?): World
 		nbr[i] = a
 	end
 
-	return { pos = pos, wall = wall, drop = drop, cell = cellOf, out = out, nbr = nbr, step = step, n = n }
+	return { pos = pos, wall = wall, drop = drop, u = uAx, nrm = nAx,
+		wallMask = wMask, dropMask = dMask,
+		cell = cellOf, out = out, nbr = nbr, step = step, n = n }
 end
 
 --------------------------------------------------------------------------
@@ -425,15 +438,18 @@ end
 
 -- The ordinary node view, with the corners called out.
 --
--- Nodes carry LocalGrid's palette so this reads the same as the classes view --
--- red wall, blue dropoff, purple both -- and a corner is the SAME node drawn
--- green and a little larger. A corner is not a different kind of thing; it is
--- one of these nodes that a rule stopped on, and it should look like that.
+-- Drawn exactly the way `LocalGrid.visualizeClasses` draws a node: a flat tile
+-- lying on the part's OWN face, oriented by that grid's axes, in the usual
+-- palette -- red wall, blue dropoff, purple both. A node is a patch of ground,
+-- so it is drawn as a patch of ground.
+--
+-- A corner is the SAME tile, green and a little wider. It is not a different
+-- kind of thing and should not be a different kind of shape.
 function Explore.visualize(res: Result, opts: any?, parent: Instance?): number
 	if typeof(opts) == "Instance" then parent = opts :: Instance; opts = nil end
 	local o = opts or {}
-	local nodeSize = o.nodeSize or 0.9
-	local cornerSize = o.cornerSize or 1.25
+	local nodeW = o.nodeW or 0.9
+	local cornerW = o.cornerW or 1.3
 	local root = parent or workspace
 	local dbg = root:FindFirstChild("NVGN_Debug")
 	if not dbg then
@@ -449,20 +465,8 @@ function Explore.visualize(res: Result, opts: any?, parent: Instance?): number
 	local CORNER = Color3.fromRGB(0, 255, 90)
 
 	local W = res.world
-	local n = 0
-
-	local function dot(pos: Vector3, size: number, col: Color3, name: string)
-		local b = Instance.new("Part")
-		b.Name = name
-		b.Shape = Enum.PartType.Ball
-		b.Size = Vector3.new(size, size, size)
-		b.Position = pos
-		b.Anchored = true; b.CanCollide = false; b.CanQuery = false; b.CanTouch = false
-		b.Material = Enum.Material.Neon
-		b.Color = col
-		b.Parent = f
-		n += 1
-	end
+	local step = W.step
+	local lift = Vector3.new(0, 0.12, 0)
 
 	-- A corner is identified by POSITION, because that is all `corners` carries.
 	-- Rounded to a tenth of a stud so a node and its own corner cannot miss each
@@ -473,16 +477,33 @@ function Explore.visualize(res: Result, opts: any?, parent: Instance?): number
 	end
 	for _, p in ipairs(res.corners) do isCorner[key(p)] = true end
 
+	local n = 0
 	for i = 1, W.n do
 		local p = W.pos[i]
-		if isCorner[key(p)] then
-			dot(p, cornerSize, CORNER, "corner")
+		local corner = isCorner[key(p)]
+		local col, w
+		if corner then
+			col, w = CORNER, cornerW
 		else
-			local col = DROP
+			w = nodeW
 			if W.wall[i] and W.drop[i] then col = BOTH
-			elseif W.wall[i] then col = WALL end
-			dot(p, nodeSize, col, "node")
+			elseif W.wall[i] then col = WALL
+			else col = DROP end
 		end
+		local dot = Instance.new("Part")
+		dot.Anchored = true; dot.CanCollide = false; dot.CanQuery = false; dot.CanTouch = false
+		dot.Material = Enum.Material.SmoothPlastic
+		dot.Color = col
+		dot.Size = Vector3.new(w * step, 0.08, w * step)
+		if W.u[i] and W.nrm[i] then
+			dot.CFrame = CFrame.fromMatrix(p + lift, W.u[i] :: Vector3, W.nrm[i] :: Vector3)
+		else
+			dot.CFrame = CFrame.new(p + lift)
+		end
+		dot.Name = corner and "corner"
+			or string.format("w%d_d%d", W.wallMask[i], W.dropMask[i])
+		dot.Parent = f
+		n += 1
 	end
 	return n
 end
