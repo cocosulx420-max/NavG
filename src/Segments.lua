@@ -136,6 +136,10 @@ end
 export type Result = {
 	rings: { { ring: any, fit: any, segments: { Segment } } },
 	stats: Stats,
+	-- "<ringIndex>:<nodeIndex>" -> the welded position of that node, set by
+	-- `weldCorners`. Read through `Segments.pointOf`, never straight out of
+	-- `ring.world`.
+	weld: { [string]: Vector3 }?,
 }
 
 -- Fit every ring and split the result. `ringData` is `Boundary.ringCells(...)`.
@@ -170,9 +174,9 @@ end
 -- corners and must never be scored as if they were.
 function Segments.cornerPoints(res: Result): { Vector3 }
 	local pts = {}
-	for _, r in ipairs(res.rings) do
+	for ri, r in ipairs(res.rings) do
 		for _, idx in ipairs(r.fit.vertices) do
-			pts[#pts + 1] = r.ring.world[idx]
+			pts[#pts + 1] = Segments.pointOf(res, ri, idx)
 		end
 	end
 	return pts
@@ -182,9 +186,9 @@ end
 -- at on their own.
 function Segments.cutPoints(res: Result): { Vector3 }
 	local pts = {}
-	for _, r in ipairs(res.rings) do
+	for ri, r in ipairs(res.rings) do
 		for _, sg in ipairs(r.segments) do
-			if not sg.corner0 then pts[#pts + 1] = r.ring.world[sg.i0] end
+			if not sg.corner0 then pts[#pts + 1] = Segments.pointOf(res, ri, sg.i0) end
 		end
 	end
 	return pts
@@ -239,11 +243,10 @@ function Segments.visualize(res: Result, opts: any?, parent: Instance?): number
 		n += 1
 	end
 
-	for _, r in ipairs(res.rings) do
-		local world = r.ring.world
+	for ri, r in ipairs(res.rings) do
 		for _, sg in ipairs(r.segments) do
 			if classes and classes[sg.class] == false then continue end
-			local a, b = world[sg.i0], world[sg.i1]
+			local a, b = Segments.pointOf(res, ri, sg.i0), Segments.pointOf(res, ri, sg.i1)
 			local d = b - a
 			local len = d.Magnitude
 			-- A zero-length piece has no direction to build a CFrame from; it is
@@ -276,6 +279,166 @@ function Segments.visualize(res: Result, opts: any?, parent: Instance?): number
 		end
 	end
 	return n
+end
+
+--------------------------------------------------------------------------
+-- Seam corners, and the duplicates a seam creates
+--------------------------------------------------------------------------
+
+-- A seam is not a boundary, so A TURN IN A SEAM IS NOT A CORNER. 38 of the 464
+-- corners on SmallMap have seam on both sides of them: they exist only because
+-- one part's grid stopped and turned. They are junctions in a chain that is
+-- about to be dissolved, so anything that welds or offsets corners would be
+-- reasoning about them for nothing.
+--
+-- So: merge every run of consecutive seam pieces into one. A cut can never be
+-- seam|seam -- a cut exists only where the class CHANGES -- so every junction
+-- this removes is a corner, and no non-seam geometry is touched.
+function Segments.dissolveSeamCorners(res: Result): number
+	local removed = 0
+	for _, r in ipairs(res.rings) do
+		local segs = r.segments
+		if #segs >= 2 then
+			local merged: { Segment } = {}
+			for _, sg in ipairs(segs) do
+				local last = merged[#merged]
+				if last and last.class == "seam" and sg.class == "seam" then
+					last.i1, last.corner1 = sg.i1, sg.corner1
+					removed += 1
+				else
+					merged[#merged + 1] = {
+						i0 = sg.i0, i1 = sg.i1, class = sg.class,
+						corner0 = sg.corner0, corner1 = sg.corner1,
+					}
+				end
+			end
+			-- The ring is a CYCLE, so the last piece and the first can be a seam
+			-- pair too. Fold the tail into the head rather than leaving behind the
+			-- one junction a linear pass cannot see.
+			if #merged >= 2 and merged[#merged].class == "seam" and merged[1].class == "seam" then
+				merged[1].i0, merged[1].corner0 = merged[#merged].i0, merged[#merged].corner0
+				merged[#merged] = nil
+				removed += 1
+			end
+			r.segments = merged
+		end
+	end
+	return removed
+end
+
+-- A corner that two rings both see.
+--
+-- Grids are per-part and sit on different lattices, so where two walkable parts
+-- meet, ONE corner in the world gets traced twice, once per ring, a fraction of
+-- a stud apart. Both copies are real observations of the same place; downstream
+-- they have to become one point or the two floors never stitch.
+--
+-- WHICH COPY WINS. Not an average, and not the first one seen: the copy on the
+-- ring that GENUINELY TURNS there. A corner with real boundary on both sides
+-- (drop|drop, wall|wall, drop|wall) is a fact about the ground. A corner with a
+-- seam on one side is only the place where the OTHER part's grid ran out, so
+-- its position is an artifact of where a lattice happened to stop. When exactly
+-- one copy in a cluster is seam-free, that copy is the answer.
+--
+-- Measured on SmallMap at radius 1.0, after `dissolveSeamCorners`: 43 clusters
+-- of two, none of them mixing two corners of the SAME ring (so nothing
+-- genuinely distinct is being welded), and none with more than one seam-free
+-- copy. 24 resolve by the rule above. The other 19 are `drop|seam` against
+-- `seam|drop` -- symmetric, both copies equally artifacted -- and `symmetric`
+-- decides what happens to those. The default is to LEAVE THEM ALONE, because
+-- guessing there would move a corner for a reason that is not about the ground.
+--
+-- Radius is 1.0 deliberately. At 1.5 three clusters start swallowing two
+-- corners of one ring, which is a different operation and a wrong one.
+export type WeldConfig = {
+	radius: number?,
+	symmetric: string?,  -- "leave" (default) | "midpoint"
+}
+
+export type WeldStats = {
+	clusters: number, welded: number, moved: number,
+	symmetric: number, sameRing: number,
+}
+
+-- The position of a node, after welding. Everything downstream must read
+-- positions through this and never out of `ring.world`, or welded corners
+-- silently come back apart.
+function Segments.pointOf(res: Result, ri: number, idx: number): Vector3
+	local w = res.weld and res.weld[ri .. ":" .. idx]
+	return w or res.rings[ri].ring.world[idx]
+end
+
+function Segments.weldCorners(res: Result, cfg: WeldConfig?): WeldStats
+	local c = cfg or {}
+	local radius = c.radius or 1.0
+	local symmetric = c.symmetric or "leave"
+	local st: WeldStats = { clusters = 0, welded = 0, moved = 0, symmetric = 0, sameRing = 0 }
+	res.weld = {}
+
+	-- Every corner junction, with the class on each side of it.
+	local pts = {}
+	for ri, r in ipairs(res.rings) do
+		local segs = r.segments
+		for si, sg in ipairs(segs) do
+			local nxt = segs[si == #segs and 1 or si + 1]
+			if nxt and sg.corner1 then
+				pts[#pts + 1] = {
+					ri = ri, idx = sg.i1, pos = r.ring.world[sg.i1],
+					a = sg.class, b = nxt.class,
+				}
+			end
+		end
+	end
+
+	local used = {}
+	for i, p in ipairs(pts) do
+		if not used[i] then
+			local cl = { p }
+			used[i] = true
+			for k = i + 1, #pts do
+				if not used[k] and (pts[k].pos - p.pos).Magnitude <= radius then
+					used[k] = true
+					cl[#cl + 1] = pts[k]
+				end
+			end
+			st.clusters += 1
+			if #cl > 1 then
+				local rings = {}
+				for _, q in ipairs(cl) do rings[q.ri] = true end
+				local nr = 0
+				for _ in pairs(rings) do nr += 1 end
+				if nr == 1 then st.sameRing += 1 end
+
+				local free, freeCount = nil, 0
+				for _, q in ipairs(cl) do
+					if q.a ~= "seam" and q.b ~= "seam" then free, freeCount = q, freeCount + 1 end
+				end
+
+				local target: Vector3? = nil
+				if freeCount == 1 then
+					target = (free :: any).pos
+				else
+					st.symmetric += 1
+					if symmetric == "midpoint" then
+						local sum = Vector3.zero
+						for _, q in ipairs(cl) do sum += q.pos end
+						target = sum / #cl
+					end
+				end
+
+				if target then
+					st.welded += 1
+					for _, q in ipairs(cl) do
+						if (q.pos - target).Magnitude > 1e-4 then
+							res.weld[q.ri .. ":" .. q.idx] = target
+							st.moved += 1
+						end
+					end
+				end
+			end
+		end
+	end
+	return st
 end
 
 return Segments
