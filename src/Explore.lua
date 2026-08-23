@@ -201,6 +201,10 @@ end
 -- Exploring
 --------------------------------------------------------------------------
 
+local function edgeKey(a: number, b: number): string
+	return (a < b) and (a .. ":" .. b) or (b .. ":" .. a)
+end
+
 export type Run = {
 	nodes: { number },
 	reason: string,   -- "dirlock" | "corridor" | "guard" | "dead end" | "probe" | "fork"
@@ -212,7 +216,7 @@ export type Run = {
 -- turn, up to `probe` steps, under these same two rules; the one that survives
 -- longest is the one the line continues along. A branch that immediately breaks
 -- is a different line arriving, and it is simply not taken.
-local function grow(W: World, start: number, cameFrom: number, c: any, probe: boolean?): Run
+local function grow(W: World, start: number, cameFrom: number, c: any, probe: boolean?, walked: { [string]: boolean }?): Run
 	local run = { start }
 	local used = { false, false, false, false }
 	local prev, cur = cameFrom, start
@@ -223,7 +227,14 @@ local function grow(W: World, start: number, cameFrom: number, c: any, probe: bo
 	while steps < budget do
 		local cands = {}
 		for _, j in ipairs(W.nbr[cur]) do
-			if j ~= prev and not seen[j] then cands[#cands + 1] = j end
+			if j ~= prev and not seen[j] then
+				-- An edge something already walked is not a way forward. Without
+				-- this a closed boundary laps forever, re-finding the same
+				-- corners: the run's own `seen` only stops it revisiting a node
+				-- WITHIN one run, and each new run starts with a fresh one.
+				local blocked = walked ~= nil and walked[edgeKey(cur, j)] or false
+				if not blocked then cands[#cands + 1] = j end
+			end
 		end
 		if #cands == 0 then return { nodes = run, reason = "dead end" } end
 
@@ -240,7 +251,7 @@ local function grow(W: World, start: number, cameFrom: number, c: any, probe: bo
 			-- EXPLORE EACH ONE, take the one that goes furthest before breaking.
 			local bestLen, bestJ = -1, cands[1]
 			for _, j in ipairs(cands) do
-				local r = grow(W, j, cur, c, true)
+				local r = grow(W, j, cur, c, true, walked)
 				if #r.nodes > bestLen then bestLen, bestJ = #r.nodes, j end
 			end
 			nxt = bestJ
@@ -294,37 +305,52 @@ function Explore.corners(W: World, cfg: Config?): Result
 	for k, v in pairs(DEFAULT) do c[k] = v end
 	if cfg then for k, v in pairs(cfg) do if v ~= nil then c[k] = v end end end
 
-	local visited = table.create(W.n, false)
+	-- WHAT MAKES THIS TERMINATE is edges, not nodes. Every edge of the boundary
+	-- gets walked exactly once; a run refuses an edge already walked, so a closed
+	-- boundary stops itself after one lap instead of re-finding the same corners
+	-- forever. That was the first version's bug and it hung Studio for 120s.
+	local walked: { [string]: boolean } = {}
+	local touched = table.create(W.n, false)
 	local corners: { Vector3 } = {}
-	local stats: { [string]: number } = {
-		dirlock = 0, corridor = 0, guard = 0, ["dead end"] = 0, probe = 0,
-	}
+	local stats: { [string]: number } = {}
 	local runs = 0
 
+	local function claim(run: { number })
+		for i = 1, #run - 1 do
+			walked[edgeKey(run[i], run[i + 1])] = true
+			touched[run[i]] = true
+		end
+		touched[run[#run]] = true
+	end
+
 	for seed = 1, W.n do
-		if not visited[seed] then
-			-- bootstrap: whichever way we can go first, walk it and take where it
-			-- broke as the anchor
-			local back = grow(W, seed, 0, c)
-			local anchor = back.nodes[#back.nodes]
+		if not touched[seed] then
+			-- BACKWARD BOOTSTRAP, LineFit's, and for its reason: an arbitrary seed
+			-- usually lands mid-run, and starting forward from it would call that
+			-- spot a corner. Grow backward under the same rules and start from
+			-- wherever that broke. The bootstrap is thrown away, not claimed.
+			local anchor = seed
+			do
+				local back = grow(W, seed, 0, c, false, walked)
+				anchor = back.nodes[#back.nodes]
+			end
+
 			local cur, from = anchor, 0
-			-- forward from the anchor, run after run, until nothing is left
 			while true do
-				local r = grow(W, cur, from, c)
+				local r = grow(W, cur, from, c, false, walked)
 				runs += 1
 				stats[r.reason] = (stats[r.reason] or 0) + 1
-				for _, i in ipairs(r.nodes) do visited[i] = true end
+				if #r.nodes < 2 then
+					touched[cur] = true
+					break
+				end
+				claim(r.nodes)
 				local last = r.nodes[#r.nodes]
-				if #r.nodes < 2 or last == cur then break end
 				corners[#corners + 1] = W.pos[last]
 				from = r.nodes[#r.nodes - 1]
 				cur = last
-				if visited[last] and #r.nodes < 3 then break end
-				local moreToGo = false
-				for _, j in ipairs(W.nbr[last]) do
-					if j ~= from and not visited[j] then moreToGo = true break end
-				end
-				if not moreToGo then break end
+				-- Progress is guaranteed because every run claims at least one
+				-- fresh edge, and there are finitely many edges.
 			end
 		end
 	end
