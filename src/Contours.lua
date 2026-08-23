@@ -148,6 +148,74 @@ local function keepWideRegions(g: any, minWidth: number)
 end
 
 --------------------------------------------------------------------------
+-- Ramps
+--------------------------------------------------------------------------
+
+-- A RAMP IS NAMED, so it does not have to be inferred.
+--
+-- `LocalGrid` marks a cell `wall` when a surface stands above it, and a ramp
+-- meeting the floor does exactly that: at the ClipRamp's foot the ground cells
+-- are `wall = true` because the ramp rises 0.65 studs over one cell beside them.
+-- That is the seam where floor meets ramp, not a wall, and tracing it produced
+-- short stubs along the foot duplicating the clean line the ramp's own edge
+-- already gives.
+--
+-- DERIVING IT GEOMETRICALLY DOES NOT WORK, and the attempt is worth recording so
+-- nobody repeats it: discounting any wall climbable within `maxSlope` also
+-- discounts every stair riser, because a one-stud rise over one cell is 45
+-- degrees and this pipeline accepts up to 65. Measured, that cut STAIR
+-- primitives from 61 to 17. A ramp and a staircase are the same shape to every
+-- measure available here. The only thing separating them is that one of them
+-- says so in its name.
+local DIR8 = {
+	{ 1, 0 }, { 1, 1 }, { 0, 1 }, { -1, 1 },
+	{ -1, 0 }, { -1, -1 }, { 0, -1 }, { 1, -1 },
+}
+
+local function isRamp(part): boolean
+	if not part then return false end
+	return tostring(part.Name):lower():find("ramp", 1, true) ~= nil
+end
+
+-- True when every direction this cell reports as walled is walled by a RAMP --
+-- a surface named as one, which you walk onto rather than into. Drops are never
+-- discounted; a drop is a drop.
+local function walledOnlyByRamp(cell, g, world, step): boolean
+	local mask = cell.wallMask or 0
+	if mask == 0 then return false end
+	if (cell.dropMask or 0) ~= 0 then return false end
+	for bit, d in ipairs(DIR8) do
+		if bit32.band(mask, bit32.lshift(1, bit - 1)) ~= 0 then
+			local off
+			if not g.fallback and g.u and g.v then
+				off = g.u * (d[1] * step) + g.v * (d[2] * step)
+			else
+				off = Vector3.new(d[1] * step, 0, d[2] * step)
+			end
+			local want = cell.pos + off
+			local found = false
+			local bx = math.floor(want.X / step)
+			local by = math.floor(want.Y / step)
+			local bz = math.floor(want.Z / step)
+			for dx = -1, 1 do for dy = -2, 2 do for dz = -1, 1 do
+				local b = world[(bx + dx) .. ":" .. (by + dy) .. ":" .. (bz + dz)]
+				if b then
+					for _, e in ipairs(b) do
+						if isRamp(e.g.part) then
+							local v = e.cell.pos - cell.pos
+							local horiz = Vector3.new(v.X, 0, v.Z).Magnitude
+							if horiz > 0.01 and horiz <= step * 1.6 then found = true end
+						end
+					end
+				end
+			end end end
+			if not found then return false end
+		end
+	end
+	return true
+end
+
+--------------------------------------------------------------------------
 -- Tracing
 --------------------------------------------------------------------------
 
