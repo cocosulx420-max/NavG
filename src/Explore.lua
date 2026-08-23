@@ -464,6 +464,15 @@ function Explore.corners(W: World, cfg: Config?): Result
 			do
 				local back = grow(W, seed, 0, c, false, walked)
 				anchor = back.nodes[#back.nodes]
+				-- THE ANCHOR IS A RULE BREAK TOO. It is where growth stopped
+				-- walking BACKWARD, under these same two rules -- the same fact
+				-- about the ground, found from the other side. Throwing it away
+				-- silently dropped real 90-degree corners: measured, four corners
+				-- picked out by hand were all anchors, and three of them were also
+				-- where the lap came back round and dead-ended.
+				if back.reason == "corridor" or back.reason == "dirlock" then
+					corners[#corners + 1] = W.pos[anchor]
+				end
 			end
 
 			local cur, from = anchor, 0
