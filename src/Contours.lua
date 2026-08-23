@@ -49,9 +49,18 @@ local Contours = {}
 local DIR4 = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } }
 
 export type Config = {
-	-- A region must be at least this many cells wide to be worth pathing on.
-	-- One erosion pass removes a 1-cell rim, so 3 is the smallest value that
-	-- discards one- and two-cell slivers while keeping a three-cell corridor.
+	-- A region must be at least this many cells wide to be traced.
+	--
+	-- TWO, NOT THREE. Three discards every two-cell-wide region, and those are
+	-- real geometry: the grating's bars are two cells wide and each one traces
+	-- cleanly as a 70-cell ring reading `D1 R34 U1 L34` -- two long edges and
+	-- two ends, which is exactly the right reading. Measured, 3 threw away 21
+	-- regions and 1083 cells to solve a problem that was never the geometry's:
+	-- the 1415 two-cell contours came from a tracer that cut at every branch,
+	-- and they do not come back now that it does not.
+	--
+	-- At 2, nothing is discarded on this map at all, which is the honest
+	-- outcome -- there were no one-cell slivers to remove.
 	minWidthCells: number?,
 	-- Contours shorter than this carry no shape worth classifying. Reported
 	-- either way; set to 0 to keep everything and see what is really there.
@@ -61,7 +70,7 @@ export type Config = {
 }
 
 local DEFAULT = {
-	minWidthCells = 3,
+	minWidthCells = 2,
 	minContourCells = 8,
 	verbose = true,
 }
