@@ -355,7 +355,15 @@ function Explore.corners(W: World, cfg: Config?): Result
 				end
 				claim(r.nodes)
 				local last = r.nodes[#r.nodes]
-				corners[#corners + 1] = W.pos[last]
+				-- A CORNER IS WHERE A RULE BROKE THE RUN, and nowhere else.
+				-- `dead end` means only that the sweep had already walked
+				-- everything ahead -- bookkeeping, not geometry -- and emitting
+				-- there put a corner at the seam between two runs. That alone was
+				-- 667 of 1475 runs and most of a 1142-corner count against the
+				-- ring pipeline's 464.
+				if r.reason == "corridor" or r.reason == "dirlock" then
+					corners[#corners + 1] = W.pos[last]
+				end
 				from = r.nodes[#r.nodes - 1]
 				cur = last
 				-- Progress is guaranteed because every run claims at least one
