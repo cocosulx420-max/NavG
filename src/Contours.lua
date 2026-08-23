@@ -166,15 +166,39 @@ local function traceGrid(g: any, keep: any, out: { Contour })
 		return a.vi < b.vi
 	end)
 
-	local function neighbours(c: any, visited: any)
+	-- WHICH WAY THE WALK GOES WHEN IT HAS A CHOICE.
+	--
+	-- Ordering candidates lexicographically looks harmless and is not. Where a
+	-- boundary is two cells thick every cell has a neighbour in the other row,
+	-- and a lexicographic pick WEAVES BETWEEN THE TWO ROWS instead of running
+	-- along one. What comes out is a sawtooth -- `D1 R1 U1 R1 D1 R1 U1` -- which
+	-- alternates direction on the SAME axis, so the direction pair changes on
+	-- every run and the classifier correctly makes every run its own primitive.
+	-- Measured: one 54-cell contour came out as 18 primitives, twelve of them a
+	-- single cell.
+	--
+	-- So the walk carries on in the direction it was already going when it can.
+	-- Where the boundary is one cell thick this changes nothing -- an interior
+	-- cell has exactly two neighbours and the walk is forced -- so it costs
+	-- nothing where there is no ambiguity and resolves it where there is.
+	-- Lexicographic order stays as the final tie-break, so the trace remains a
+	-- fact about the cells rather than about table order.
+	local function neighbours(c: any, visited: any, fromDir: { number }?)
 		local n = {}
 		for _, d in ipairs(DIR4) do
 			local q = boundary[key(c.ui + d[1], c.vi + d[2])]
-			if q and not visited[key(q.ui, q.vi)] then n[#n + 1] = q end
+			if q and not visited[key(q.ui, q.vi)] then
+				n[#n + 1] = { cell = q, d = d }
+			end
 		end
 		table.sort(n, function(a, b)
-			if a.ui ~= b.ui then return a.ui < b.ui end
-			return a.vi < b.vi
+			if fromDir then
+				local sa = (a.d[1] == fromDir[1] and a.d[2] == fromDir[2]) and 0 or 1
+				local sb = (b.d[1] == fromDir[1] and b.d[2] == fromDir[2]) and 0 or 1
+				if sa ~= sb then return sa < sb end
+			end
+			if a.cell.ui ~= b.cell.ui then return a.cell.ui < b.cell.ui end
+			return a.cell.vi < b.cell.vi
 		end)
 		return n
 	end
@@ -202,11 +226,13 @@ local function traceGrid(g: any, keep: any, out: { Contour })
 		if not visited[key(start.ui, start.vi)] then
 			local run = { start }
 			visited[key(start.ui, start.vi)] = true
-			local cur = start
+			local cur, dir = start, nil
 			while true do
-				local n = neighbours(cur, visited)
+				local n = neighbours(cur, visited, dir)
 				if #n == 0 then break end
-				cur = n[1]
+				local pick = n[1]
+				dir = pick.d
+				cur = pick.cell
 				visited[key(cur.ui, cur.vi)] = true
 				run[#run + 1] = cur
 			end
