@@ -524,7 +524,18 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	-- would shrink the window below what a full neighbour needs and turn every
 	-- sub-to-full join into a false dropoff.
 	local function matchR2(a: number, b: number): number
-		local r = c.probeRadius * math.max(a, b)
+		-- NEVER SHRINK BELOW THE GRID STEP. probeRadius exists because a
+		-- neighbouring grid's lattice does not line up with ours, so the nearest
+		-- cell can sit up to pitch*sqrt(2)/2 away. That bound assumes a COMPLETE
+		-- lattice at that pitch -- and subcells are not one. Only cells that met
+		-- solid were ever split, so the half-pitch lattice is sparse and its
+		-- nearest member can be far further off than 0.35 studs.
+		--
+		-- Sizing the window off two half-pitch cells gave 0.375, and a level
+		-- floor cell sitting exactly 0.500 away was missed: the cell reported a
+		-- dropoff with walkable floor right beside it. The coarse step is what
+		-- the misalignment is actually measured against, so it is the floor.
+		local r = c.probeRadius * math.max(a, b, c.step)
 		return r * r
 	end
 	local tol = c.flushTol
