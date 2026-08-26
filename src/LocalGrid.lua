@@ -16,6 +16,9 @@ export type Cell = {
 	-- anything that steps between cells must read this and not grid.step.
 	size: number,
 	sub: boolean?,            -- true => recovered from a subdivided dead cell
+	-- true => the centre sample was blocked, but corner probes found clear
+	-- ground and this node sits at the centroid of the clear corners
+	rescued: boolean?,
 	pui: number?, pvi: number?, -- parent cell's lattice indices (subcells only)
 	-- Set by classifyNodes. Bitmasks over DIR8, plus the booleans they imply.
 	wallMask: number?,        -- directions with a surface standing above us
@@ -57,6 +60,7 @@ export type Config = {
 	step: number?, maxSlope: number?, clearCap: number?, minClearance: number?,
 	flushTol: number?, probeRadius: number?,
 	subdivLevels: number?, cardinalEdges: boolean?,
+	rescueDead: boolean?, rescueInset: number?,
 	clipRampDedupe: boolean?, clipRampDedupeFactor: number?,
 }
 
@@ -82,6 +86,9 @@ local DEFAULT = {
 	subdivLevels = 1,
 	-- Only a shared EDGE makes a cell boundary; a shared corner does not.
 	cardinalEdges = true,
+	-- Retry a dead boundary cell at its corners before deleting it.
+	rescueDead = true,
+	rescueInset = 0.4,
 	-- Drop floor cells that sit exactly on top of a ClipRamp cell. Keep the
 	-- ones merely near it -- those are the floor's own edge beside the ramp.
 	clipRampDedupe = true,
@@ -341,6 +348,89 @@ local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll:
 			work = nextWork
 			pitch = child
 		end
+	end
+
+	-- RESCUE: a cell killed by a hairline.
+	--
+	-- evalSample decides life or death from ONE point, the cell's centre. Along a
+	-- wall running at an angle that centre crosses the face gradually, and
+	-- wherever it crosses by a hair the whole cell dies. Measured on the test map
+	-- at eight gaps in an otherwise continuous edge: the killed sample sat
+	-- 0.020 to 0.119 studs inside the blocker. A cell ~97% clear, deleted.
+	--
+	-- Subdividing further does not fix this. It reproduces the same failure one
+	-- pitch down: a 0.25 cell whose centre is 0.01 inside dies exactly the same
+	-- way. The defect is in asking a single point, not in the pitch.
+	--
+	-- There is no way to ask Roblox what FRACTION of a cell is filled --
+	-- GetPartsInPart answers yes or no and nothing else. So ask more points: test
+	-- the four corners, and if any are clear, re-run the full test at the
+	-- centroid of the clear ones. The node survives, and it sits on ground that
+	-- was actually verified standable rather than on a nominal centre.
+	--
+	-- Only dead cells with a live neighbour are tried. A cell buried inside a
+	-- wall has no clear corner and testing it is wasted work.
+	if c.rescueDead ~= false and levels > 0 then
+		local inset = c.rescueInset or 0.4
+		local liveB: {[string]: {any}} = {}
+		for _, cell in ipairs(grid.cells) do
+			local k = math.floor(cell.pos.X) .. ":" .. math.floor(cell.pos.Z)
+			local b = liveB[k]; if not b then b = {}; liveB[k] = b end
+			b[#b + 1] = cell
+		end
+		local function hasLiveNeighbour(d): boolean
+			local bx, bz = math.floor(d.pos.X), math.floor(d.pos.Z)
+			local lim = d.size * 1.25
+			for ox = -1, 1 do
+				for oz = -1, 1 do
+					for _, cell in ipairs(liveB[(bx + ox) .. ":" .. (bz + oz)] or {}) do
+						local dx, dz = cell.pos.X - d.pos.X, cell.pos.Z - d.pos.Z
+						if dx * dx + dz * dz <= lim * lim then return true end
+					end
+				end
+			end
+			return false
+		end
+
+		pointProbe()
+		local survivors, rescued = {}, 0
+		for _, d in ipairs(grid.dead) do
+			local saved = false
+			if hasLiveNeighbour(d) then
+				-- the cell's centre on the face plane, in stud units along u/v
+				local cu = (d.ui + 0.5) * d.size
+				local cv = (d.vi + 0.5) * d.size
+				local off = inset * d.size
+				local su, sv, n2 = 0, 0, 0
+				for _, q in ipairs({ {1,1}, {1,-1}, {-1,1}, {-1,-1} }) do
+					local qu, qv = cu + q[1] * off, cv + q[2] * off
+					local st = evalSample(corner + u * qu + v * qv)
+					if st == "live" then su += qu; sv += qv; n2 += 1 end
+				end
+				if n2 > 0 then
+					local status, res, slope, clearance, inst =
+						evalSample(corner + u * (su / n2) + v * (sv / n2))
+					if status == "live" then
+						local cell: Cell = {
+							ui = d.ui, vi = d.vi, pos = res.Position, normal = res.Normal,
+							slope = slope, clearance = clearance, cover = inst,
+							size = d.size, sub = true, rescued = true,
+						}
+						grid.cells[#grid.cells + 1] = cell
+						grid.subIndex[string.format("%d:%d", d.ui, d.vi)] = cell
+						rescued += 1
+						saved = true
+					end
+				end
+			end
+			if not saved then survivors[#survivors + 1] = d end
+		end
+		grid.dead = survivors
+		grid.deadIndex = {}
+		for _, d in ipairs(grid.dead) do
+			grid.deadIndex[string.format("%d:%d", d.ui, d.vi)] = d
+		end
+		grid.rescued = rescued
 	end
 
 	return grid
@@ -631,7 +721,7 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 	local byPart = groupByPart(floorData.surfels)
 	local grids: { [BasePart]: Grid } = {}
 	local nBlock, nFallback, nCells, nDead = 0, 0, 0, 0
-	local nSubCells, nSubDead = 0, 0
+	local nSubCells, nSubDead, nRescued = 0, 0, 0
 	for part, sfs in pairs(byPart) do
 		local g: Grid
 		if isBlock(part) then
@@ -646,6 +736,7 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 		nDead += #g.dead
 		for _, cell in ipairs(g.cells) do if cell.sub then nSubCells += 1 end end
 		for _, d in ipairs(g.dead) do if d.sub then nSubDead += 1 end end
+		nRescued += (g.rescued or 0)
 	end
 	probe:Destroy()
 
@@ -664,6 +755,8 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 			-- turned out to be standable at half. `subDead` is the other half of
 			-- the split -- quadrants that stayed solid.
 			subCells = nSubCells, subDead = nSubDead,
+			-- cells whose centre was blocked but whose corners were not
+			rescued = nRescued,
 			-- floor cells removed for duplicating a ClipRamp cell outright
 			clipDupes = clipDupes,
 		},
