@@ -84,7 +84,7 @@ local DEFAULT = {
 	cardinalEdges = true,
 	-- How far a subdivided cell's centre may sit inside a blocker and still
 	-- live. Below this it is a hairline, not an obstruction. 0 = off.
-	killDepthTol = 0.15,
+	killDepthTol = 0.03,
 	-- Drop floor cells that sit exactly on top of a ClipRamp cell. Keep the
 	-- ones merely near it -- those are the floor's own edge beside the ramp.
 	clipRampDedupe = true,
