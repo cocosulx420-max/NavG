@@ -56,7 +56,7 @@ export type Grid = {
 export type Config = {
 	step: number?, maxSlope: number?, clearCap: number?, minClearance: number?,
 	flushTol: number?, probeRadius: number?,
-	subdivLevels: number?, cardinalEdges: boolean?, clipRampPrune: boolean?,
+	subdivLevels: number?, cardinalEdges: boolean?,
 }
 
 local DEFAULT = {
@@ -81,8 +81,6 @@ local DEFAULT = {
 	subdivLevels = 1,
 	-- Only a shared EDGE makes a cell boundary; a shared corner does not.
 	cardinalEdges = true,
-	-- Drop ClipRamp cells that duplicate, or hide under, real floor.
-	clipRampPrune = true,
 }
 
 local UP = Vector3.new(0, 1, 0)
@@ -416,85 +414,6 @@ local function neighbourPos(g: Grid, cell: Cell, d: {number}): Vector3
 	return cell.pos + Vector3.new(d[1] * sp, 0, d[2] * sp)
 end
 
--- A ClipRamp is an invisible collision ramp laid over authored stairs, and it
--- is the one part in the map deliberately allowed to break the slope limit. At
--- its FOOT the sloped surface converges with the floor it lands on, and at its
--- HEAD with the platform it arrives at. In both places two grids emit a node
--- for the same spot -- the ramp's and the floor's -- on different lattices at
--- different angles. Measured on the test map: 433 of 4119 ramp cells (10.5%),
--- clustered exactly at the two landing heights.
---
--- THE RAMP'S CELL WINS. The ramp is the continuous surface: it runs from the
--- bottom landing to the top one as a single grid, and anything walking the
--- stairs is walking it. Deleting the ramp's cells at a junction instead --
--- which is what this did first -- leaves a gap exactly where the ramp meets a
--- landing, and the landing's edge then reads as a WALL because its neighbour
--- has no floor any more. That put a false wall along the head of every ramp.
---
--- So the coincident FLOOR cell goes. No area is lost: the ramp cell sits at the
--- same spot within probeRadius and the same height within flushTol, so it
--- already covers what the floor cell covered, and the ramp stays unbroken
--- across the join.
---
--- Nothing is removed from the ramp. An earlier version also dropped ramp cells
--- that had floor above them, meaning to cull the tail running on under a
--- landing -- but a 45 degree ramp falls a full stud per stud, so near the head
--- the landing sits more than flushTol above the ramp's continuation and the
--- rule ate exactly the cells that bridge the join. The landing then had nothing
--- to stand on next to it and read as a WALL.
---
--- That cull was redundant anyway: a ramp cell genuinely buried under a landing
--- has less than minClearance of headroom, so evalSample has already killed it.
-local function pruneClipRampOverlap(grids: any, c: any)
-	local rampB: {[string]: {any}} = {}
-	for part, g in pairs(grids) do
-		if isClip(part) then
-			for _, cell in ipairs(g.cells) do
-				local k = math.floor(cell.pos.X) .. ":" .. math.floor(cell.pos.Z)
-				local b = rampB[k]; if not b then b = {}; rampB[k] = b end
-				b[#b + 1] = cell
-			end
-		end
-	end
-	if next(rampB) == nil then return 0, 0 end
-
-	local function reindex(g)
-		g.index, g.subIndex = {}, {}
-		for _, cell in ipairs(g.cells) do
-			local k = string.format("%d:%d", cell.ui, cell.vi)
-			if cell.sub then g.subIndex[k] = cell else g.index[k] = cell end
-		end
-	end
-
-	-- Pass A: drop FLOOR cells duplicated by a ramp cell.
-	local floorDropped = 0
-	for part, g in pairs(grids) do
-		if not isClip(part) then
-			local keep = {}
-			for _, cell in ipairs(g.cells) do
-				local bx, bz = math.floor(cell.pos.X), math.floor(cell.pos.Z)
-				local r = c.probeRadius * math.max(cell.size or c.step, c.step)
-				local r2, drop = r * r, false
-				for ox = -1, 1 do
-					for oz = -1, 1 do
-						for _, rc in ipairs(rampB[(bx + ox) .. ":" .. (bz + oz)] or {}) do
-							local dx, dz = rc.pos.X - cell.pos.X, rc.pos.Z - cell.pos.Z
-							if dx * dx + dz * dz <= r2 and math.abs(rc.pos.Y - cell.pos.Y) <= c.flushTol then
-								drop = true
-							end
-						end
-					end
-				end
-				if drop then floorDropped += 1 else keep[#keep + 1] = cell end
-			end
-			g.cells = keep
-			reindex(g)
-		end
-	end
-
-	return floorDropped, 0
-end
-
 -- Mark every cell with the directions in which it has a wall and the
 -- directions in which it has air.
 --
@@ -524,29 +443,8 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	-- would shrink the window below what a full neighbour needs and turn every
 	-- sub-to-full join into a false dropoff.
 	local function matchR2(a: number, b: number): number
-		-- probeRadius exists because a neighbouring grid's lattice does not line
-		-- up with ours, so the nearest cell can sit up to pitch*sqrt(2)/2 away.
-		-- That bound assumes a COMPLETE lattice at that pitch, and subcells are
-		-- not one: only cells that met solid were split, so the half-pitch
-		-- lattice is sparse and its nearest member can be much further off.
-		-- Sizing off two half-pitch cells gave 0.375 and missed level floor
-		-- sitting exactly 0.500 away. The coarse step is the floor of the window.
-		local r = c.probeRadius * math.max(a, b, c.step)
+		local r = c.probeRadius * math.max(a, b)
 		return r * r
-	end
-	-- A window wide enough for a foreign lattice is wider than a subcell's own
-	-- step, so on its own it matches THE CELL WE ARE STANDING ON: the sample
-	-- point is only cell.size away, well inside 0.75. Every subcell would then
-	-- find floor beneath itself and no subcell could ever report a wall.
-	--
-	-- Distance alone cannot separate those. Direction can: a genuine neighbour
-	-- lies nearer the sample point than it does to the cell we are testing from.
-	-- That excludes the origin cell (distance 0 to itself) and its diagonal
-	-- partners, while keeping any cell that actually sits out at the sample.
-	local function isNeighbour(q: Vector3, p: Vector3, from: Vector3): boolean
-		local ax, az = q.X - p.X, q.Z - p.Z
-		local bx, bz = q.X - from.X, q.Z - from.Z
-		return (ax * ax + az * az) < (bx * bx + bz * bz)
 	end
 	local tol = c.flushTol
 	local nWall, nDrop, nBoth, nCornerOnly = 0, 0, 0, 0
@@ -576,8 +474,7 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 						for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
 							local q = e.cell.pos
 							local dx, dz = q.X - p.X, q.Z - p.Z
-							if dx * dx + dz * dz <= matchR2(csize, e.cell.size or c.step)
-								and isNeighbour(q, p, cell.pos) then
+							if dx * dx + dz * dz <= matchR2(csize, e.cell.size or c.step) then
 								-- MEASURED AGAINST WHERE THIS SURFACE WOULD CONTINUE,
 								-- not against our own height. `p` lies on this grid's
 								-- own plane, so on a tilted slab the next cell along
@@ -607,7 +504,6 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 									local q = e.dead.pos
 									local dx, dz = q.X - p.X, q.Z - p.Z
 									if dx * dx + dz * dz <= matchR2(csize, e.dead.size or c.step)
-										and isNeighbour(q, p, cell.pos)
 										and e.dead.killer
 										and math.abs(q.Y - p.Y) <= tol then
 										above = true
@@ -684,12 +580,6 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 	end
 	probe:Destroy()
 
-	local clipFloorPruned, clipRampPruned = 0, 0
-	if c.clipRampPrune ~= false then
-		clipFloorPruned, clipRampPruned = pruneClipRampOverlap(grids, c)
-		nCells -= (clipFloorPruned + clipRampPruned)
-	end
-
 	local data = {
 		grids = grids, config = c,
 		stats = {
@@ -699,9 +589,6 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 			-- turned out to be standable at half. `subDead` is the other half of
 			-- the split -- quadrants that stayed solid.
 			subCells = nSubCells, subDead = nSubDead,
-			-- floor cells dropped because a ClipRamp already covers them, and
-			-- ramp cells dropped for running on under a landing
-			clipFloorPruned = clipFloorPruned, clipRampPruned = clipRampPruned,
 		},
 	}
 	LocalGrid.classifyNodes(data, cfg)
