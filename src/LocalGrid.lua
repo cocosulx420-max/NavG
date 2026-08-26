@@ -56,7 +56,7 @@ export type Grid = {
 export type Config = {
 	step: number?, maxSlope: number?, clearCap: number?, minClearance: number?,
 	flushTol: number?, probeRadius: number?,
-	subdivLevels: number?, cardinalEdges: boolean?,
+	subdivLevels: number?, cardinalEdges: boolean?, clipRampPrune: boolean?,
 }
 
 local DEFAULT = {
@@ -81,6 +81,8 @@ local DEFAULT = {
 	subdivLevels = 1,
 	-- Only a shared EDGE makes a cell boundary; a shared corner does not.
 	cardinalEdges = true,
+	-- Drop ClipRamp cells that duplicate, or hide under, real floor.
+	clipRampPrune = true,
 }
 
 local UP = Vector3.new(0, 1, 0)
@@ -414,6 +416,71 @@ local function neighbourPos(g: Grid, cell: Cell, d: {number}): Vector3
 	return cell.pos + Vector3.new(d[1] * sp, 0, d[2] * sp)
 end
 
+-- A ClipRamp is an invisible collision ramp laid over authored stairs, and it
+-- is the one part in the map deliberately allowed to break the slope limit. At
+-- its FOOT the sloped surface converges with the floor it lands on, and at its
+-- HEAD with the platform it arrives at. In both places two grids emit a node
+-- for the same spot -- the ramp's and the floor's -- on different lattices at
+-- different angles. Measured on the test map: 433 of 4119 ramp cells (10.5%),
+-- clustered exactly at the two landing heights.
+--
+-- The floor's cell wins. It is flat, it is on the lattice that the surrounding
+-- floor already uses, and it covers the same position at the same height, so
+-- dropping the ramp's copy costs no walkable area -- whereas dropping the
+-- floor's could. What survives on the ramp is the part that actually stands
+-- clear of the floor: its own bottom edge, unobscured.
+--
+-- Ramp cells with floor ABOVE them go too. Those are the tail of the ramp
+-- running on underneath a landing, where nothing can walk.
+local function pruneClipRampOverlap(grids: any, c: any)
+	local floorB: {[string]: {any}} = {}
+	for part, g in pairs(grids) do
+		if not isClip(part) then
+			for _, cell in ipairs(g.cells) do
+				local k = math.floor(cell.pos.X) .. ":" .. math.floor(cell.pos.Z)
+				local b = floorB[k]; if not b then b = {}; floorB[k] = b end
+				b[#b + 1] = cell
+			end
+		end
+	end
+
+	local removed = 0
+	for part, g in pairs(grids) do
+		if isClip(part) then
+			local keep = {}
+			for _, cell in ipairs(g.cells) do
+				local bx, bz = math.floor(cell.pos.X), math.floor(cell.pos.Z)
+				local r = c.probeRadius * math.max(cell.size or c.step, c.step)
+				local r2 = r * r
+				local drop = false
+				for ox = -1, 1 do
+					for oz = -1, 1 do
+						for _, fc in ipairs(floorB[(bx + ox) .. ":" .. (bz + oz)] or {}) do
+							local dx, dz = fc.pos.X - cell.pos.X, fc.pos.Z - cell.pos.Z
+							if dx * dx + dz * dz <= r2 then
+								local dy = fc.pos.Y - cell.pos.Y
+								-- coincident: the floor already owns this spot
+								-- above:      the ramp runs on under a landing
+								if math.abs(dy) <= c.flushTol or dy > c.flushTol then
+									drop = true
+								end
+							end
+						end
+					end
+				end
+				if drop then removed += 1 else keep[#keep + 1] = cell end
+			end
+			g.cells = keep
+			g.index, g.subIndex = {}, {}
+			for _, cell in ipairs(keep) do
+				local k = string.format("%d:%d", cell.ui, cell.vi)
+				if cell.sub then g.subIndex[k] = cell else g.index[k] = cell end
+			end
+		end
+	end
+	return removed
+end
+
 -- Mark every cell with the directions in which it has a wall and the
 -- directions in which it has air.
 --
@@ -580,6 +647,12 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 	end
 	probe:Destroy()
 
+	local clipPruned = 0
+	if c.clipRampPrune ~= false then
+		clipPruned = pruneClipRampOverlap(grids, c)
+		nCells -= clipPruned
+	end
+
 	local data = {
 		grids = grids, config = c,
 		stats = {
@@ -589,6 +662,8 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 			-- turned out to be standable at half. `subDead` is the other half of
 			-- the split -- quadrants that stayed solid.
 			subCells = nSubCells, subDead = nSubDead,
+			-- ramp cells dropped for coinciding with, or sitting under, floor
+			clipPruned = clipPruned,
 		},
 	}
 	LocalGrid.classifyNodes(data, cfg)
