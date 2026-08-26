@@ -524,19 +524,29 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	-- would shrink the window below what a full neighbour needs and turn every
 	-- sub-to-full join into a false dropoff.
 	local function matchR2(a: number, b: number): number
-		-- NEVER SHRINK BELOW THE GRID STEP. probeRadius exists because a
-		-- neighbouring grid's lattice does not line up with ours, so the nearest
-		-- cell can sit up to pitch*sqrt(2)/2 away. That bound assumes a COMPLETE
-		-- lattice at that pitch -- and subcells are not one. Only cells that met
-		-- solid were ever split, so the half-pitch lattice is sparse and its
-		-- nearest member can be far further off than 0.35 studs.
-		--
-		-- Sizing the window off two half-pitch cells gave 0.375, and a level
-		-- floor cell sitting exactly 0.500 away was missed: the cell reported a
-		-- dropoff with walkable floor right beside it. The coarse step is what
-		-- the misalignment is actually measured against, so it is the floor.
+		-- probeRadius exists because a neighbouring grid's lattice does not line
+		-- up with ours, so the nearest cell can sit up to pitch*sqrt(2)/2 away.
+		-- That bound assumes a COMPLETE lattice at that pitch, and subcells are
+		-- not one: only cells that met solid were split, so the half-pitch
+		-- lattice is sparse and its nearest member can be much further off.
+		-- Sizing off two half-pitch cells gave 0.375 and missed level floor
+		-- sitting exactly 0.500 away. The coarse step is the floor of the window.
 		local r = c.probeRadius * math.max(a, b, c.step)
 		return r * r
+	end
+	-- A window wide enough for a foreign lattice is wider than a subcell's own
+	-- step, so on its own it matches THE CELL WE ARE STANDING ON: the sample
+	-- point is only cell.size away, well inside 0.75. Every subcell would then
+	-- find floor beneath itself and no subcell could ever report a wall.
+	--
+	-- Distance alone cannot separate those. Direction can: a genuine neighbour
+	-- lies nearer the sample point than it does to the cell we are testing from.
+	-- That excludes the origin cell (distance 0 to itself) and its diagonal
+	-- partners, while keeping any cell that actually sits out at the sample.
+	local function isNeighbour(q: Vector3, p: Vector3, from: Vector3): boolean
+		local ax, az = q.X - p.X, q.Z - p.Z
+		local bx, bz = q.X - from.X, q.Z - from.Z
+		return (ax * ax + az * az) < (bx * bx + bz * bz)
 	end
 	local tol = c.flushTol
 	local nWall, nDrop, nBoth, nCornerOnly = 0, 0, 0, 0
@@ -566,7 +576,8 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 						for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
 							local q = e.cell.pos
 							local dx, dz = q.X - p.X, q.Z - p.Z
-							if dx * dx + dz * dz <= matchR2(csize, e.cell.size or c.step) then
+							if dx * dx + dz * dz <= matchR2(csize, e.cell.size or c.step)
+								and isNeighbour(q, p, cell.pos) then
 								-- MEASURED AGAINST WHERE THIS SURFACE WOULD CONTINUE,
 								-- not against our own height. `p` lies on this grid's
 								-- own plane, so on a tilted slab the next cell along
@@ -596,6 +607,7 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 									local q = e.dead.pos
 									local dx, dz = q.X - p.X, q.Z - p.Z
 									if dx * dx + dz * dz <= matchR2(csize, e.dead.size or c.step)
+										and isNeighbour(q, p, cell.pos)
 										and e.dead.killer
 										and math.abs(q.Y - p.Y) <= tol then
 										above = true
