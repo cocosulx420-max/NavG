@@ -16,6 +16,8 @@ export type Cell = {
 	-- anything that steps between cells must read this and not grid.step.
 	size: number,
 	sub: boolean?,            -- true => recovered from a subdivided dead cell
+	-- corner-only, but sitting in a break in the boundary, so it counts
+	bridge: boolean?,
 	pui: number?, pvi: number?, -- parent cell's lattice indices (subcells only)
 	-- Set by classifyNodes. Bitmasks over DIR8, plus the booleans they imply.
 	wallMask: number?,        -- directions with a surface standing above us
@@ -56,7 +58,7 @@ export type Grid = {
 export type Config = {
 	step: number?, maxSlope: number?, clearCap: number?, minClearance: number?,
 	flushTol: number?, probeRadius: number?,
-	subdivLevels: number?, cardinalEdges: boolean?,
+	subdivLevels: number?, cardinalEdges: boolean?, bridgeCorners: boolean?,
 	clipRampDedupe: boolean?, clipRampDedupeFactor: number?,
 }
 
@@ -80,8 +82,10 @@ local DEFAULT = {
 	-- How many times a boundary cell may be halved. 0 = off (original
 	-- behaviour), 1 = 0.5 stud, 2 = 0.25 stud.
 	subdivLevels = 1,
-	-- Only a shared EDGE makes a cell boundary; a shared corner does not.
+	-- Only a shared EDGE makes a cell boundary; a shared corner does not...
 	cardinalEdges = true,
+	-- ...unless dropping it would break the run. See the second pass.
+	bridgeCorners = true,
 	-- Drop floor cells that sit exactly on top of a ClipRamp cell. Keep the
 	-- ones merely near it -- those are the floor's own edge beside the ramp.
 	clipRampDedupe = true,
@@ -601,6 +605,70 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 			if cell.dropoff then nDrop += 1 end
 			if cell.wall and cell.dropoff then nBoth += 1 end
 		end
+	end
+
+	-- SECOND PASS: put back the corner-only cells that were holding the boundary
+	-- together.
+	--
+	-- CARDINAL_MASK drops a cell whose only wall lies diagonally, on the grounds
+	-- that a corner touch is not a border. That is right for a lone cell at a
+	-- convex corner -- a spur, and noise to a line fitter. It is wrong wherever
+	-- the boundary itself runs diagonally: there the corner-touch cells ARE the
+	-- chain, and dropping them opens a gap in the run.
+	--
+	-- Measured on the test map, of 672 cells the rule excluded, 603 had two or
+	-- more edge neighbours -- they were sitting in a break, not sticking out of
+	-- one. Only 69 were the isolated spurs the rule was written for.
+	--
+	-- So the test is not "does it touch a wall edge-on" but "is it isolated".
+	-- Two or more edge neighbours means it is part of the run and it stays.
+	-- Decided from the FIRST pass's results only, so no cell promoted here can
+	-- promote another and cascade.
+	if c.cardinalEdges ~= false and c.bridgeCorners ~= false then
+		local edgeB: {[string]: {any}} = {}
+		for _, g in pairs(data.grids) do
+			for _, cell in ipairs(g.cells) do
+				if cell.wall or cell.dropoff then
+					local k = math.floor(cell.pos.X) .. ":" .. math.floor(cell.pos.Z)
+					local b = edgeB[k]; if not b then b = {}; edgeB[k] = b end
+					b[#b + 1] = cell
+				end
+			end
+		end
+		local promoted = 0
+		for _, g in pairs(data.grids) do
+			for _, cell in ipairs(g.cells) do
+				local w, d = cell.wallMask or 0, cell.dropMask or 0
+				if not (cell.wall or cell.dropoff) and (w ~= 0 or d ~= 0) then
+					local n = 0
+					for _, dir in ipairs(DIR8) do
+						local p = neighbourPos(g, cell, dir)
+						local px, pz = math.floor(p.X), math.floor(p.Z)
+						local hit = false
+						for ox = -1, 1 do
+							for oz = -1, 1 do
+								for _, e in ipairs(edgeB[(px + ox) .. ":" .. (pz + oz)] or {}) do
+									local dx, dz = e.pos.X - p.X, e.pos.Z - p.Z
+									local r = 0.6 * math.max(cell.size or c.step, e.size or c.step)
+									if dx * dx + dz * dz <= r * r then hit = true end
+								end
+							end
+						end
+						if hit then n += 1 end
+					end
+					if n >= 2 then
+						cell.wall, cell.dropoff = w ~= 0, d ~= 0
+						cell.bridge = true
+						promoted += 1
+						if cell.wall then nWall += 1 end
+						if cell.dropoff then nDrop += 1 end
+						if cell.wall and cell.dropoff then nBoth += 1 end
+						nCornerOnly -= 1
+					end
+				end
+			end
+		end
+		data.stats.bridgeCorners = promoted
 	end
 
 	data.stats.wallNodes, data.stats.dropNodes, data.stats.bothNodes = nWall, nDrop, nBoth
