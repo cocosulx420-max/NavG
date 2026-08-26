@@ -56,6 +56,7 @@ export type Grid = {
 export type Config = {
 	step: number?, maxSlope: number?, clearCap: number?, minClearance: number?,
 	flushTol: number?, probeRadius: number?,
+	subdivLevels: number?,
 }
 
 local DEFAULT = {
@@ -75,6 +76,9 @@ local DEFAULT = {
 	-- `step` can be up to step*sqrt(2)/2 ~= 0.707 away. Anything below that and
 	-- a foreign floor reads as air, which turns every part join into a dropoff.
 	probeRadius = 0.75,
+	-- How many times a boundary cell may be halved. 0 = off (original
+	-- behaviour), 1 = 0.5 stud, 2 = 0.25 stud.
+	subdivLevels = 1,
 }
 
 local UP = Vector3.new(0, 1, 0)
@@ -214,53 +218,121 @@ local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll:
 		end
 	end
 
-	-- Pass two: SUBDIVIDE EVERY DEAD CELL ONCE.
+	-- Pass two: REFINE EVERY CELL WHOSE FOOTPRINT MEETS SOLID.
 	--
-	-- A dead cell means "the sample point at this cell's centre is inside
-	-- something". At 1-stud pitch that verdict is all-or-nothing, which is
-	-- exactly where the staircase comes from: a cell 10% buried in a skewed wall
-	-- and a cell 90% buried are both simply gone, so the boundary can only ever
-	-- land on the lattice.
+	-- Two different things qualify, and conflating them was the first version's
+	-- mistake:
 	--
-	-- Splitting each dead cell into four half-pitch samples and re-testing gives
-	-- the boundary a second, finer place to land. The partially-buried cell
-	-- recovers the quadrants that are actually clear; the fully-buried one
-	-- recovers nothing and stays gone. The result is still a staircase -- it is
-	-- a staircase at half the amplitude, with intermediate treads that say
-	-- whether a step is one edge continuing or a genuinely new one.
+	--   dead cell  -- the sample AT ITS CENTRE is inside something.
+	--   live cell  -- the centre is clear, but the cell's own square pokes into
+	--                 a wall. Standable, correctly kept, but its extent is a lie:
+	--                 the tile drawn for it overlaps geometry you cannot stand in.
 	--
-	-- The parent dead cell is REPLACED by its four children, so a dead cell in
-	-- the output always describes solid at its own recorded size.
-	local parents = grid.dead
-	grid.dead, grid.deadIndex = {}, {}
-	local half = step * 0.5
-	for _, d in ipairs(parents) do
-		for sx = 0, 1 do
-			for sy = 0, 1 do
-				local hu, hv = 2 * d.ui + sx, 2 * d.vi + sy
-				local sp = corner
-					+ u * ((d.ui + 0.25 + 0.5 * sx) * step)
-					+ v * ((d.vi + 0.25 + 0.5 * sy) * step)
-				local status, res, slope, clearance, inst = evalSample(sp)
-				if status == "miss" then continue end
-				local k = string.format("%d:%d", hu, hv)
-				if status == "dead" then
-					local sd: DeadCell = {
-						ui = hu, vi = hv, pos = res.Position, killer = inst,
-						size = half, sub = true,
-					}
-					grid.dead[#grid.dead + 1] = sd
-					grid.deadIndex[k] = sd
-					continue
-				end
-				local cell: Cell = {
-					ui = hu, vi = hv, pos = res.Position, normal = res.Normal,
-					slope = slope, clearance = clearance, cover = inst,
-					size = half, sub = true, pui = d.ui, pvi = d.vi,
-				}
-				grid.cells[#grid.cells + 1] = cell
-				grid.subIndex[k] = cell
+	-- Both are the same defect seen from either side -- a 1-stud verdict standing
+	-- in for a boundary that does not run along the lattice. A cell 10% buried
+	-- and one 90% buried are indistinguishable, so the edge can only land on
+	-- lattice lines, and that is the staircase.
+	--
+	-- Splitting a qualifying cell into four and re-testing gives the boundary a
+	-- finer place to land. Repeat per level: pitch halves, staircase amplitude
+	-- halves. Cost is driven by BOUNDARY LENGTH, not area -- only cells that
+	-- actually meet solid ever split -- so it grows ~2x per level, not 4x.
+	--
+	-- A parent is always REPLACED by its children, so every cell in the output
+	-- describes the world at its own recorded size.
+	--
+	-- Termination rule differs by kind, and this matters:
+	--   dead at the final level -> deleted. Nothing standable was found.
+	--   live at the final level -> KEPT, even if it still overlaps. Its centre is
+	--     clear, so it is real floor. Deleting it would throw away walkable
+	--     surface to make the outline tidy, which is exactly backwards for a
+	--     project whose whole value is finding 1-stud parkour ledges.
+	local levels = math.max(0, math.floor(c.subdivLevels or 1))
+
+	-- Does this cell's SQUARE (not just its centre) intersect anything but our
+	-- own part? The centre test cannot see this: a cell can have a clear centre
+	-- and still be half inside a wall.
+	local function footprintHits(pos: Vector3, sz: number): boolean
+		probe.Size = Vector3.new(sz * 0.98, c.minClearance - 0.1, sz * 0.98)
+		probe.CFrame = CFrame.fromMatrix(pos + n * ((c.minClearance - 0.1) * 0.5), u, n)
+		for _, hit in ipairs(workspace:GetPartsInPart(probe, op)) do
+			if hit ~= part then return true end
+		end
+		return false
+	end
+	-- evalSample uses the point probe; restore it after every footprint test.
+	local function pointProbe()
+		probe.Size = Vector3.new(0.05, c.minClearance - 0.1, 0.05)
+	end
+
+	if levels > 0 then
+		-- Seed: every dead cell, plus every live cell whose square meets solid.
+		-- ui/vi are carried in units of the CURRENT level's lattice.
+		local work = {}
+		for _, d in ipairs(grid.dead) do
+			work[#work + 1] = { ui = d.ui, vi = d.vi }
+		end
+		local keptCells = {}
+		for _, cell in ipairs(grid.cells) do
+			if footprintHits(cell.pos, cell.size) then
+				work[#work + 1] = { ui = cell.ui, vi = cell.vi }
+			else
+				keptCells[#keptCells + 1] = cell
 			end
+		end
+		pointProbe()
+		grid.cells, grid.index = keptCells, {}
+		for _, cell in ipairs(keptCells) do
+			grid.index[string.format("%d:%d", cell.ui, cell.vi)] = cell
+		end
+		grid.dead, grid.deadIndex = {}, {}
+
+		local pitch = step
+		for level = 1, levels do
+			local child = pitch * 0.5
+			local nextWork = {}
+			for _, w in ipairs(work) do
+				for sx = 0, 1 do
+					for sy = 0, 1 do
+						local hu, hv = 2 * w.ui + sx, 2 * w.vi + sy
+						-- centre of this child on the face, in stud units
+						local cu = (hu + 0.5) * child
+						local cv = (hv + 0.5) * child
+						local sp = corner + u * cu + v * cv
+						local status, res, slope, clearance, inst = evalSample(sp)
+						if status == "miss" then continue end
+						local k = string.format("%d:%d", hu, hv)
+						if status == "dead" then
+							if level < levels then
+								nextWork[#nextWork + 1] = { ui = hu, vi = hv }
+							else
+								local sd: DeadCell = {
+									ui = hu, vi = hv, pos = res.Position,
+									killer = inst, size = child, sub = true,
+								}
+								grid.dead[#grid.dead + 1] = sd
+								grid.deadIndex[k] = sd
+							end
+							continue
+						end
+						local cell: Cell = {
+							ui = hu, vi = hv, pos = res.Position, normal = res.Normal,
+							slope = slope, clearance = clearance, cover = inst,
+							size = child, sub = true, pui = w.ui, pvi = w.vi,
+						}
+						if level < levels and footprintHits(res.Position, child) then
+							pointProbe()
+							nextWork[#nextWork + 1] = { ui = hu, vi = hv }
+						else
+							pointProbe()
+							grid.cells[#grid.cells + 1] = cell
+							grid.subIndex[k] = cell
+						end
+					end
+				end
+			end
+			work = nextWork
+			pitch = child
 		end
 	end
 
