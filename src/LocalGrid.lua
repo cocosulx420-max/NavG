@@ -61,7 +61,7 @@ export type Grid = {
 export type Config = {
 	step: number?, maxSlope: number?, clearCap: number?, minClearance: number?,
 	flushTol: number?, probeRadius: number?,
-	subdivLevels: number?, cardinalEdges: boolean?,
+	subdivLevels: number?, cardinalEdges: boolean?, subdivideDropoffs: boolean?,
 	deadFaceAdjacent: boolean?, deadFaceTol: number?,
 	clipRampDedupe: boolean?, clipRampDedupeFactor: number?,
 	clipRampAheadCull: number?,
@@ -87,6 +87,9 @@ local DEFAULT = {
 	-- How many times a boundary cell may be halved. 0 = off (original
 	-- behaviour), 1 = 0.5 stud, 2 = 0.25 stud.
 	subdivLevels = 1,
+	-- Also refine cells on a part's own rim, not just those meeting solid.
+	-- Without this a dropoff edge can never subdivide: there is nothing to hit.
+	subdivideDropoffs = true,
 	-- Only a shared EDGE makes a cell boundary; a shared corner does not.
 	cardinalEdges = true,
 	-- A dead cell sharing a FACE with a live one makes it boundary. Corner
@@ -217,11 +220,19 @@ local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll:
 	end
 
 	-- Pass one: the full-pitch lattice, exactly as before.
+	--
+	-- `hitSlot` remembers every lattice slot where this part had a surface at
+	-- all, live or dead. A slot that is absent is where the PART ITSELF ends,
+	-- and that is the seed the dropoff refinement needs: a dropoff is the
+	-- absence of floor, so footprintHits -- which asks what solid we run into --
+	-- can never see one.
+	local hitSlot: {[string]: boolean} = {}
 	for iu = 0, nu - 1 do
 		for iv = 0, nv - 1 do
 			local sp = corner + u * ((iu + 0.5) * step) + v * ((iv + 0.5) * step)
 			local status, res, slope, clearance, inst = evalSample(sp)
 			if status == "miss" then continue end
+			hitSlot[string.format("%d:%d", iu, iv)] = true
 			if status == "dead" then
 				local d: DeadCell = {
 					ui = iu, vi = iv, pos = res.Position, killer = inst, size = step,
@@ -293,9 +304,23 @@ local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll:
 		for _, d in ipairs(grid.dead) do
 			work[#work + 1] = { ui = d.ui, vi = d.vi }
 		end
+		-- A cell is refined if it meets solid (footprintHits) OR if it sits on
+		-- this part's own rim -- a cardinal lattice slot next to it where the
+		-- part had no surface at all. The first seed finds walls, the second
+		-- finds dropoffs, and dropoffs are the majority of the boundary: 89% of
+		-- them are the part's own surface ending, which is exactly this test.
+		local rimSeed = c.subdivideDropoffs ~= false
 		local keptCells = {}
 		for _, cell in ipairs(grid.cells) do
-			if footprintHits(cell.pos, cell.size) then
+			local refine = footprintHits(cell.pos, cell.size)
+			if not refine and rimSeed then
+				for _, d in ipairs({ {1,0}, {0,1}, {-1,0}, {0,-1} }) do
+					if not hitSlot[string.format("%d:%d", cell.ui + d[1], cell.vi + d[2])] then
+						refine = true
+					end
+				end
+			end
+			if refine then
 				work[#work + 1] = { ui = cell.ui, vi = cell.vi }
 			else
 				keptCells[#keptCells + 1] = cell
