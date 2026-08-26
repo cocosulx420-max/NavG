@@ -56,7 +56,7 @@ export type Grid = {
 export type Config = {
 	step: number?, maxSlope: number?, clearCap: number?, minClearance: number?,
 	flushTol: number?, probeRadius: number?,
-	subdivLevels: number?, cardinalEdges: boolean?, killDepthTol: number?,
+	subdivLevels: number?, cardinalEdges: boolean?,
 	clipRampDedupe: boolean?, clipRampDedupeFactor: number?,
 }
 
@@ -82,9 +82,6 @@ local DEFAULT = {
 	subdivLevels = 1,
 	-- Only a shared EDGE makes a cell boundary; a shared corner does not.
 	cardinalEdges = true,
-	-- How far a subdivided cell's centre may sit inside a blocker and still
-	-- live. Below this it is a hairline, not an obstruction. 0 = off.
-	killDepthTol = 0.03,
 	-- Drop floor cells that sit exactly on top of a ClipRamp cell. Keep the
 	-- ones merely near it -- those are the floor's own edge beside the ramp.
 	clipRampDedupe = true,
@@ -171,32 +168,6 @@ local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll:
 	local nv = math.max(1, math.floor(2 * vExt / step + 1e-6))
 	local castH = 2 -- studs above the surface to start the (downward-along-normal) ray
 
-	-- How far is `pt` inside `blocker`, measured in the walking plane?
-	--
-	-- A ray never hits the part it starts inside, so this cannot be measured
-	-- outward from the point. Cast INWARD instead: start a stud away along each
-	-- in-plane axis and aim back at the point. The hit is the face, and what is
-	-- left of the stud is the penetration along that axis. The shallowest axis
-	-- is the answer -- that is the nearest way out.
-	--
-	-- No hit on an axis means the face is further than a stud that way, so the
-	-- point is deep; math.huge stands in and the cell dies as before.
-	local depthRP = RaycastParams.new()
-	depthRP.FilterType = Enum.RaycastFilterType.Include
-	local function pierceDepth(pt: Vector3, blocker: BasePart): number
-		depthRP.FilterDescendantsInstances = { blocker }
-		local R = 1
-		local best = math.huge
-		for _, dir in ipairs({ u, -u, v, -v }) do
-			local res = workspace:Raycast(pt + dir * R, -dir * R, depthRP)
-			if res then
-				local d = R - res.Distance
-				if d < best then best = d end
-			end
-		end
-		return best
-	end
-
 	-- Evaluate ONE sample point on the face. `sp` is the sample's centre in the
 	-- part's face plane. Returns "miss" (no surface / too steep, nothing to
 	-- record), "dead" (something is there we cannot stand in) or "live", plus
@@ -205,24 +176,14 @@ local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll:
 	-- Split out of the main loop so the subdivision pass re-tests a subcell with
 	-- BYTE-FOR-BYTE the same rules as a full cell. If the two ever diverge, a
 	-- recovered subcell stops being comparable to the cells around it.
-	-- `depthTol` > 0 means: a blocker that the centre is only just inside does
-	-- NOT kill the cell. The centre is a single point standing in for a whole
-	-- square, and at eight gaps in an otherwise continuous edge the killed
-	-- samples sat 0.020 to 0.119 studs in -- cells ~97% clear, deleted over a
-	-- hairline. Past the tolerance the cell dies exactly as it always did.
-	local function evalSample(sp: Vector3, depthTol: number?)
+	local function evalSample(sp: Vector3)
 		local res = workspace:Raycast(sp + n * castH, -n * (castH + 0.5), rpPart)
 		if not res then return "miss" end
 		local slope = math.deg(math.acos(math.clamp(res.Normal:Dot(UP), -1, 1)))
 		if not ((slope <= c.maxSlope) or isClip(part)) then return "miss" end
 		probe.CFrame = CFrame.new(res.Position + UP * (0.1 + (c.minClearance - 0.1) * 0.5))
 		for _, hit in ipairs(workspace:GetPartsInPart(probe, op)) do
-			if hit ~= part then
-				if not (depthTol and depthTol > 0 and hit:IsA("BasePart")
-					and pierceDepth(res.Position, hit) <= depthTol) then
-					return "dead", res, slope, nil, hit
-				end
-			end
+			if hit ~= part then return "dead", res, slope, nil, hit end
 		end
 		local upRes = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap, filterAll)
 		local clearance = upRes and upRes.Distance or c.clearCap
@@ -345,7 +306,7 @@ local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll:
 						local cu = (hu + 0.5) * child
 						local cv = (hv + 0.5) * child
 						local sp = corner + u * cu + v * cv
-						local status, res, slope, clearance, inst = evalSample(sp, c.killDepthTol)
+						local status, res, slope, clearance, inst = evalSample(sp)
 						if status == "miss" then continue end
 						local k = string.format("%d:%d", hu, hv)
 						if status == "dead" then
