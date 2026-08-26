@@ -436,9 +436,15 @@ end
 -- already covers what the floor cell covered, and the ramp stays unbroken
 -- across the join.
 --
--- Ramp cells with floor ABOVE them are still dropped. Those are the tail of the
--- ramp running on underneath a landing, where nothing can walk, and no floor
--- cell duplicates them.
+-- Nothing is removed from the ramp. An earlier version also dropped ramp cells
+-- that had floor above them, meaning to cull the tail running on under a
+-- landing -- but a 45 degree ramp falls a full stud per stud, so near the head
+-- the landing sits more than flushTol above the ramp's continuation and the
+-- rule ate exactly the cells that bridge the join. The landing then had nothing
+-- to stand on next to it and read as a WALL.
+--
+-- That cull was redundant anyway: a ramp cell genuinely buried under a landing
+-- has less than minClearance of headroom, so evalSample has already killed it.
 local function pruneClipRampOverlap(grids: any, c: any)
 	local rampB: {[string]: {any}} = {}
 	for part, g in pairs(grids) do
@@ -486,43 +492,7 @@ local function pruneClipRampOverlap(grids: any, c: any)
 		end
 	end
 
-	-- Pass B: drop RAMP cells that run on under a landing. Uses the floor set
-	-- AFTER pass A, so a cell removed above can never count as "floor overhead".
-	local floorB: {[string]: {any}} = {}
-	for part, g in pairs(grids) do
-		if not isClip(part) then
-			for _, cell in ipairs(g.cells) do
-				local k = math.floor(cell.pos.X) .. ":" .. math.floor(cell.pos.Z)
-				local b = floorB[k]; if not b then b = {}; floorB[k] = b end
-				b[#b + 1] = cell
-			end
-		end
-	end
-	local rampDropped = 0
-	for part, g in pairs(grids) do
-		if isClip(part) then
-			local keep = {}
-			for _, cell in ipairs(g.cells) do
-				local bx, bz = math.floor(cell.pos.X), math.floor(cell.pos.Z)
-				local r = c.probeRadius * math.max(cell.size or c.step, c.step)
-				local r2, drop = r * r, false
-				for ox = -1, 1 do
-					for oz = -1, 1 do
-						for _, fc in ipairs(floorB[(bx + ox) .. ":" .. (bz + oz)] or {}) do
-							local dx, dz = fc.pos.X - cell.pos.X, fc.pos.Z - cell.pos.Z
-							if dx * dx + dz * dz <= r2 and (fc.pos.Y - cell.pos.Y) > c.flushTol then
-								drop = true
-							end
-						end
-					end
-				end
-				if drop then rampDropped += 1 else keep[#keep + 1] = cell end
-			end
-			g.cells = keep
-			reindex(g)
-		end
-	end
-	return floorDropped, rampDropped
+	return floorDropped, 0
 end
 
 -- Mark every cell with the directions in which it has a wall and the
