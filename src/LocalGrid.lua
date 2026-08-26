@@ -57,6 +57,7 @@ export type Config = {
 	step: number?, maxSlope: number?, clearCap: number?, minClearance: number?,
 	flushTol: number?, probeRadius: number?,
 	subdivLevels: number?, cardinalEdges: boolean?,
+	clipRampDedupe: boolean?, clipRampDedupeFactor: number?,
 }
 
 local DEFAULT = {
@@ -81,6 +82,10 @@ local DEFAULT = {
 	subdivLevels = 1,
 	-- Only a shared EDGE makes a cell boundary; a shared corner does not.
 	cardinalEdges = true,
+	-- Drop floor cells that sit exactly on top of a ClipRamp cell. Keep the
+	-- ones merely near it -- those are the floor's own edge beside the ramp.
+	clipRampDedupe = true,
+	clipRampDedupeFactor = 0.6,
 }
 
 local UP = Vector3.new(0, 1, 0)
@@ -414,6 +419,70 @@ local function neighbourPos(g: Grid, cell: Cell, d: {number}): Vector3
 	return cell.pos + Vector3.new(d[1] * sp, 0, d[2] * sp)
 end
 
+-- A ClipRamp is an invisible collision ramp laid over authored stairs. Where it
+-- meets the floor at its foot, the floor grid and the ramp grid both emit a
+-- node for the SAME SPOT -- centres about 0.1 studs apart, heights within
+-- 0.12. The floor's copy is then flagged as a wall by the ramp sitting just
+-- above it: a phantom wall across the very place you walk onto the ramp.
+--
+-- Only the exact duplicates go. Floor cells merely NEAR the ramp are kept, and
+-- deliberately so -- they are the floor's own edge running alongside the ramp,
+-- and they are what lets the floor's edges be merged with the ramp's later.
+--
+-- The two populations separate cleanly by HORIZONTAL DISTANCE, and by nothing
+-- else. Measured at a ramp foot: duplicates sit 0.09-0.27 studs from the
+-- nearest ramp cell, the floor edge beside the ramp sits 0.38-0.64, and the
+-- height difference is +0.12 for BOTH. So the threshold is a fraction of a
+-- cell, not a step height, and it must stay well under half a cell -- an
+-- earlier attempt used probeRadius (0.75) and deleted the good ones too.
+--
+-- Nothing is removed from the ramp itself.
+local function pruneClipRampDuplicates(grids: any, c: any): number
+	local rampB: {[string]: {any}} = {}
+	for part, g in pairs(grids) do
+		if isClip(part) then
+			for _, cell in ipairs(g.cells) do
+				local k = math.floor(cell.pos.X) .. ":" .. math.floor(cell.pos.Z)
+				local b = rampB[k]; if not b then b = {}; rampB[k] = b end
+				b[#b + 1] = cell
+			end
+		end
+	end
+	if next(rampB) == nil then return 0 end
+
+	local factor = c.clipRampDedupeFactor or 0.6
+	local removed = 0
+	for part, g in pairs(grids) do
+		if not isClip(part) then
+			local keep = {}
+			for _, cell in ipairs(g.cells) do
+				local bx, bz = math.floor(cell.pos.X), math.floor(cell.pos.Z)
+				local dup = false
+				for ox = -1, 1 do
+					for oz = -1, 1 do
+						for _, rc in ipairs(rampB[(bx + ox) .. ":" .. (bz + oz)] or {}) do
+							local dx, dz = rc.pos.X - cell.pos.X, rc.pos.Z - cell.pos.Z
+							local lim = factor * math.min(cell.size, rc.size)
+							if dx * dx + dz * dz <= lim * lim
+								and math.abs(rc.pos.Y - cell.pos.Y) <= c.flushTol then
+								dup = true
+							end
+						end
+					end
+				end
+				if dup then removed += 1 else keep[#keep + 1] = cell end
+			end
+			g.cells = keep
+			g.index, g.subIndex = {}, {}
+			for _, cell in ipairs(keep) do
+				local k = string.format("%d:%d", cell.ui, cell.vi)
+				if cell.sub then g.subIndex[k] = cell else g.index[k] = cell end
+			end
+		end
+	end
+	return removed
+end
+
 -- Mark every cell with the directions in which it has a wall and the
 -- directions in which it has air.
 --
@@ -580,6 +649,12 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 	end
 	probe:Destroy()
 
+	local clipDupes = 0
+	if c.clipRampDedupe ~= false then
+		clipDupes = pruneClipRampDuplicates(grids, c)
+		nCells -= clipDupes
+	end
+
 	local data = {
 		grids = grids, config = c,
 		stats = {
@@ -589,6 +664,8 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 			-- turned out to be standable at half. `subDead` is the other half of
 			-- the split -- quadrants that stayed solid.
 			subCells = nSubCells, subDead = nSubDead,
+			-- floor cells removed for duplicating a ClipRamp cell outright
+			clipDupes = clipDupes,
 		},
 	}
 	LocalGrid.classifyNodes(data, cfg)
