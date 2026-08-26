@@ -16,6 +16,8 @@ export type Cell = {
 	-- anything that steps between cells must read this and not grid.step.
 	size: number,
 	sub: boolean?,            -- true => recovered from a subdivided dead cell
+	-- made boundary because a dead cell shares a FACE with it
+	deadFace: boolean?,
 	-- marked by the ramp ahead-cull; kept through classifyNodes so it still
 	-- reads as floor to its neighbours, then dropped
 	aheadCull: boolean?,
@@ -60,6 +62,7 @@ export type Config = {
 	step: number?, maxSlope: number?, clearCap: number?, minClearance: number?,
 	flushTol: number?, probeRadius: number?,
 	subdivLevels: number?, cardinalEdges: boolean?,
+	deadFaceAdjacent: boolean?, deadFaceTol: number?,
 	clipRampDedupe: boolean?, clipRampDedupeFactor: number?,
 	clipRampAheadCull: number?,
 }
@@ -86,6 +89,10 @@ local DEFAULT = {
 	subdivLevels = 1,
 	-- Only a shared EDGE makes a cell boundary; a shared corner does not.
 	cardinalEdges = true,
+	-- A dead cell sharing a FACE with a live one makes it boundary. Corner
+	-- contact does not; the measured gap is 0.79 vs 1.06 studs centre to centre.
+	deadFaceAdjacent = true,
+	deadFaceTol = 0.12,
 	-- Drop floor cells that sit exactly on top of a ClipRamp cell. Keep the
 	-- ones merely near it -- those are the floor's own edge beside the ramp.
 	clipRampDedupe = true,
@@ -792,6 +799,74 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 			if cell.dropoff then nDrop += 1 end
 			if cell.wall and cell.dropoff then nBoth += 1 end
 		end
+	end
+
+	-- A DEAD CELL FACE-ADJACENT TO US IS A WALL.
+	--
+	-- A dead cell is a place something solid stands. A live cell sharing a FACE
+	-- with one is therefore bordering solid, and is boundary -- but the main
+	-- pass can miss it, because that pass asks what is at a neighbour SLOT and
+	-- stops at the first floor it finds within probeRadius. Where a slot holds
+	-- both a live cell and a dead one, the floor wins and the dead cell is never
+	-- considered.
+	--
+	-- FACE-adjacent, not corner-adjacent, and the distinction is the whole rule
+	-- -- the same shared-edge-not-shared-corner principle as CARDINAL_MASK.
+	-- Measured against hand-marked cases: the ones that should promote sit
+	-- 0.791 studs centre to centre, which is (1.00 + 0.50)/2 plus 0.041 of
+	-- lattice offset. The ones that should NOT sit at 1.061 = 0.75 * sqrt(2),
+	-- diagonal, touching only at a corner. A radius around the neighbour slot
+	-- cannot tell those apart, which is how corner-touchers got in and put a
+	-- redundant second row outboard of the real boundary: 524 promotions instead
+	-- of 94.
+	if c.deadFaceAdjacent ~= false then
+		local tol = c.deadFaceTol or 0.12
+		local promoted = 0
+		for _, g in pairs(data.grids) do
+			if not g.fallback and g.u and g.v then
+				local deadB: {[string]: {any}} = {}
+				for _, d in ipairs(g.dead) do
+					local k = math.floor(d.pos.X) .. ":" .. math.floor(d.pos.Z)
+					local b = deadB[k]; if not b then b = {}; deadB[k] = b end
+					b[#b + 1] = d
+				end
+				for _, cell in ipairs(g.cells) do
+					if not (cell.wall or cell.dropoff) then
+						local bx, bz = math.floor(cell.pos.X), math.floor(cell.pos.Z)
+						local hitDir = nil
+						for ox = -1, 1 do
+							for oz = -1, 1 do
+								for _, d in ipairs(deadB[(bx + ox) .. ":" .. (bz + oz)] or {}) do
+									local off = d.pos - cell.pos
+									local dx, dz = off.X, off.Z
+									if math.sqrt(dx * dx + dz * dz)
+										<= (cell.size + d.size) * 0.5 + tol then
+										hitDir = off
+									end
+								end
+							end
+						end
+						if hitDir then
+							-- record WHICH cardinal it came from, so the mask stays
+							-- meaningful to anything reading it downstream
+							local du, dv = hitDir:Dot(g.u), hitDir:Dot(g.v)
+							local bit
+							if math.abs(du) >= math.abs(dv) then
+								bit = du >= 0 and 1 or 5
+							else
+								bit = dv >= 0 and 3 or 7
+							end
+							cell.wallMask = bit32.bor(cell.wallMask or 0, bit32.lshift(1, bit - 1))
+							cell.wall = true
+							cell.deadFace = true
+							nWall += 1
+							promoted += 1
+						end
+					end
+				end
+			end
+		end
+		data.stats.deadFacePromoted = promoted
 	end
 
 	data.stats.wallNodes, data.stats.dropNodes, data.stats.bothNodes = nWall, nDrop, nBoth
