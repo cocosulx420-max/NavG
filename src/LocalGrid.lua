@@ -56,7 +56,7 @@ export type Grid = {
 export type Config = {
 	step: number?, maxSlope: number?, clearCap: number?, minClearance: number?,
 	flushTol: number?, probeRadius: number?,
-	subdivLevels: number?,
+	subdivLevels: number?, cardinalEdges: boolean?,
 }
 
 local DEFAULT = {
@@ -79,6 +79,8 @@ local DEFAULT = {
 	-- How many times a boundary cell may be halved. 0 = off (original
 	-- behaviour), 1 = 0.5 stud, 2 = 0.25 stud.
 	subdivLevels = 1,
+	-- Only a shared EDGE makes a cell boundary; a shared corner does not.
+	cardinalEdges = true,
 }
 
 local UP = Vector3.new(0, 1, 0)
@@ -365,6 +367,19 @@ local DIR8 = {
 	{ -1, 0 }, { -1, -1 }, { 0, -1 }, { 1, -1 },
 }
 
+-- Entries 1, 3, 5, 7 are the cardinals (E, N, W, S) -- bits 0, 2, 4, 6.
+--
+-- A BORDER IS A SHARED EDGE, NOT A SHARED CORNER. A cell whose only wall lies
+-- diagonally touches that wall at a single point: you can still walk off it in
+-- all four directions, so it is interior floor that happens to have a corner
+-- clipped. Counting it as boundary put a spur on the contour for every convex
+-- corner in the map -- 10.7% of the edge set on the test map, and pure noise to
+-- anything trying to fit a line through it.
+--
+-- The diagonal bits are still recorded in the masks. They are simply not what
+-- decides whether a cell is on the boundary.
+local CARDINAL_MASK = 0b01010101
+
 -- World XZ bucket, 1 stud, holding every cell and every dead cell so a
 -- neighbour can be found without knowing which grid owns it.
 local function buildWorldIndex(grids: any)
@@ -414,6 +429,11 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	if data.config then
 		c.step = data.config.step or c.step
 		c.flushTol = (cfg and cfg.flushTol) or data.config.flushTol or c.flushTol
+		if cfg and cfg.cardinalEdges ~= nil then
+			c.cardinalEdges = cfg.cardinalEdges
+		elseif data.config.cardinalEdges ~= nil then
+			c.cardinalEdges = data.config.cardinalEdges
+		end
 	end
 	local live, dead = buildWorldIndex(data.grids)
 	-- Match radius is PER PAIR, not per grid. probeRadius exists because a
@@ -427,7 +447,7 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 		return r * r
 	end
 	local tol = c.flushTol
-	local nWall, nDrop, nBoth = 0, 0, 0
+	local nWall, nDrop, nBoth, nCornerOnly = 0, 0, 0, 0
 
 	for _, g in pairs(data.grids) do
 		for _, cell in ipairs(g.cells) do
@@ -497,7 +517,17 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 				end
 			end
 			cell.wallMask, cell.dropMask = wallMask, dropMask
-			cell.wall, cell.dropoff = wallMask ~= 0, dropMask ~= 0
+			-- Boundary membership is decided on cardinals only (see CARDINAL_MASK).
+			-- Set cardinalEdges = false to go back to counting corner contact.
+			if c.cardinalEdges == false then
+				cell.wall, cell.dropoff = wallMask ~= 0, dropMask ~= 0
+			else
+				cell.wall = bit32.band(wallMask, CARDINAL_MASK) ~= 0
+				cell.dropoff = bit32.band(dropMask, CARDINAL_MASK) ~= 0
+			end
+			if (wallMask ~= 0 or dropMask ~= 0) and not (cell.wall or cell.dropoff) then
+				nCornerOnly += 1
+			end
 			if cell.wall then nWall += 1 end
 			if cell.dropoff then nDrop += 1 end
 			if cell.wall and cell.dropoff then nBoth += 1 end
@@ -505,6 +535,7 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	end
 
 	data.stats.wallNodes, data.stats.dropNodes, data.stats.bothNodes = nWall, nDrop, nBoth
+	data.stats.cornerOnly = nCornerOnly
 	return data
 end
 
