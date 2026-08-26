@@ -11,6 +11,12 @@ export type Cell = {
 	slope: number,            -- degrees from world-up
 	clearance: number,        -- studs of vertical headroom (capped)
 	cover: Instance?,
+	-- Cell edge length in studs. Full cells carry the grid step; cells recovered
+	-- by subdividing a dead cell carry step/2. Cells are NO LONGER UNIFORM, so
+	-- anything that steps between cells must read this and not grid.step.
+	size: number,
+	sub: boolean?,            -- true => recovered from a subdivided dead cell
+	pui: number?, pvi: number?, -- parent cell's lattice indices (subcells only)
 	-- Set by classifyNodes. Bitmasks over DIR8, plus the booleans they imply.
 	wallMask: number?,        -- directions with a surface standing above us
 	dropMask: number?,        -- directions with nothing to stand on
@@ -25,6 +31,8 @@ export type DeadCell = {
 	ui: number, vi: number,
 	pos: Vector3,
 	killer: Instance?,
+	size: number,
+	sub: boolean?,
 }
 
 export type Grid = {
@@ -37,7 +45,10 @@ export type Grid = {
 	uExt: number?, vExt: number?, -- half-extents along u and v
 	step: number,
 	cells: {Cell},
-	index: { [string]: Cell },-- "ui:vi" -> cell
+	index: { [string]: Cell },-- "ui:vi" -> cell (FULL cells only)
+	-- Recovered subcells, keyed on the half-pitch lattice "2*ui+sx:2*vi+sy".
+	-- Kept out of `index` so integer-lattice adjacency there stays meaningful.
+	subIndex: { [string]: Cell },
 	dead: {DeadCell},
 	deadIndex: { [string]: DeadCell },
 }
@@ -136,70 +147,130 @@ local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll:
 
 	local grid: Grid = {
 		part = part, fallback = false, origin = corner,
-		u = u, v = v, n = n, step = c.step, cells = {}, index = {},
+		u = u, v = v, n = n, step = c.step, cells = {}, index = {}, subIndex = {},
 		dead = {}, deadIndex = {},
-		center = surfaceCenter, uExt = uExt, vExt = vExt,
+	    center = surfaceCenter, uExt = uExt, vExt = vExt,
 	}
-
-	local function kill(iu: number, iv: number, pos: Vector3, killer: Instance?)
-		local d: DeadCell = { ui = iu, vi = iv, pos = pos, killer = killer }
-		grid.dead[#grid.dead + 1] = d
-		grid.deadIndex[string.format("%d:%d", iu, iv)] = d
-	end
 
 	local step = c.step
 	local nu = math.max(1, math.floor(2 * uExt / step + 1e-6))
 	local nv = math.max(1, math.floor(2 * vExt / step + 1e-6))
 	local castH = 2 -- studs above the surface to start the (downward-along-normal) ray
 
-	for iu = 0, nu - 1 do
-		for iv = 0, nv - 1 do
-			local p = corner + u * ((iu + 0.5) * step) + v * ((iv + 0.5) * step)
-			local res = workspace:Raycast(p + n * castH, -n * (castH + 0.5), rpPart)
-			if not res then continue end
-			local slope = math.deg(math.acos(math.clamp(res.Normal:Dot(UP), -1, 1)))
-			if not ((slope <= c.maxSlope) or isClip(part)) then continue end
-			probe.CFrame = CFrame.new(res.Position + UP * (0.1 + (c.minClearance - 0.1) * 0.5))
-			local killer: Instance? = nil
-			for _, hit in ipairs(workspace:GetPartsInPart(probe, op)) do
-				if hit ~= part then killer = hit; break end
-			end
-			if killer then
-				kill(iu, iv, res.Position, killer)
-				continue
-			end
-			local upRes = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap, filterAll)
-			local clearance = upRes and upRes.Distance or c.clearCap
-			local cover: Instance? = upRes and upRes.Instance or nil
-			local tUp = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap, rpTerrain)
-			if tUp then
-				if tUp.Distance < clearance then
-					clearance = tUp.Distance
-					cover = workspace.Terrain
-				end
-			elseif workspace:Raycast(res.Position + UP * c.clearCap, -UP * (c.clearCap - 0.25), rpTerrain) then
-				clearance = 0
+	-- Evaluate ONE sample point on the face. `sp` is the sample's centre in the
+	-- part's face plane. Returns "miss" (no surface / too steep, nothing to
+	-- record), "dead" (something is there we cannot stand in) or "live", plus
+	-- the resolved surface data.
+	--
+	-- Split out of the main loop so the subdivision pass re-tests a subcell with
+	-- BYTE-FOR-BYTE the same rules as a full cell. If the two ever diverge, a
+	-- recovered subcell stops being comparable to the cells around it.
+	local function evalSample(sp: Vector3)
+		local res = workspace:Raycast(sp + n * castH, -n * (castH + 0.5), rpPart)
+		if not res then return "miss" end
+		local slope = math.deg(math.acos(math.clamp(res.Normal:Dot(UP), -1, 1)))
+		if not ((slope <= c.maxSlope) or isClip(part)) then return "miss" end
+		probe.CFrame = CFrame.new(res.Position + UP * (0.1 + (c.minClearance - 0.1) * 0.5))
+		for _, hit in ipairs(workspace:GetPartsInPart(probe, op)) do
+			if hit ~= part then return "dead", res, slope, nil, hit end
+		end
+		local upRes = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap, filterAll)
+		local clearance = upRes and upRes.Distance or c.clearCap
+		local cover: Instance? = upRes and upRes.Instance or nil
+		local tUp = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap, rpTerrain)
+		if tUp then
+			if tUp.Distance < clearance then
+				clearance = tUp.Distance
 				cover = workspace.Terrain
 			end
-			if clearance < c.minClearance then
-				kill(iu, iv, res.Position, cover)
+		elseif workspace:Raycast(res.Position + UP * c.clearCap, -UP * (c.clearCap - 0.25), rpTerrain) then
+			clearance = 0
+			cover = workspace.Terrain
+		end
+		if clearance < c.minClearance then return "dead", res, slope, clearance, cover end
+		return "live", res, slope, clearance, cover
+	end
+
+	-- Pass one: the full-pitch lattice, exactly as before.
+	for iu = 0, nu - 1 do
+		for iv = 0, nv - 1 do
+			local sp = corner + u * ((iu + 0.5) * step) + v * ((iv + 0.5) * step)
+			local status, res, slope, clearance, inst = evalSample(sp)
+			if status == "miss" then continue end
+			if status == "dead" then
+				local d: DeadCell = {
+					ui = iu, vi = iv, pos = res.Position, killer = inst, size = step,
+				}
+				grid.dead[#grid.dead + 1] = d
+				grid.deadIndex[string.format("%d:%d", iu, iv)] = d
 				continue
 			end
 			local cell: Cell = {
 				ui = iu, vi = iv, pos = res.Position, normal = res.Normal,
-				slope = slope, clearance = clearance, cover = cover,
+				slope = slope, clearance = clearance, cover = inst, size = step,
 			}
 			grid.cells[#grid.cells + 1] = cell
 			grid.index[string.format("%d:%d", iu, iv)] = cell
 		end
 	end
+
+	-- Pass two: SUBDIVIDE EVERY DEAD CELL ONCE.
+	--
+	-- A dead cell means "the sample point at this cell's centre is inside
+	-- something". At 1-stud pitch that verdict is all-or-nothing, which is
+	-- exactly where the staircase comes from: a cell 10% buried in a skewed wall
+	-- and a cell 90% buried are both simply gone, so the boundary can only ever
+	-- land on the lattice.
+	--
+	-- Splitting each dead cell into four half-pitch samples and re-testing gives
+	-- the boundary a second, finer place to land. The partially-buried cell
+	-- recovers the quadrants that are actually clear; the fully-buried one
+	-- recovers nothing and stays gone. The result is still a staircase -- it is
+	-- a staircase at half the amplitude, with intermediate treads that say
+	-- whether a step is one edge continuing or a genuinely new one.
+	--
+	-- The parent dead cell is REPLACED by its four children, so a dead cell in
+	-- the output always describes solid at its own recorded size.
+	local parents = grid.dead
+	grid.dead, grid.deadIndex = {}, {}
+	local half = step * 0.5
+	for _, d in ipairs(parents) do
+		for sx = 0, 1 do
+			for sy = 0, 1 do
+				local hu, hv = 2 * d.ui + sx, 2 * d.vi + sy
+				local sp = corner
+					+ u * ((d.ui + 0.25 + 0.5 * sx) * step)
+					+ v * ((d.vi + 0.25 + 0.5 * sy) * step)
+				local status, res, slope, clearance, inst = evalSample(sp)
+				if status == "miss" then continue end
+				local k = string.format("%d:%d", hu, hv)
+				if status == "dead" then
+					local sd: DeadCell = {
+						ui = hu, vi = hv, pos = res.Position, killer = inst,
+						size = half, sub = true,
+					}
+					grid.dead[#grid.dead + 1] = sd
+					grid.deadIndex[k] = sd
+					continue
+				end
+				local cell: Cell = {
+					ui = hu, vi = hv, pos = res.Position, normal = res.Normal,
+					slope = slope, clearance = clearance, cover = inst,
+					size = half, sub = true, pui = d.ui, pvi = d.vi,
+				}
+				grid.cells[#grid.cells + 1] = cell
+				grid.subIndex[k] = cell
+			end
+		end
+	end
+
 	return grid
 end
 
 local function buildFallbackGrid(part: BasePart, surfels: {any}, c: any): Grid
 	local grid: Grid = {
 		part = part, fallback = true, step = c.step, cells = {}, index = {},
-		dead = {}, deadIndex = {},
+		subIndex = {}, dead = {}, deadIndex = {},
 	}
 	for _, s in ipairs(surfels) do
 		if s.clearance < c.minClearance then continue end
@@ -208,6 +279,7 @@ local function buildFallbackGrid(part: BasePart, surfels: {any}, c: any): Grid
 		local cell: Cell = {
 			ui = iu, vi = iv, pos = s.pos, normal = s.normal,
 			slope = s.slope, clearance = s.clearance, cover = s.cover,
+			size = c.step,
 		}
 		grid.cells[#grid.cells + 1] = cell
 		grid.index[string.format("%d:%d", iu, iv)] = cell
@@ -236,16 +308,23 @@ local function buildWorldIndex(grids: any)
 		for _, cell in ipairs(g.cells) do push(live, cell.pos, { cell = cell, part = part }) end
 		for _, d in ipairs(g.dead) do push(dead, d.pos, { dead = d, part = part }) end
 	end
+	-- NOTE: the bucket is 1 stud regardless of cell size, and a half-pitch cell
+	-- is strictly smaller, so a subcell never spans more buckets than a full one
+	-- and the existing 3x3 bucket sweep still covers every candidate.
 	return live, dead
 end
 
 -- Where the neighbour in local direction d would be, in world space. Block
 -- grids step along their own face axes; fallback grids are world-aligned.
 local function neighbourPos(g: Grid, cell: Cell, d: {number}): Vector3
+	-- Step by THIS CELL's own pitch. A recovered subcell is half-pitch, and
+	-- stepping a full stud from it would skip straight over its neighbour and
+	-- read open floor as a dropoff.
+	local sp = cell.size or g.step
 	if not g.fallback and g.u and g.v then
-		return cell.pos + g.u * (d[1] * g.step) + g.v * (d[2] * g.step)
+		return cell.pos + g.u * (d[1] * sp) + g.v * (d[2] * sp)
 	end
-	return cell.pos + Vector3.new(d[1] * g.step, 0, d[2] * g.step)
+	return cell.pos + Vector3.new(d[1] * sp, 0, d[2] * sp)
 end
 
 -- Mark every cell with the directions in which it has a wall and the
@@ -265,7 +344,16 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 		c.flushTol = (cfg and cfg.flushTol) or data.config.flushTol or c.flushTol
 	end
 	local live, dead = buildWorldIndex(data.grids)
-	local r2 = (c.probeRadius * c.step) ^ 2
+	-- Match radius is PER PAIR, not per grid. probeRadius exists because a
+	-- neighbouring grid's lattice never lands on our sample point, so the nearest
+	-- cell can sit up to pitch*sqrt(2)/2 away. With mixed pitches the relevant
+	-- pitch is the COARSER of the two: sizing off a half-pitch subcell alone
+	-- would shrink the window below what a full neighbour needs and turn every
+	-- sub-to-full join into a false dropoff.
+	local function matchR2(a: number, b: number): number
+		local r = c.probeRadius * math.max(a, b)
+		return r * r
+	end
 	local tol = c.flushTol
 	local nWall, nDrop, nBoth = 0, 0, 0
 
@@ -287,13 +375,14 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 				-- matter what is overhead. A wall standing at that spot would have
 				-- killed that floor, so it would not be live. So: floor first,
 				-- then below, then above.
+				local csize = cell.size or c.step
 				local floor, above, below = false, false, false
 				for ox = -1, 1 do
 					for oz = -1, 1 do
 						for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
 							local q = e.cell.pos
 							local dx, dz = q.X - p.X, q.Z - p.Z
-							if dx * dx + dz * dz <= r2 then
+							if dx * dx + dz * dz <= matchR2(csize, e.cell.size or c.step) then
 								-- MEASURED AGAINST WHERE THIS SURFACE WOULD CONTINUE,
 								-- not against our own height. `p` lies on this grid's
 								-- own plane, so on a tilted slab the next cell along
@@ -322,7 +411,8 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 								for _, e in ipairs(dead[(bx + ox) .. ":" .. (bz + oz)] or {}) do
 									local q = e.dead.pos
 									local dx, dz = q.X - p.X, q.Z - p.Z
-									if dx * dx + dz * dz <= r2 and e.dead.killer
+									if dx * dx + dz * dz <= matchR2(csize, e.dead.size or c.step)
+										and e.dead.killer
 										and math.abs(q.Y - p.Y) <= tol then
 										above = true
 									end
@@ -369,6 +459,7 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 	local byPart = groupByPart(floorData.surfels)
 	local grids: { [BasePart]: Grid } = {}
 	local nBlock, nFallback, nCells, nDead = 0, 0, 0, 0
+	local nSubCells, nSubDead = 0, 0
 	for part, sfs in pairs(byPart) do
 		local g: Grid
 		if isBlock(part) then
@@ -381,12 +472,21 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 		grids[part] = g
 		nCells += #g.cells
 		nDead += #g.dead
+		for _, cell in ipairs(g.cells) do if cell.sub then nSubCells += 1 end end
+		for _, d in ipairs(g.dead) do if d.sub then nSubDead += 1 end end
 	end
 	probe:Destroy()
 
 	local data = {
 		grids = grids, config = c,
-		stats = { parts = nBlock + nFallback, block = nBlock, fallback = nFallback, cells = nCells, dead = nDead },
+		stats = {
+			parts = nBlock + nFallback, block = nBlock, fallback = nFallback,
+			cells = nCells, dead = nDead,
+			-- Recovered by subdivision: cells that were solid at full pitch and
+			-- turned out to be standable at half. `subDead` is the other half of
+			-- the split -- quadrants that stayed solid.
+			subCells = nSubCells, subDead = nSubDead,
+		},
 	}
 	LocalGrid.classifyNodes(data, cfg)
 	return data
@@ -429,11 +529,12 @@ function LocalGrid.visualizeClasses(data: any, opts: any?, parent: Instance?)
 				col = Color3.new(col.R * 0.28, col.G * 0.28, col.B * 0.28)
 			end
 			if col == PLAIN and not showInterior then continue end
+			local csize = cell.size or step
 			local dot = Instance.new("Part")
 			dot.Anchored = true; dot.CanCollide = false; dot.CanQuery = false; dot.CanTouch = false
 			dot.Material = Enum.Material.SmoothPlastic
 			dot.Color = col
-			dot.Size = Vector3.new(w * step, 0.08, w * step)
+			dot.Size = Vector3.new(w * csize, 0.08, w * csize)
 			if not g.fallback and g.n and g.u then
 				dot.CFrame = CFrame.fromMatrix(cell.pos + Vector3.new(0, 0.12, 0), g.u, g.n)
 			else
@@ -482,7 +583,7 @@ function LocalGrid.visualize(data: any, parent: Instance?)
 			else
 				w, v = 0.55, 0.28
 			end
-			dot.Size = Vector3.new(w * step, 0.1, w * step)
+			dot.Size = Vector3.new(w * (cell.size or step), 0.1, w * (cell.size or step))
 			dot.Color = Color3.fromHSV(hue, sat, v)
 			-- matte, so the neon Boundary edges pop over the grid layer
 			dot.Material = Enum.Material.SmoothPlastic
