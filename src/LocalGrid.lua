@@ -424,15 +424,70 @@ end
 -- different angles. Measured on the test map: 433 of 4119 ramp cells (10.5%),
 -- clustered exactly at the two landing heights.
 --
--- The floor's cell wins. It is flat, it is on the lattice that the surrounding
--- floor already uses, and it covers the same position at the same height, so
--- dropping the ramp's copy costs no walkable area -- whereas dropping the
--- floor's could. What survives on the ramp is the part that actually stands
--- clear of the floor: its own bottom edge, unobscured.
+-- THE RAMP'S CELL WINS. The ramp is the continuous surface: it runs from the
+-- bottom landing to the top one as a single grid, and anything walking the
+-- stairs is walking it. Deleting the ramp's cells at a junction instead --
+-- which is what this did first -- leaves a gap exactly where the ramp meets a
+-- landing, and the landing's edge then reads as a WALL because its neighbour
+-- has no floor any more. That put a false wall along the head of every ramp.
 --
--- Ramp cells with floor ABOVE them go too. Those are the tail of the ramp
--- running on underneath a landing, where nothing can walk.
+-- So the coincident FLOOR cell goes. No area is lost: the ramp cell sits at the
+-- same spot within probeRadius and the same height within flushTol, so it
+-- already covers what the floor cell covered, and the ramp stays unbroken
+-- across the join.
+--
+-- Ramp cells with floor ABOVE them are still dropped. Those are the tail of the
+-- ramp running on underneath a landing, where nothing can walk, and no floor
+-- cell duplicates them.
 local function pruneClipRampOverlap(grids: any, c: any)
+	local rampB: {[string]: {any}} = {}
+	for part, g in pairs(grids) do
+		if isClip(part) then
+			for _, cell in ipairs(g.cells) do
+				local k = math.floor(cell.pos.X) .. ":" .. math.floor(cell.pos.Z)
+				local b = rampB[k]; if not b then b = {}; rampB[k] = b end
+				b[#b + 1] = cell
+			end
+		end
+	end
+	if next(rampB) == nil then return 0, 0 end
+
+	local function reindex(g)
+		g.index, g.subIndex = {}, {}
+		for _, cell in ipairs(g.cells) do
+			local k = string.format("%d:%d", cell.ui, cell.vi)
+			if cell.sub then g.subIndex[k] = cell else g.index[k] = cell end
+		end
+	end
+
+	-- Pass A: drop FLOOR cells duplicated by a ramp cell.
+	local floorDropped = 0
+	for part, g in pairs(grids) do
+		if not isClip(part) then
+			local keep = {}
+			for _, cell in ipairs(g.cells) do
+				local bx, bz = math.floor(cell.pos.X), math.floor(cell.pos.Z)
+				local r = c.probeRadius * math.max(cell.size or c.step, c.step)
+				local r2, drop = r * r, false
+				for ox = -1, 1 do
+					for oz = -1, 1 do
+						for _, rc in ipairs(rampB[(bx + ox) .. ":" .. (bz + oz)] or {}) do
+							local dx, dz = rc.pos.X - cell.pos.X, rc.pos.Z - cell.pos.Z
+							if dx * dx + dz * dz <= r2 and math.abs(rc.pos.Y - cell.pos.Y) <= c.flushTol then
+								drop = true
+							end
+						end
+					end
+				end
+				if drop then floorDropped += 1 else keep[#keep + 1] = cell end
+			end
+			g.cells = keep
+			reindex(g)
+		end
+	end
+
+	-- Pass B: drop RAMP cells that run on under a landing. Uses the floor set
+	-- AFTER pass A, so a cell removed above can never count as "floor overhead".
 	local floorB: {[string]: {any}} = {}
 	for part, g in pairs(grids) do
 		if not isClip(part) then
@@ -443,42 +498,31 @@ local function pruneClipRampOverlap(grids: any, c: any)
 			end
 		end
 	end
-
-	local removed = 0
+	local rampDropped = 0
 	for part, g in pairs(grids) do
 		if isClip(part) then
 			local keep = {}
 			for _, cell in ipairs(g.cells) do
 				local bx, bz = math.floor(cell.pos.X), math.floor(cell.pos.Z)
 				local r = c.probeRadius * math.max(cell.size or c.step, c.step)
-				local r2 = r * r
-				local drop = false
+				local r2, drop = r * r, false
 				for ox = -1, 1 do
 					for oz = -1, 1 do
 						for _, fc in ipairs(floorB[(bx + ox) .. ":" .. (bz + oz)] or {}) do
 							local dx, dz = fc.pos.X - cell.pos.X, fc.pos.Z - cell.pos.Z
-							if dx * dx + dz * dz <= r2 then
-								local dy = fc.pos.Y - cell.pos.Y
-								-- coincident: the floor already owns this spot
-								-- above:      the ramp runs on under a landing
-								if math.abs(dy) <= c.flushTol or dy > c.flushTol then
-									drop = true
-								end
+							if dx * dx + dz * dz <= r2 and (fc.pos.Y - cell.pos.Y) > c.flushTol then
+								drop = true
 							end
 						end
 					end
 				end
-				if drop then removed += 1 else keep[#keep + 1] = cell end
+				if drop then rampDropped += 1 else keep[#keep + 1] = cell end
 			end
 			g.cells = keep
-			g.index, g.subIndex = {}, {}
-			for _, cell in ipairs(keep) do
-				local k = string.format("%d:%d", cell.ui, cell.vi)
-				if cell.sub then g.subIndex[k] = cell else g.index[k] = cell end
-			end
+			reindex(g)
 		end
 	end
-	return removed
+	return floorDropped, rampDropped
 end
 
 -- Mark every cell with the directions in which it has a wall and the
@@ -647,10 +691,10 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 	end
 	probe:Destroy()
 
-	local clipPruned = 0
+	local clipFloorPruned, clipRampPruned = 0, 0
 	if c.clipRampPrune ~= false then
-		clipPruned = pruneClipRampOverlap(grids, c)
-		nCells -= clipPruned
+		clipFloorPruned, clipRampPruned = pruneClipRampOverlap(grids, c)
+		nCells -= (clipFloorPruned + clipRampPruned)
 	end
 
 	local data = {
@@ -662,8 +706,9 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 			-- turned out to be standable at half. `subDead` is the other half of
 			-- the split -- quadrants that stayed solid.
 			subCells = nSubCells, subDead = nSubDead,
-			-- ramp cells dropped for coinciding with, or sitting under, floor
-			clipPruned = clipPruned,
+			-- floor cells dropped because a ClipRamp already covers them, and
+			-- ramp cells dropped for running on under a landing
+			clipFloorPruned = clipFloorPruned, clipRampPruned = clipRampPruned,
 		},
 	}
 	LocalGrid.classifyNodes(data, cfg)
