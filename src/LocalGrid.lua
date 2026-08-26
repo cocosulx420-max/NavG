@@ -831,7 +831,12 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 					b[#b + 1] = d
 				end
 				for _, cell in ipairs(g.cells) do
-					if not (cell.wall or cell.dropoff) then
+					-- Never promote a cell the ramp ahead-cull has marked. This pass
+					-- runs before those marks are acted on, and an edge node is never
+					-- culled -- so promoting one here would quietly refill the ramp
+					-- mouths the cull just cleared. Measured: 109 of 201 promotions
+					-- landed inside a cull strip.
+					if not (cell.wall or cell.dropoff) and not cell.aheadCull then
 						local bx, bz = math.floor(cell.pos.X), math.floor(cell.pos.Z)
 						local hitDir = nil
 						for ox = -1, 1 do
