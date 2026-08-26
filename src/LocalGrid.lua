@@ -16,6 +16,9 @@ export type Cell = {
 	-- anything that steps between cells must read this and not grid.step.
 	size: number,
 	sub: boolean?,            -- true => recovered from a subdivided dead cell
+	-- marked by the ramp ahead-cull; kept through classifyNodes so it still
+	-- reads as floor to its neighbours, then dropped
+	aheadCull: boolean?,
 	pui: number?, pvi: number?, -- parent cell's lattice indices (subcells only)
 	-- Set by classifyNodes. Bitmasks over DIR8, plus the booleans they imply.
 	wallMask: number?,        -- directions with a surface standing above us
@@ -58,6 +61,7 @@ export type Config = {
 	flushTol: number?, probeRadius: number?,
 	subdivLevels: number?, cardinalEdges: boolean?,
 	clipRampDedupe: boolean?, clipRampDedupeFactor: number?,
+	clipRampAheadCull: number?,
 }
 
 local DEFAULT = {
@@ -86,6 +90,9 @@ local DEFAULT = {
 	-- ones merely near it -- those are the floor's own edge beside the ramp.
 	clipRampDedupe = true,
 	clipRampDedupeFactor = 0.6,
+	-- Studs of ground cleared straight ahead of a ramp's bottom edge, along the
+	-- ramp's own downhill direction in XZ. 0 = off.
+	clipRampAheadCull = 1,
 }
 
 local UP = Vector3.new(0, 1, 0)
@@ -483,6 +490,134 @@ local function pruneClipRampDuplicates(grids: any, c: any): number
 	return removed
 end
 
+-- Clear the ground directly in front of a ramp's bottom edge.
+--
+-- The ramp arrives at the floor at an angle, and the floor's own nodes carry on
+-- underneath and past it. Those nodes are real floor, but they sit across the
+-- ramp's mouth and clutter the one place the ramp's outline has to read
+-- cleanly. Straight ahead of the bottom edge, along the ramp's own downhill
+-- direction in XZ, nothing else should be claiming ground.
+--
+-- Downhill is the horizontal part of the surface normal: a plane tilts its
+-- normal toward the UPHILL side, so (n.X, 0, n.Z) points down the slope.
+--
+-- Only cells ahead of the BOTTOM EDGE are culled -- a ramp cell with no
+-- downhill neighbour of its own. Cells beside or behind the ramp are untouched,
+-- and so is anything on a ramp grid.
+local function cullAheadOfRamps(grids: any, c: any): number
+	local reach = c.clipRampAheadCull or 1
+	if reach <= 0 then return 0 end
+
+	local samples = {}   -- points in front of every bottom-edge cell
+	for part, g in pairs(grids) do
+		if isClip(part) and g.n and g.u and g.v then
+			local flat = Vector3.new(g.n.X, 0, g.n.Z)
+			if flat.Magnitude > 1e-3 then
+				local downhill = flat.Unit
+				-- this grid's own cells, to find which are on the bottom edge
+				local own = {}
+				for _, cell in ipairs(g.cells) do
+					local k = math.floor(cell.pos.X) .. ":" .. math.floor(cell.pos.Z)
+					local b = own[k]; if not b then b = {}; own[k] = b end
+					b[#b + 1] = cell
+				end
+				for _, cell in ipairs(g.cells) do
+					local step = cell.size or c.step
+					local ahead = cell.pos + downhill * step
+					local bx, bz = math.floor(ahead.X), math.floor(ahead.Z)
+					local hasNext = false
+					for ox = -1, 1 do
+						for oz = -1, 1 do
+							for _, o in ipairs(own[(bx + ox) .. ":" .. (bz + oz)] or {}) do
+								local dx, dz = o.pos.X - ahead.X, o.pos.Z - ahead.Z
+								local r = 0.6 * math.max(step, o.size or step)
+								if dx * dx + dz * dz <= r * r then hasNext = true end
+							end
+						end
+					end
+					if not hasNext then
+						-- bottom edge: march forward and mark the ground ahead
+						local t = step * 0.5
+						while t <= reach do
+							samples[#samples + 1] = cell.pos + downhill * t
+							t += step * 0.5
+						end
+					end
+				end
+			end
+		end
+	end
+	if #samples == 0 then return 0 end
+
+	local sampleB: {[string]: {Vector3}} = {}
+	for _, sp in ipairs(samples) do
+		local k = math.floor(sp.X) .. ":" .. math.floor(sp.Z)
+		local b = sampleB[k]; if not b then b = {}; sampleB[k] = b end
+		b[#b + 1] = sp
+	end
+
+	local removed = 0
+	for part, g in pairs(grids) do
+		if not isClip(part) then
+			local keep = {}
+			for _, cell in ipairs(g.cells) do
+				local bx, bz = math.floor(cell.pos.X), math.floor(cell.pos.Z)
+				local lim = 0.6 * (cell.size or c.step)
+				local cull = false
+				for ox = -1, 1 do
+					for oz = -1, 1 do
+						for _, sp in ipairs(sampleB[(bx + ox) .. ":" .. (bz + oz)] or {}) do
+							local dx, dz = sp.X - cell.pos.X, sp.Z - cell.pos.Z
+							if dx * dx + dz * dz <= lim * lim
+								and math.abs(sp.Y - cell.pos.Y) <= c.clearCap then
+								cull = true
+							end
+						end
+					end
+				end
+				if cull then cell.aheadCull = true; removed += 1 end
+			end
+		end
+	end
+	return removed
+end
+
+-- Drop the marked cells. Runs AFTER classifyNodes, and AN EDGE NODE IS NEVER
+-- DROPPED.
+--
+-- Order matters twice over. Removing them before classification would leave a
+-- hole in the floor, and the cells around it would report a dropoff into that
+-- hole -- an edge invented by our own cull, describing nothing in the world.
+--
+-- And classifying first is what makes the second rule possible: by the time the
+-- cull runs we know which cells are real boundary. A cell in front of a ramp
+-- that borders an actual wall or an actual drop is describing the world, not
+-- the ramp, and the ramp's tidiness is no reason to delete it. Only ordinary
+-- interior floor is cleared out of the ramp's mouth.
+local function dropCulledCells(grids: any): number
+	local removed = 0
+	for _, g in pairs(grids) do
+		local keep = {}
+		for _, cell in ipairs(g.cells) do
+			if cell.aheadCull and not (cell.wall or cell.dropoff) then
+				removed += 1
+			else
+				cell.aheadCull = nil
+				keep[#keep + 1] = cell
+			end
+		end
+		if removed > 0 then
+			g.cells = keep
+			g.index, g.subIndex = {}, {}
+			for _, cell in ipairs(keep) do
+				local k = string.format("%d:%d", cell.ui, cell.vi)
+				if cell.sub then g.subIndex[k] = cell else g.index[k] = cell end
+			end
+		end
+	end
+	return removed
+end
+
 -- Mark every cell with the directions in which it has a wall and the
 -- directions in which it has air.
 --
@@ -518,7 +653,63 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	local tol = c.flushTol
 	local nWall, nDrop, nBoth, nCornerOnly = 0, 0, 0, 0
 
-	for _, g in pairs(data.grids) do
+	for gPart, g in pairs(data.grids) do
+		-- A CLIPRAMP IS CLASSIFIED IN A VACUUM, BY PRESENCE ALONE.
+		--
+		-- It is an invisible surface laid over authored stairs, overlapping the
+		-- floor at both ends by design. Classified against the world it reports
+		-- walls and dropoffs wherever it meets that floor -- noise about the
+		-- geometry it was laid over, not about the ramp.
+		--
+		-- And the height logic is wrong for it too. Asking whether a neighbour
+		-- is level, above or below assumes the surface continues somewhere; a
+		-- ramp's lowest row runs into the floor it lands on, so those questions
+		-- answer about the floor. Feeding them the ramp's own cells instead just
+		-- moved the wrong answer: the bottom row came back with 4 edge cells out
+		-- of 90 -- the ramp's bottom line, gone.
+		--
+		-- For a ramp the question is only "where does this surface stop". A
+		-- cardinal neighbour missing from its own grid is an edge, full stop.
+		-- That gives one closed outline at the ramp's true extent.
+		if isClip(gPart) and g.u and g.v then
+			local own: {[string]: {any}} = {}
+			for _, cell in ipairs(g.cells) do
+				local k = math.floor(cell.pos.X) .. ":" .. math.floor(cell.pos.Z)
+				local b = own[k]; if not b then b = {}; own[k] = b end
+				b[#b + 1] = cell
+			end
+			for _, cell in ipairs(g.cells) do
+				local dropMask = 0
+				for bit, d in ipairs(DIR8) do
+					if bit32.band(CARDINAL_MASK, bit32.lshift(1, bit - 1)) ~= 0 then
+						local sp = cell.size or c.step
+						local p = cell.pos + g.u * (d[1] * sp) + g.v * (d[2] * sp)
+						local bx, bz = math.floor(p.X), math.floor(p.Z)
+						local found = false
+						for ox = -1, 1 do
+							for oz = -1, 1 do
+								for _, o in ipairs(own[(bx + ox) .. ":" .. (bz + oz)] or {}) do
+									local ax, az = o.pos.X - p.X, o.pos.Z - p.Z
+									local ex, ez = o.pos.X - cell.pos.X, o.pos.Z - cell.pos.Z
+									local r = c.probeRadius * math.max(sp, o.size or sp)
+									if ax * ax + az * az <= r * r
+										and (ax * ax + az * az) < (ex * ex + ez * ez) then
+										found = true
+									end
+								end
+							end
+						end
+						if not found then
+							dropMask = bit32.bor(dropMask, bit32.lshift(1, bit - 1))
+						end
+					end
+				end
+				cell.wallMask, cell.dropMask = 0, dropMask
+				cell.wall, cell.dropoff = false, dropMask ~= 0
+				if cell.dropoff then nDrop += 1 end
+			end
+			continue
+		end
 		for _, cell in ipairs(g.cells) do
 			local wallMask, dropMask = 0, 0
 			for bit, d in ipairs(DIR8) do
@@ -654,6 +845,8 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 		clipDupes = pruneClipRampDuplicates(grids, c)
 		nCells -= clipDupes
 	end
+	local clipAhead = cullAheadOfRamps(grids, c)
+	nCells -= clipAhead
 
 	local data = {
 		grids = grids, config = c,
@@ -666,9 +859,16 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 			subCells = nSubCells, subDead = nSubDead,
 			-- floor cells removed for duplicating a ClipRamp cell outright
 			clipDupes = clipDupes,
+			-- floor cells cleared from in front of a ramp's bottom edge
+			clipAhead = clipAhead,
 		},
 	}
 	LocalGrid.classifyNodes(data, cfg)
+	local droppedAhead = dropCulledCells(grids)
+	data.stats.clipAheadMarked = clipAhead
+	data.stats.clipAhead = droppedAhead
+	data.stats.clipAheadKeptAsEdge = clipAhead - droppedAhead
+	data.stats.cells = data.stats.cells + clipAhead - droppedAhead
 	return data
 end
 
