@@ -152,4 +152,62 @@ function SVOLocalDebug.setSourceHidden(model: Instance, hidden: boolean): number
 	return SVOLocalDebug.setSourceTransparency(model, hidden and 1 or nil)
 end
 
+-- Cull a drawing down to the nodes that actually touch REAL geometry.
+--
+-- SVOLocal describes each part by its local BOX. For a Block that is the part;
+-- for a Wedge, MeshPart or Union it is the bounding box, and the nodes filling
+-- the empty half of a wedge or the hollow of an arch are fiction. This tests
+-- every drawn node against the true collision geometry of `model` and removes
+-- the ones that touch nothing, so what is left is the honest occupancy.
+--
+-- Returns kept, removed.
+function SVOLocalDebug.keepTouching(drawName: string, model: Instance, pad: number?)
+	local root = workspace:FindFirstChild(ROOT_NAME)
+	local sec = root and root:FindFirstChild(SECTION)
+	local folder = sec and sec:FindFirstChild(drawName)
+	if not folder then return 0, 0 end
+
+	local real = {}
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") then table.insert(real, d) end
+	end
+
+	local probe = Instance.new("Part")
+	probe.Anchored = true
+	probe.CanCollide, probe.CanQuery, probe.CanTouch = false, false, false
+	probe.Transparency = 1
+	probe.Parent = workspace
+	local op = OverlapParams.new()
+	op.FilterType = Enum.RaycastFilterType.Include
+	op.FilterDescendantsInstances = real
+	op.RespectCanCollide = false
+	op.MaxParts = 1
+
+	local grow = pad or 0
+	local kept, removed = 0, 0
+	local doomed = {}
+	for _, sub in ipairs(folder:GetChildren()) do
+		for _, node in ipairs(sub:GetChildren()) do
+			if node:IsA("BasePart") then
+				-- the node is drawn inset; test at its TRUE size
+				local edge = (node:GetAttribute("nodeSize") :: number) + grow
+				probe.Size = Vector3.new(edge, edge, edge)
+				probe.CFrame = node.CFrame
+				if #workspace:GetPartsInPart(probe, op) > 0 then
+					kept += 1
+				else
+					removed += 1
+					table.insert(doomed, node)
+				end
+			end
+		end
+	end
+	probe:Destroy()
+	for _, d in ipairs(doomed) do d:Destroy() end
+	for _, sub in ipairs(folder:GetChildren()) do
+		if #sub:GetChildren() == 0 then sub:Destroy() end
+	end
+	return kept, removed
+end
+
 return SVOLocalDebug
