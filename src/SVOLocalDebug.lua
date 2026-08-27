@@ -62,6 +62,9 @@ end
 --   inset       shrink each box so node seams stay visible (default 0.06)
 --   solidAlpha  transparency of non-seam nodes (default 0.6)
 --   seamAlpha   transparency of seam nodes (default 0.1)
+--   offset      world-space Vector3 to shift the whole drawing by (default zero).
+--               The tree is exactly coincident with the source geometry, so an
+--               offset is the only way to see BOTH at once without hiding one.
 --   maxParts    abort past this many parts (default 20000)
 function SVOLocalDebug.draw(trees, opts)
 	opts = opts or {}
@@ -70,6 +73,7 @@ function SVOLocalDebug.draw(trees, opts)
 	local inset: number = opts.inset or 0.06
 	local solidAlpha: number = opts.solidAlpha or 0.6
 	local seamAlpha: number = opts.seamAlpha or 0.1
+	local offset: Vector3 = opts.offset or Vector3.zero
 	local maxParts: number = opts.maxParts or 20000
 
 	SVOLocalDebug.clear(name)
@@ -97,7 +101,7 @@ function SVOLocalDebug.draw(trees, opts)
 			p.Color = isSeam and SEAM_COLOR or (SOLID_COLOR[edge] or SOLID_FALLBACK)
 			p.Transparency = isSeam and seamAlpha or solidAlpha
 			p.Size = Vector3.new(edge - inset, edge - inset, edge - inset)
-			p.CFrame = cf
+			p.CFrame = cf + offset
 			p:SetAttribute("nodeSize", edge)
 			p:SetAttribute("seam", isSeam)
 			p:SetAttribute("part", part.Name)
