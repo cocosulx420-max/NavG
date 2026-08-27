@@ -300,8 +300,16 @@ end
 -- Build an SVO from a list of parts. margin pads the world bounds.
 -- Block parts use fast OBB rasterization; non-block parts (unions/meshes/etc)
 -- are voxelized against their real collision geometry.
+--
+-- The tree is ALIGNED TO THE WORLD LATTICE: the root's minimum corner is snapped
+-- down to a whole multiple of `leaf`, and the root edge is leaf * 2^depth, so
+-- every node boundary at every level sits on a whole multiple of `leaf`. Two
+-- bakes of different regions therefore share one lattice, and with leaf = 1 the
+-- leaves are the unit studs of the world grid rather than an arbitrary phase.
 function SVO.fromParts(parts: {BasePart}, leaf: number, margin: number)
 	assert(#parts > 0, "SVO.fromParts: no parts")
+	leaf = leaf or 1
+	margin = margin or 0
 	local lo = Vector3.new(math.huge, math.huge, math.huge)
 	local hi = -lo
 	for _, part in ipairs(parts) do
@@ -311,13 +319,21 @@ function SVO.fromParts(parts: {BasePart}, leaf: number, margin: number)
 	end
 	lo -= Vector3.new(margin, margin, margin)
 	hi += Vector3.new(margin, margin, margin)
-	local center = (lo + hi) * 0.5
+	-- snap the minimum corner DOWN onto the world lattice
+	lo = Vector3.new(
+		math.floor(lo.X / leaf) * leaf,
+		math.floor(lo.Y / leaf) * leaf,
+		math.floor(lo.Z / leaf) * leaf
+	)
 	local extent = hi - lo
 	local maxE = math.max(extent.X, extent.Y, extent.Z)
-	-- root edge = leaf * 2^depth, big enough to hold maxE
+	-- root edge = leaf * 2^depth, big enough to hold maxE from the snapped corner
 	local depth = math.max(0, math.ceil(math.log(maxE/leaf) / math.log(2))) -- luau: log base via division
 	local rootEdge = leaf * (2 ^ depth)
+	-- anchor the root at the snapped corner, not on the bounds centroid
+	local center = lo + Vector3.new(rootEdge, rootEdge, rootEdge) * 0.5
 	local tree = SVO.new(center, rootEdge * 0.5, leaf)
+	tree.origin = lo
 	for _, part in ipairs(parts) do
 		if SVO.isBlockPart(part) then
 			tree:insertPart(part)          -- fast OBB path
