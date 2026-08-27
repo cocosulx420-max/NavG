@@ -133,7 +133,11 @@ function FloorLocal.extract(trees, cfg)
 	end
 
 	local surfels: {Surfel} = {}
-	local rejSolidAbove, rejNoHit, rejSlope = 0, 0, 0
+	local rejSolidAbove, rejNoHit, rejSlope, rejDup = 0, 0, 0, 0
+	-- Several candidates can share a column -- different nodes, different AABB
+	-- tops, the same surface underneath. De-duplicate on the RESULT, not on the
+	-- candidate, or one walkable cell is reported many times.
+	local landed: { [string]: boolean } = {}
 
 	for _, k in ipairs(cand) do
 		-- empty directly above? (the SVO's "top face is exposed" guard)
@@ -155,6 +159,14 @@ function FloorLocal.extract(trees, cfg)
 			rejSlope += 1
 			continue
 		end
+		local rk = string.format("%d_%d_%d",
+			math.floor(res.Position.X), math.floor(res.Position.Z),
+			math.floor(res.Position.Y * 4 + 0.5))
+		if landed[rk] then
+			rejDup += 1
+			continue
+		end
+		landed[rk] = true
 		-- clearance: precise overlap first (a raycast never hits the part its
 		-- origin is inside), then an up-ray to the real ceiling
 		local clearance
@@ -187,6 +199,7 @@ function FloorLocal.extract(trees, cfg)
 			rejectedSolidAbove = rejSolidAbove,
 			rejectedNoHit = rejNoHit,
 			rejectedSlope = rejSlope,
+			rejectedDuplicate = rejDup,
 			standableParts = #solids,
 		},
 	}
