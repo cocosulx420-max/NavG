@@ -65,6 +65,7 @@ end
 --   offset      world-space Vector3 to shift the whole drawing by (default zero).
 --               The tree is exactly coincident with the source geometry, so an
 --               offset is the only way to see BOTH at once without hiding one.
+--   locked      lock the drawn parts against selection (default false)
 --   maxParts    abort past this many parts (default 20000)
 function SVOLocalDebug.draw(trees, opts)
 	opts = opts or {}
@@ -74,6 +75,8 @@ function SVOLocalDebug.draw(trees, opts)
 	local solidAlpha: number = opts.solidAlpha or 0.6
 	local seamAlpha: number = opts.seamAlpha or 0.1
 	local offset: Vector3 = opts.offset or Vector3.zero
+	-- Unlocked by default: these are meant to be clicked, measured and deleted.
+	local locked: boolean = opts.locked == true
 	local maxParts: number = opts.maxParts or 20000
 
 	SVOLocalDebug.clear(name)
@@ -96,7 +99,7 @@ function SVOLocalDebug.draw(trees, opts)
 			p.Anchored = true
 			p.CanCollide, p.CanQuery, p.CanTouch = false, false, false
 			p.CastShadow = false
-			p.Locked = true
+			p.Locked = locked
 			p.Material = Enum.Material.SmoothPlastic
 			p.Color = isSeam and SEAM_COLOR or (SOLID_COLOR[edge] or SOLID_FALLBACK)
 			p.Transparency = isSeam and seamAlpha or solidAlpha

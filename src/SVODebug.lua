@@ -5,9 +5,9 @@
 -- depth, so the octree's compression reads directly off the picture: a big
 -- yellow block is one node standing in for 64 unit leaves.
 --
--- Everything lands under workspace.NVGN_Debug.SVO.<name>, is unanchored-safe
--- (Anchored, CanCollide/CanQuery/CanTouch off) and is Locked so it cannot be
--- grabbed by accident in the viewport.
+-- Everything lands under workspace.NVGN_Debug.SVO.<name>, Anchored with
+-- CanCollide/CanQuery/CanTouch off. The parts are left UNLOCKED so they can be
+-- clicked and inspected in the viewport; pass locked = true to protect them.
 
 local SVODebug = {}
 
@@ -90,6 +90,8 @@ function SVODebug.draw(tree, opts)
 	local inset: number = opts.inset or 0.06
 	local transparency: number = opts.transparency or 0.35
 	local outline: boolean = opts.outline or false
+	-- Unlocked by default: these are meant to be clicked, measured and deleted.
+	local locked: boolean = opts.locked == true
 	local maxParts: number = opts.maxParts or 20000
 
 	SVODebug.clear(name)
@@ -117,7 +119,7 @@ function SVODebug.draw(tree, opts)
 		p.CanQuery = false
 		p.CanTouch = false
 		p.CastShadow = false
-		p.Locked = true
+		p.Locked = locked
 		p.Material = Enum.Material.SmoothPlastic
 		p.Color = SIZE_COLOR[size] or FALLBACK
 		p.Transparency = transparency
@@ -158,7 +160,7 @@ function SVODebug.drawBounds(tree, name: string?)
 	p.Anchored = true
 	p.CanCollide, p.CanQuery, p.CanTouch = false, false, false
 	p.CastShadow = false
-	p.Locked = true
+	p.Locked = false
 	p.Transparency = 1
 	p.Size = Vector3.new(tree.half * 2, tree.half * 2, tree.half * 2)
 	p.CFrame = CFrame.new(tree.center)
