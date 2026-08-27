@@ -116,23 +116,25 @@ function SVOLocalDebug.draw(trees, opts)
 	return { drawn = drawn, seams = seams, overflowed = overflow, folder = folder }
 end
 
--- The local-axis tree is exactly coincident with the real geometry, so the
--- source parts occlude it completely. Toggle them out of the way; the original
--- transparency is stashed per part in the NVGN_origT attribute and restored,
--- so this leaves nothing behind.
-function SVOLocalDebug.setSourceHidden(model: Instance, hidden: boolean): number
+-- The local-axis tree is exactly coincident with the real geometry, so drawn in
+-- place the source parts occlude it completely. Push the source back to a given
+-- transparency to see the two overlap; pass nil to restore. The original value
+-- is stashed per part in the NVGN_origT attribute, so this leaves nothing
+-- behind, and a part already more transparent than the target is left alone.
+function SVOLocalDebug.setSourceTransparency(model: Instance, t: number?): number
 	local n = 0
 	for _, d in ipairs(model:GetDescendants()) do
 		if d:IsA("BasePart") then
-			if hidden then
+			if t then
 				if d:GetAttribute("NVGN_origT") == nil then
 					d:SetAttribute("NVGN_origT", d.Transparency)
 				end
-				d.Transparency = 1
+				-- never make a part MORE opaque than the builder made it
+				d.Transparency = math.max(t, d:GetAttribute("NVGN_origT") :: number)
 			else
-				local t = d:GetAttribute("NVGN_origT")
-				if t ~= nil then
-					d.Transparency = t
+				local orig = d:GetAttribute("NVGN_origT")
+				if orig ~= nil then
+					d.Transparency = orig :: number
 					d:SetAttribute("NVGN_origT", nil)
 				end
 			end
@@ -140,6 +142,11 @@ function SVOLocalDebug.setSourceHidden(model: Instance, hidden: boolean): number
 		end
 	end
 	return n
+end
+
+-- Fully hide / restore the source. Kept as the common case of the above.
+function SVOLocalDebug.setSourceHidden(model: Instance, hidden: boolean): number
+	return SVOLocalDebug.setSourceTransparency(model, hidden and 1 or nil)
 end
 
 return SVOLocalDebug
