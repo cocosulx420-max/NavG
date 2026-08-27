@@ -77,6 +77,27 @@ local function anchor(dim: number, leaf: number): number
 	return -n * leaf * 0.5
 end
 
+-- Is a part's COLLISION shape identical to its bounding box?
+--
+-- When it is, the box arithmetic below is exact and free. When it is not --
+-- a wedge is half its box, a union can be a third of it -- filling the box
+-- invents solid where there is air, which is what put phantom nodes at every
+-- gable and cut corner.
+--
+-- A part with CanQuery = false is treated as exact ON PURPOSE: the precise test
+-- is GetPartsInPart, which cannot see such a part at all, so the precise path
+-- would silently delete it entirely. An over-large box beats a vanished part.
+function SVOLocal.boxIsExact(part: BasePart): boolean
+	if not part.CanQuery then return true end
+	if part:IsA("UnionOperation") then return false end
+	if part:IsA("MeshPart") then
+		local ok, fid = pcall(function() return (part :: any).CollisionFidelity end)
+		return ok and fid == Enum.CollisionFidelity.Box
+	end
+	local ok, shape = pcall(function() return (part :: any).Shape end)
+	return ok and shape == Enum.PartType.Block
+end
+
 function SVOLocal.new(part: BasePart, leaf: number)
 	local self = setmetatable({}, SVOLocal)
 	local s = part.Size
@@ -120,10 +141,10 @@ function SVOLocal:_cubeInsidePart(lc: Vector3, h: number): boolean
 		and math.abs(lc.Z) + h <= e.Z + 1e-6
 end
 
-function SVOLocal:_build(node, lc: Vector3, h: number, depth: number, seamAt): boolean
-	if not self:_cubeHitsPart(lc, h) then return false end
+function SVOLocal:_build(node, lc: Vector3, h: number, depth: number, seamAt, hitsAt, fullAt): boolean
+	if not hitsAt(lc, h) then return false end
 	local seam = seamAt(lc, h)
-	local full = self:_cubeInsidePart(lc, h)
+	local full = fullAt(lc, h)
 
 	if depth == 0 then
 		node.solid = true
@@ -142,7 +163,7 @@ function SVOLocal:_build(node, lc: Vector3, h: number, depth: number, seamAt): b
 	local any = false
 	for i = 0, 7 do
 		local child = {}
-		if self:_build(child, lc + OFF[i] * ch, ch, depth - 1, seamAt) then
+		if self:_build(child, lc + OFF[i] * ch, ch, depth - 1, seamAt, hitsAt, fullAt) then
 			node.children[i] = child
 			any = true
 		end
@@ -179,37 +200,65 @@ end
 function SVOLocal.forPart(part: BasePart, others: {BasePart}, leaf: number, contactPad: number?)
 	local self = SVOLocal.new(part, leaf)
 	local pad = contactPad or 0.02
+	local exact = SVOLocal.boxIsExact(part)
+	self.exact = exact
 
-	if #others == 0 then
-		-- Nothing can cut it, so no probes are needed -- but still build, or the
-		-- root CUBE (which is larger than the part) would be reported as solid.
-		self:_build(self.root, self.center, self.half, self.maxDepth, function() return false end)
-		self.probeCount = 0
-		return self
-	end
-
+	-- One probe part serves both queries; each has its own OverlapParams.
 	local probe = Instance.new("Part")
 	probe.Anchored = true
 	probe.CanCollide, probe.CanQuery, probe.CanTouch = false, false, false
 	probe.Transparency = 1
 	probe.Parent = workspace
-	local op = OverlapParams.new()
-	op.FilterType = Enum.RaycastFilterType.Include
-	op.FilterDescendantsInstances = others
-	op.RespectCanCollide = false
 
-	local probes = 0
-	local function seamAt(lc: Vector3, h: number): boolean
-		probes += 1
-		local edge = h * 2 + pad
-		probe.Size = Vector3.new(edge, edge, edge)
-		probe.CFrame = self.cf * CFrame.new(lc)
-		return #workspace:GetPartsInPart(probe, op) > 0
+	local shapeProbes = 0
+	local hitsAt, fullAt
+	if exact then
+		hitsAt = function(lc: Vector3, h: number) return self:_cubeHitsPart(lc, h) end
+		fullAt = function(lc: Vector3, h: number) return self:_cubeInsidePart(lc, h) end
+	else
+		local selfOp = OverlapParams.new()
+		selfOp.FilterType = Enum.RaycastFilterType.Include
+		selfOp.FilterDescendantsInstances = { part }
+		selfOp.RespectCanCollide = false
+		selfOp.MaxParts = 1
+		hitsAt = function(lc: Vector3, h: number): boolean
+			-- cheap box reject first; the real query only runs inside the box
+			if not self:_cubeHitsPart(lc, h) then return false end
+			shapeProbes += 1
+			local edge = h * 2
+			probe.Size = Vector3.new(edge, edge, edge)
+			probe.CFrame = self.cf * CFrame.new(lc)
+			return #workspace:GetPartsInPart(probe, selfOp) > 0
+		end
+		-- Overlap is boolean, so containment inside a non-box shape cannot be
+		-- proven cheaply. Never claim "full" -- descend to the leaf and let the
+		-- eight-children collapse rebuild the big nodes from below.
+		fullAt = function() return false end
 	end
 
-	self:_build(self.root, self.center, self.half, self.maxDepth, seamAt)
+	local seamProbes = 0
+	local seamAt
+	if #others == 0 then
+		seamAt = function() return false end
+	else
+		local op = OverlapParams.new()
+		op.FilterType = Enum.RaycastFilterType.Include
+		op.FilterDescendantsInstances = others
+		op.RespectCanCollide = false
+		seamAt = function(lc: Vector3, h: number): boolean
+			seamProbes += 1
+			local edge = h * 2 + pad
+			probe.Size = Vector3.new(edge, edge, edge)
+			probe.CFrame = self.cf * CFrame.new(lc)
+			return #workspace:GetPartsInPart(probe, op) > 0
+		end
+	end
+
+	self:_build(self.root, self.center, self.half, self.maxDepth, seamAt, hitsAt, fullAt)
 	probe:Destroy()
-	self.probeCount = probes
+	self.probeCount = seamProbes + shapeProbes
+	self.seamProbes = seamProbes
+	self.shapeProbes = shapeProbes
 	return self
 end
 
@@ -253,6 +302,8 @@ function SVOLocal:stats()
 		minNode = (minE == math.huge) and 0 or minE,
 		maxNode = maxE,
 		probes = self.probeCount or 0,
+		shapeProbes = self.shapeProbes or 0,
+		exact = self.exact,
 	}
 end
 
@@ -265,6 +316,7 @@ function SVOLocal.fromParts(parts: {BasePart}, leaf: number, contactPad: number?
 	local totals = {
 		parts = 0, nodes = 0, seamNodes = 0,
 		volume = 0, seamVolume = 0, trueVolume = 0, probes = 0,
+		shapeProbes = 0, preciseParts = 0,
 	}
 	for _, part in ipairs(parts) do
 		local others = SVOLocal.neighbours(part, parts, leaf)
@@ -278,6 +330,8 @@ function SVOLocal.fromParts(parts: {BasePart}, leaf: number, contactPad: number?
 		totals.seamVolume += s.seamVolume
 		totals.trueVolume += s.trueVolume
 		totals.probes += s.probes
+		totals.shapeProbes += s.shapeProbes
+		if not s.exact then totals.preciseParts += 1 end
 	end
 	return trees, totals
 end
