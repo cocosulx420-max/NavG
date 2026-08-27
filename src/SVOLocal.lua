@@ -64,21 +64,41 @@ end
 
 -- ---- the per-part tree ------------------------------------------------------
 
+-- Anchor one axis so the CELLS THE PART OCCUPIES are centred on the part.
+--
+-- When a dimension is a whole multiple of leaf this returns exactly -dim/2, so
+-- it is identical to anchoring at the part's min corner and the clean cases stay
+-- clean. Otherwise it splits the overhang evenly instead of dumping all of it on
+-- the plus side. That matters most BELOW leaf size: a 0.38-thick panel in a
+-- 1-stud cell used to sit flush with one face and 0.62 studs proud of the other,
+-- so the voxels read as a slab beside the geometry rather than on it.
+local function anchor(dim: number, leaf: number): number
+	local n = math.max(1, math.ceil(dim / leaf - 1e-9))
+	return -n * leaf * 0.5
+end
+
 function SVOLocal.new(part: BasePart, leaf: number)
 	local self = setmetatable({}, SVOLocal)
 	local s = part.Size
+	local origin = Vector3.new(anchor(s.X, leaf), anchor(s.Y, leaf), anchor(s.Z, leaf))
 	local maxE = math.max(s.X, s.Y, s.Z)
 	local depth = math.max(0, math.ceil(math.log(maxE / leaf) / math.log(2)))
 	local edge = leaf * (2 ^ depth)
+	-- re-anchoring can push the far face out, so make sure the root still holds it
+	while (origin.X + edge < s.X * 0.5 - 1e-9)
+		or (origin.Y + edge < s.Y * 0.5 - 1e-9)
+		or (origin.Z + edge < s.Z * 0.5 - 1e-9) do
+		depth += 1
+		edge = leaf * (2 ^ depth)
+	end
 	self.part = part
 	self.cf = part.CFrame
 	self.size = s
 	self.leaf = leaf
 	self.maxDepth = depth
-	self.origin = -s * 0.5                        -- local min corner of the part
+	self.origin = origin
 	self.half = edge * 0.5
-	-- root anchored at the part's own min corner, so that corner is on-lattice
-	self.center = self.origin + Vector3.new(edge, edge, edge) * 0.5
+	self.center = origin + Vector3.new(edge, edge, edge) * 0.5
 	self.root = {}
 	return self
 end
