@@ -16,6 +16,7 @@ polygonization and the pathfinder are all left behind deliberately.
 | `src/LocalGrid.lua` | One grid PER PART, aligned to that part's own axes. Cells are live or dead; a dead cell records what killed it. This is the truth about what is walkable. |
 | `src/SVOLocal.lua` | One octree PER PART, in that part's own frame, so a rotated part voxelizes without an axis-aligned bounding box swelling it. Nodes touching a neighbouring part are marked as seams. Box-exact parts are solved analytically; meshes and unions fall back to `GetPartsInPart`. |
 | `src/SVOLocalDebug.lua` | Draws the per-part octrees as parts, hides and restores the source geometry, and culls a drawing to the nodes touching real geometry. Visualization only. |
+| `src/Contour.lua` | A region's cells to a closed polygon. Traces boundary loops, fits a tangent per border cell, cuts them into lines where the direction turns, closes U-turns, then extends the lines to their crossings and welds them into shared vertices. |
 
 ## What is not here, and why
 
