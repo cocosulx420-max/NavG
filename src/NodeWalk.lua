@@ -140,6 +140,37 @@ local function fallbackUp(cf: CFrame): Vector3
 	return best
 end
 
+-- A FRAME WHOSE UP IS THE CELL'S OWN NORMAL.
+--
+-- Everything downstream reads a cell's frame as "up is the surface normal, the
+-- other two axes lie in the surface" -- Contour.lattice takes its two in-plane
+-- axes straight from Right and Look and treats Up as the plane normal. A raw SVO
+-- node frame does not honour that: it is the node in its PART's axes, so its Up
+-- is the part's Y, which is the surface normal only when the walkable face
+-- happens to be that part's top.
+--
+-- When they differ by 90 degrees one "in-plane" axis IS the normal, so it
+-- measures depth instead of position and a whole row of cells projects onto one
+-- coordinate. Measured on case3: 43 of 57 regions, r2 collapsing 100 cells into
+-- 2 lattice slots and r98 1579 into 46 -- which is also why their borders came
+-- back at 3% when a real patch runs 12-25%. case5 hid it because its parts are
+-- mostly axis-aligned with walkable tops, so Up genuinely was the normal there.
+--
+-- Keep the part's own lattice direction: take whichever part axis is least
+-- aligned with the normal and flatten it into the plane, so cells still line up
+-- with their neighbours instead of being re-gridded onto some arbitrary axis.
+local function frameFor(cf: CFrame, up: Vector3): CFrame
+	local best, bd = nil, math.huge
+	for _, a in ipairs({ cf.RightVector, cf.UpVector, cf.LookVector }) do
+		local d = math.abs(a:Dot(up))
+		if d < bd then bd = d; best = a end
+	end
+	local right = best - up * best:Dot(up)
+	if right.Magnitude < 1e-4 then right = up:Cross(Vector3.new(1, 0, 0)) end
+	if right.Magnitude < 1e-4 then right = up:Cross(Vector3.new(0, 0, 1)) end
+	return CFrame.fromMatrix(cf.Position, right.Unit, up)
+end
+
 -- The two in-plane lattice directions for a cell, taken from the cell's OWN
 -- frame. Using world axes here deletes every sloped surface wholesale.
 local function basis(c): (Vector3?, Vector3?)
@@ -219,6 +250,10 @@ function NodeWalk.cells(parts: {BasePart}, cfg)
 		end
 		cell.up = n
 		cell.face = cell.cf.Position + n * (c.leaf * 0.5)
+		-- position is unchanged; only the ORIENTATION is restated so that up is the
+		-- normal. The world-Y rescue and normalizeFaces both replace this later with
+		-- their own frame when they take a cell over.
+		cell.frame = frameFor(cell.cf, n)
 	end
 
 	-- WORLD-Y TOP RESCUE.
@@ -1043,15 +1078,32 @@ function NodeWalk.regions(walk, alive, cfg)
 	local n = #walk
 
 	-- bucket by (mode, normal direction, plane offset)
+	--
+	-- MEASURE THE OFFSET WITH THE QUANTISED NORMAL, not the raw one. Two cells
+	-- can agree on the normal bucket and still disagree wildly on `face:Dot(up)`,
+	-- because that dot is taken against the WORLD ORIGIN: a normal off vertical by
+	-- a fraction of a degree contributes `dx*X + dz*Z`, which grows with distance
+	-- from the origin. Measured on case3's second floor -- three small parts tilted
+	-- 0.283 degrees at X~300 -- their true heights are 11.41 to 11.44, within one
+	-- bucket of the 11.408 slab they sit on, but their offsets came out at 12.679:
+	-- 1.24 studs adrift, five buckets away, so they split off as regions 44, 45 and
+	-- 46 over a floor they are part of. The same tilt costs nothing near the
+	-- origin, which is why region 23 at Y 0.408 was never affected.
+	--
+	-- Using the bucket's own normal makes the offset a property of the bucket
+	-- rather than of where the geometry happens to sit in the world.
 	local QN, QD = 100, 1 / (c.leaf * 0.5)
 	local planes = {}
 	for i = 1, n do
 		if alive == nil or alive[i] then
 			local cell = walk[i]
 			local u = cell.up
-			local d = cell.face:Dot(u)
+			local qx, qy, qz = math.round(u.X*QN), math.round(u.Y*QN), math.round(u.Z*QN)
+			local qn = Vector3.new(qx, qy, qz)
+			qn = (qn.Magnitude > 1e-6) and qn.Unit or u
+			local d = cell.face:Dot(qn)
 			local k = string.format("%s|%d,%d,%d|%d", cell.mode or "?",
-				math.round(u.X*QN), math.round(u.Y*QN), math.round(u.Z*QN), math.round(d*QD))
+				qx, qy, qz, math.round(d*QD))
 			local b = planes[k]; if not b then b = {}; planes[k] = b end
 			table.insert(b, i)
 		end
