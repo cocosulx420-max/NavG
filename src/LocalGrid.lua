@@ -1216,6 +1216,79 @@ function LocalGrid.drawNeighbours(data: any, opts: any?, parent: Instance?)
 	return folder, n
 end
 
+-- Stand a pillar on every line endpoint: the corners of the fitted boundary.
+--
+-- Endpoints are shared -- where two lines meet, both name the same point -- so
+-- they are deduplicated on a quantised position and the count reported is
+-- distinct corners, not line ends. A corner where three or more lines meet is
+-- one pillar, which is what makes a junction countable.
+--
+-- Pillars rise from the same lift as the lines so a corner reads as the post
+-- holding up the outline rather than as something floating beside it.
+function LocalGrid.drawCorners(data: any, opts: any?, parent: Instance?)
+	if typeof(opts) == "Instance" then parent = opts :: Instance; opts = nil end
+	local o = opts or {}
+	local lift = o.lift or 1
+	local height = o.height or 4
+	local thick = o.thickness or 0.15
+	local col = o.color or Color3.fromRGB(255, 25, 25)
+
+	local only = nil
+	if o.only and typeof(o.only) == "table" then
+		only = {}
+		for k, v in pairs(o.only) do
+			if typeof(k) == "number" and typeof(v) == "number" then only[v] = true
+			else only[k] = v and true or nil end
+		end
+	end
+
+	local root = parent or workspace
+	local dbg = root:FindFirstChild("NVGN_Debug")
+	if not dbg then
+		dbg = Instance.new("Folder"); dbg.Name = "NVGN_Debug"; dbg.Parent = root
+	end
+	local old = dbg:FindFirstChild("Corners")
+	if old then old:Destroy() end
+	local folder = Instance.new("Folder"); folder.Name = "Corners"; folder.Parent = dbg
+
+	local n = 0
+	for r, res in pairs(data.contours or {}) do
+		if res.edges and (not only or only[r]) then
+			local rf = Instance.new("Folder"); rf.Name = string.format("r%03d", r); rf.Parent = folder
+			local up = (res.lattice and res.lattice.up) or Vector3.yAxis
+			local seen, hits = {}, {}
+			for _, e in ipairs(res.edges) do
+				for _, pt in ipairs({ e.a, e.b }) do
+					local key = string.format("%d:%d:%d",
+						math.round(pt.X * 8), math.round(pt.Y * 8), math.round(pt.Z * 8))
+					if not seen[key] then
+						seen[key] = pt
+						hits[key] = 1
+					else
+						hits[key] += 1
+					end
+				end
+			end
+			for key, pt in pairs(seen) do
+				local post = Instance.new("Part")
+				post.Anchored = true; post.CanCollide = false
+				post.CanQuery = false; post.CanTouch = false
+				post.Size = Vector3.new(thick, height, thick)
+				-- oriented to the surface, so a corner on a ramp or a roof stands
+				-- off its face instead of leaning through it
+				post.CFrame = CFrame.fromMatrix(pt + up * (lift + height * 0.5), Vector3.xAxis, up)
+				post.Color = col
+				post.Material = Enum.Material.Neon
+				post.Name = string.format("corner_x%d", hits[key])
+				post.Parent = rf
+				n += 1
+			end
+		end
+	end
+	data.stats.corners = n
+	return folder, n
+end
+
 -- Draw the fitted boundary as neon segments, one colour per region.
 --
 -- `lift` raises them off the surface along its OWN normal rather than along
