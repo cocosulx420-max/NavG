@@ -165,8 +165,16 @@ local function surfaceFrame(part: BasePart, surfels: {any}, step: number)
 		uMax = math.max(uMax, math.abs(r:Dot(u)))
 		vMax = math.max(vMax, math.abs(r:Dot(v)))
 	end
-	uExt = math.max(uExt, uMax + step)
-	vExt = math.max(vExt, vMax + step)
+	-- Grow to the outermost surfel, and NO further. An earlier version added a
+	-- whole `step` of margin here, which was wrong twice over: rounding the cell
+	-- count up already leaves up to half a step of slack on each side, and on a
+	-- part thinner than the step the margin dominated its real size -- a 0.5-stud
+	-- tread was given a 4-cell lattice whose sample points landed on and past its
+	-- edges, so whether a row survived came down to float luck. That is what made
+	-- identical stair treads come out one row deep in some places and two in
+	-- others.
+	uExt = math.max(uExt, uMax)
+	vExt = math.max(vExt, vMax)
 	-- Cap the stray: it only sizes the probe ray, and a wild surfel should not
 	-- turn that into an arbitrarily long cast.
 	dev = math.min(dev, 32)
