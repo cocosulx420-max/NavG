@@ -49,6 +49,7 @@ export type Config = {
 	step: number?, maxSlope: number?, clearCap: number?, minClearance: number?,
 	flushTol: number?, probeRadius: number?, minWidth: number?, regionAngle: number?,
 	bandHeight: number?, standHeight: number?, crouchHeight: number?,
+	connectivity: number?,
 }
 
 local DEFAULT = {
@@ -94,6 +95,8 @@ local DEFAULT = {
 	-- so they are never the same region.
 	standHeight = 5,
 	crouchHeight = 3,
+	-- 4 or 8. See DIR4 above; 4 is what the boundary tracing needs.
+	connectivity = 4,
 }
 
 local UP = Vector3.new(0, 1, 0)
@@ -332,6 +335,23 @@ local DIR8 = {
 	{ -1, 0 }, { -1, -1 }, { 0, -1 }, { 1, -1 },
 }
 
+-- 4-CONNECTED is the default, and it is not a simplification.
+--
+-- Measured on the other approach: 8-connectivity adds the inner corners of every
+-- staircase (+630 cells on case5 region 40) and makes the tangent fit WORSE
+-- (linearity 0.973 -> 0.959), because those corner cells sit off the line the
+-- rest of the stretch defines. A boundary loop is built from cell FACES, and a
+-- diagonal contact has no face to contribute. 8-conn remains the right rule for
+-- erosion and for corner-to-corner pinch detection -- which is why pruneNarrow,
+-- a filled-square test, is unaffected by this setting.
+local DIR4 = {
+	{ 1, 0 }, { 0, 1 }, { -1, 0 }, { 0, -1 },
+}
+
+local function dirsFor(c: any)
+	return (c.connectivity == 8) and DIR8 or DIR4
+end
+
 -- World XZ bucket, 1 stud, holding every cell and every dead cell so a
 -- neighbour can be found without knowing which grid owns it.
 local function buildWorldIndex(grids: any)
@@ -520,12 +540,13 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	local live, dead = buildWorldIndex(data.grids)
 	local r2 = (c.probeRadius * c.step) ^ 2
 	local tol = c.flushTol
+	local dirs = dirsFor(c)
 	local nWall, nDrop, nBoth, nEdge = 0, 0, 0, 0
 
 	for _, g in pairs(data.grids) do
 		for _, cell in ipairs(g.cells) do
 			local wallMask, dropMask, edgeMask = 0, 0, 0
-			for bit, d in ipairs(DIR8) do
+			for bit, d in ipairs(dirs) do
 				local p = neighbourPos(g, cell, d)
 				local bx, bz = math.floor(p.X), math.floor(p.Z)
 				-- BELOW OUTRANKS ABOVE, and getting that backwards is what marked
@@ -753,6 +774,7 @@ function LocalGrid.regions(data: any, cfg: Config?)
 	local r2 = (c.probeRadius * c.step) ^ 2
 	local tol = c.flushTol
 	local cosTol = math.cos(math.rad(c.regionAngle))
+	local dirs = dirsFor(c)
 
 	local up: { [any]: any } = {}
 	local function find(x)
@@ -770,7 +792,7 @@ function LocalGrid.regions(data: any, cfg: Config?)
 	for _, g in pairs(data.grids) do
 		for _, cell in ipairs(g.cells) do
 			gridOf[cell] = g
-			for _, d in ipairs(DIR8) do
+			for _, d in ipairs(dirs) do
 				local p = neighbourPos(g, cell, d)
 				local bx, bz = math.floor(p.X), math.floor(p.Z)
 				for ox = -1, 1 do
@@ -835,7 +857,7 @@ function LocalGrid.regions(data: any, cfg: Config?)
 				end
 				for _, cell in ipairs(m) do
 					local g = gridOf[cell]
-					for _, d in ipairs(DIR8) do
+					for _, d in ipairs(dirs) do
 						local p = neighbourPos(g, cell, d)
 						local bx, bz = math.floor(p.X), math.floor(p.Z)
 						for ox = -1, 1 do
@@ -896,6 +918,102 @@ function LocalGrid.regions(data: any, cfg: Config?)
 	end
 	data.stats.regionFragments = frag
 	return data
+end
+
+-- Hand each region to NVGN.Contour, the boundary tracer from the other
+-- approach: cells -> closed loops -> a tangent per border cell -> lines.
+--
+-- Contour wants ONE lattice per region, and a LocalGrid region does not have
+-- one: it spans parts, each with its own origin and its own in-plane rotation.
+-- The anchor cell frame is used for the whole region, so cells from a part
+-- rotated against it land off-lattice and can share a slot. `collapsed` counts
+-- exactly that, per region, and is the number to watch before trusting any of
+-- the line output -- it is the same failure the other approach hit on case3.
+function LocalGrid.contours(data: any, cfg: Config?)
+	local Contour = require(script.Parent:WaitForChild("Contour"))
+	local step = data.config.step
+
+	local byRegion: { [number]: {any} } = {}
+	for _, g in pairs(data.grids) do
+		local u = g.u or Vector3.xAxis
+		local n = g.n or Vector3.yAxis
+		for _, cell in ipairs(g.cells) do
+			local r = cell.region
+			if r then
+				local t = byRegion[r]
+				if not t then t = {}; byRegion[r] = t end
+				t[#t + 1] = { cf = CFrame.fromMatrix(cell.pos, u, n) }
+			end
+		end
+	end
+
+	local out, nCells, nSlots, nLines, nLoops, nFailed = {}, 0, 0, 0, 0, 0
+	local worstCollapse, worstAt = 0, 0
+	for r, parts in pairs(byRegion) do
+		local ok, res = pcall(Contour.run, parts, { leaf = step })
+		if ok and typeof(res) == "table" then
+			local slots = 0
+			for _ in pairs(res.lattice.occ) do slots += 1 end
+			res.stats.slots = slots
+			res.stats.collapsed = #parts - slots
+			local frac = res.stats.collapsed / math.max(1, #parts)
+			if frac > worstCollapse then worstCollapse = frac; worstAt = r end
+			out[r] = res
+			nCells += #parts; nSlots += slots
+			nLines += res.stats.lines; nLoops += res.stats.loops
+		else
+			out[r] = { failed = tostring(res) }
+			nFailed += 1
+		end
+	end
+
+	data.contours = out
+	data.stats.contourCells = nCells
+	data.stats.contourSlots = nSlots
+	data.stats.contourCollapsed = nCells - nSlots
+	data.stats.contourLines = nLines
+	data.stats.contourLoops = nLoops
+	data.stats.contourFailed = nFailed
+	data.stats.worstCollapse = worstCollapse
+	data.stats.worstCollapseRegion = worstAt
+	return data
+end
+
+-- Draw the fitted boundary as neon segments, one colour per region.
+function LocalGrid.drawContours(data: any, parent: Instance?)
+	local root = parent or workspace
+	local dbg = root:FindFirstChild("NVGN_Debug")
+	if not dbg then
+		dbg = Instance.new("Folder"); dbg.Name = "NVGN_Debug"; dbg.Parent = root
+	end
+	local old = dbg:FindFirstChild("Contours")
+	if old then old:Destroy() end
+	local folder = Instance.new("Folder"); folder.Name = "Contours"; folder.Parent = dbg
+
+	local n = 0
+	for r, res in pairs(data.contours or {}) do
+		if res.edges then
+			local rf = Instance.new("Folder"); rf.Name = string.format("r%03d", r); rf.Parent = folder
+			local col = Color3.fromHSV((r * 0.61803398875) % 1, 0.9, 1)
+			for _, e in ipairs(res.edges) do
+				local d = e.b - e.a
+				local len = d.Magnitude
+				if len > 1e-3 then
+					local seg = Instance.new("Part")
+					seg.Anchored = true; seg.CanCollide = false
+					seg.CanQuery = false; seg.CanTouch = false
+					seg.Size = Vector3.new(0.12, 0.12, len)
+					seg.CFrame = CFrame.lookAt(e.a + d * 0.5, e.b)
+					seg.Color = col
+					seg.Material = Enum.Material.Neon
+					seg.Name = string.format("e%d_%.1f", e.id or 0, len)
+					seg.Parent = rf
+					n += 1
+				end
+			end
+		end
+	end
+	return folder, n
 end
 
 -- Debug viz. Border cells -- the ones classifyNodes marked wall or dropoff --
