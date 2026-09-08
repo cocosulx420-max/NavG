@@ -349,103 +349,121 @@ function LocalGrid.pruneNarrow(data: any, cfg: Config?)
 		c.flushTol = (cfg and cfg.flushTol) or data.config.flushTol or c.flushTol
 	end
 	data.stats.narrow = 0
+	data.stats.narrowPasses = 0
 	local k = math.ceil(c.minWidth / c.step) -- cells spanning one agent width
 	if k <= 1 then return data end
 
-	local live = buildWorldIndex(data.grids)
 	local r2 = (c.probeRadius * c.step) ^ 2
 	local tol = c.flushTol
 	local step = c.step
+	local half = math.floor((k - 1) / 2)
 
-	-- Windows overlap heavily, so the same world point is probed many times.
-	-- Quantising to an eighth of a stud is far finer than probeRadius, so two
-	-- points that share a key would have answered the same anyway.
-	local memo: { [string]: boolean } = {}
-	local function floorAt(p: Vector3): boolean
-		local key = math.round(p.X * 8) .. ":" .. math.round(p.Y * 8) .. ":" .. math.round(p.Z * 8)
-		local m = memo[key]
-		if m ~= nil then return m end
-		local found = false
-		local bx, bz = math.floor(p.X), math.floor(p.Z)
-		for ox = -1, 1 do
-			for oz = -1, 1 do
-				for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
-					local q = e.cell.pos
-					local dx, dz = q.X - p.X, q.Z - p.Z
-					if dx * dx + dz * dz <= r2 and math.abs(q.Y - p.Y) <= tol then
-						found = true
-						break
+	-- ITERATED to a fixed point. One pass is not enough because a footprint may
+	-- be completed by cells that are themselves about to be pruned: where a rail
+	-- runs within flushTol of a post cap or a second rail, each props the other
+	-- up and both survive a single pass. Re-running against only the survivors
+	-- removes whatever was standing on doomed ground. It terminates because
+	-- every pass either removes cells or stops, and it cannot eat real floor:
+	-- a cell in open floor keeps a valid footprint no matter how many times it
+	-- is asked, so a wide surface is a fixed point from the first pass.
+	local totalNarrow, passes = 0, 0
+	while passes < 8 do
+		passes += 1
+		local live = buildWorldIndex(data.grids)
+
+		-- Windows overlap heavily, so the same world point is probed many times.
+		-- Quantising to an eighth of a stud is far finer than probeRadius, so two
+		-- points that share a key would have answered the same anyway.
+		local memo: { [string]: boolean } = {}
+		local function floorAt(p: Vector3): boolean
+			local key = math.round(p.X * 8) .. ":" .. math.round(p.Y * 8) .. ":" .. math.round(p.Z * 8)
+			local m = memo[key]
+			if m ~= nil then return m end
+			local found = false
+			local bx, bz = math.floor(p.X), math.floor(p.Z)
+			for ox = -1, 1 do
+				for oz = -1, 1 do
+					for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
+						local q = e.cell.pos
+						local dx, dz = q.X - p.X, q.Z - p.Z
+						if dx * dx + dz * dz <= r2 and math.abs(q.Y - p.Y) <= tol then
+							found = true
+							break
+						end
 					end
+					if found then break end
 				end
 				if found then break end
 			end
-			if found then break end
+			memo[key] = found
+			return found
 		end
-		memo[key] = found
-		return found
-	end
 
-	-- Is the whole k x k footprint anchored at `origin` walkable?
-	local function footFits(u: Vector3, v: Vector3, origin: Vector3): boolean
-		for a = 0, k - 1 do
-			for b = 0, k - 1 do
-				if not floorAt(origin + u * (a * step) + v * (b * step)) then
-					return false
+		-- Is the whole k x k footprint anchored at `origin` walkable?
+		local function footFits(u: Vector3, v: Vector3, origin: Vector3): boolean
+			for a = 0, k - 1 do
+				for b = 0, k - 1 do
+					if not floorAt(origin + u * (a * step) + v * (b * step)) then
+						return false
+					end
 				end
 			end
-		end
-		return true
-	end
-
-	-- A cell is standable if the agent's footprint fits ANYWHERE that covers it.
-	--
-	-- Two 1-D runs through the cell -- the previous test -- ask a weaker
-	-- question, and handrails exploited the gap: a rail has a long run along its
-	-- length, and where it meets a newel post or dies into a wall the crosswise
-	-- run leaks onto that neighbour and reaches width. So the middle of every
-	-- rail was pruned and its ends survived. Requiring a filled square instead
-	-- of two crossing lines closes that, because a post cap is not big enough to
-	-- complete one.
-	--
-	-- Asking whether a covering footprint EXISTS, rather than whether the one
-	-- centred here fits, is what keeps the edge cells of a wide floor: their
-	-- footprint simply sits further in. This is a morphological opening, and the
-	-- centred window is tried first because that is the answer for open floor.
-	local half = math.floor((k - 1) / 2)
-	local function standable(u: Vector3, v: Vector3, cell: Cell): boolean
-		if footFits(u, v, cell.pos - u * (half * step) - v * (half * step)) then
 			return true
 		end
-		for a = 0, k - 1 do
-			for b = 0, k - 1 do
-				if (a ~= half or b ~= half)
-					and footFits(u, v, cell.pos - u * (a * step) - v * (b * step)) then
-					return true
+
+		-- A cell is standable if the agent's footprint fits ANYWHERE covering it.
+		--
+		-- Two 1-D runs through the cell -- an earlier version of this test -- ask
+		-- a weaker question, and handrails exploited the gap: a rail has a long
+		-- run along its length, and where it meets a newel post or dies into a
+		-- wall the crosswise run leaks onto that neighbour and reaches width. So
+		-- the middle of every rail was pruned and its ends survived. A filled
+		-- square closes that, because a post cap cannot complete one.
+		--
+		-- Asking whether a covering footprint EXISTS, rather than whether the one
+		-- centred here fits, is what keeps the edge cells of a wide floor: their
+		-- footprint simply sits further in. The centred window is tried first
+		-- because that is the answer for open floor.
+		local function standable(u: Vector3, v: Vector3, cell: Cell): boolean
+			if footFits(u, v, cell.pos - u * (half * step) - v * (half * step)) then
+				return true
+			end
+			for a = 0, k - 1 do
+				for b = 0, k - 1 do
+					if (a ~= half or b ~= half)
+						and footFits(u, v, cell.pos - u * (a * step) - v * (b * step)) then
+						return true
+					end
 				end
 			end
+			return false
 		end
-		return false
+
+		local nNarrow = 0
+		for _, g in pairs(data.grids) do
+			local u = g.u or Vector3.xAxis
+			local v = g.v or Vector3.zAxis
+			local keep = {}
+			local narrow = g.narrow or {}
+			for _, cell in ipairs(g.cells) do
+				if standable(u, v, cell) then
+					keep[#keep + 1] = cell
+				else
+					narrow[#narrow + 1] = cell
+					g.index[string.format("%d:%d", cell.ui, cell.vi)] = nil
+					nNarrow += 1
+				end
+			end
+			g.cells = keep
+			g.narrow = narrow
+		end
+		totalNarrow += nNarrow
+		if nNarrow == 0 then break end
 	end
 
-	local nNarrow = 0
-	for _, g in pairs(data.grids) do
-		local u = g.u or Vector3.xAxis
-		local v = g.v or Vector3.zAxis
-		local keep, narrow = {}, {}
-		for _, cell in ipairs(g.cells) do
-			if standable(u, v, cell) then
-				keep[#keep + 1] = cell
-			else
-				narrow[#narrow + 1] = cell
-				g.index[string.format("%d:%d", cell.ui, cell.vi)] = nil
-				nNarrow += 1
-			end
-		end
-		g.cells = keep
-		g.narrow = narrow
-	end
-	data.stats.cells -= nNarrow
-	data.stats.narrow = nNarrow
+	data.stats.cells -= totalNarrow
+	data.stats.narrow = totalNarrow
+	data.stats.narrowPasses = passes
 	return data
 end
 
