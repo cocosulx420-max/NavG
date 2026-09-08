@@ -16,6 +16,8 @@ export type Cell = {
 	dropMask: number?,        -- directions with nothing to stand on
 	wall: boolean?,
 	dropoff: boolean?,
+	region: number?,          -- set by LocalGrid.regions; 1 = largest
+
 }
 
 export type DeadCell = {
@@ -42,7 +44,7 @@ export type Grid = {
 
 export type Config = {
 	step: number?, maxSlope: number?, clearCap: number?, minClearance: number?,
-	flushTol: number?, probeRadius: number?, minWidth: number?,
+	flushTol: number?, probeRadius: number?, minWidth: number?, regionAngle: number?,
 }
 
 local DEFAULT = {
@@ -69,6 +71,11 @@ local DEFAULT = {
 	-- fact that separates them. Default is the Roblox character's shoulder
 	-- width; set it to 0 to keep every surface.
 	minWidth = 2,
+	-- How far two adjacent cells surface normals may diverge and still belong to
+	-- the same region. Regions are meant to be surfaces one plane can describe,
+	-- so a ramp meeting a floor is a seam even though you can walk straight
+	-- across it -- that join is a region LINK, not a merge.
+	regionAngle = 15,
 }
 
 local UP = Vector3.new(0, 1, 0)
@@ -609,6 +616,7 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 	}
 	LocalGrid.pruneNarrow(data, cfg)
 	LocalGrid.classifyNodes(data, cfg)
+	LocalGrid.regions(data, cfg)
 	return data
 end
 
@@ -668,6 +676,94 @@ function LocalGrid.build(cfg: Config?)
 	return data, floorData, tree, parts
 end
 
+-- Group cells into regions: connected runs of surface that share a plane.
+--
+-- Adjacency is the same neighbour lookup classifyNodes uses, so a region flows
+-- across part boundaries -- a plaza paved from forty slabs is one region, not
+-- forty. Two conditions join a pair: the neighbour has to sit on this cells own
+-- plane within flushTol (a step up is a different region, which is what keeps
+-- stair treads apart), and the normals have to agree within regionAngle (so a
+-- ramp is not swallowed by the floor it runs into).
+--
+-- Ids are assigned largest-first, so region 1 is the main floor on any map and
+-- the numbering is stable enough to compare between bakes.
+function LocalGrid.regions(data: any, cfg: Config?)
+	local c = merged(cfg)
+	if data.config then
+		c.step = data.config.step or c.step
+		c.flushTol = (cfg and cfg.flushTol) or data.config.flushTol or c.flushTol
+		c.regionAngle = (cfg and cfg.regionAngle) or data.config.regionAngle or c.regionAngle
+	end
+	local live = buildWorldIndex(data.grids)
+	local r2 = (c.probeRadius * c.step) ^ 2
+	local tol = c.flushTol
+	local cosTol = math.cos(math.rad(c.regionAngle))
+
+	local up: { [any]: any } = {}
+	local function find(x)
+		local r = x
+		while up[r] do r = up[r] end
+		while up[x] do up[x], x = r, up[x] end
+		return r
+	end
+	local function union(a, b)
+		local ra, rb = find(a), find(b)
+		if ra ~= rb then up[ra] = rb end
+	end
+
+	for _, g in pairs(data.grids) do
+		for _, cell in ipairs(g.cells) do
+			for _, d in ipairs(DIR8) do
+				local p = neighbourPos(g, cell, d)
+				local bx, bz = math.floor(p.X), math.floor(p.Z)
+				for ox = -1, 1 do
+					for oz = -1, 1 do
+						for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
+							local q = e.cell
+							local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
+							if dx * dx + dz * dz <= r2
+								and math.abs(q.pos.Y - p.Y) <= tol
+								and cell.normal:Dot(q.normal) >= cosTol then
+								union(cell, q)
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+
+	local members: { [any]: {Cell} } = {}
+	for _, g in pairs(data.grids) do
+		for _, cell in ipairs(g.cells) do
+			local r = find(cell)
+			local m = members[r]
+			if not m then m = {}; members[r] = m end
+			m[#m + 1] = cell
+		end
+	end
+	local groups = {}
+	for _, m in pairs(members) do groups[#groups + 1] = m end
+	table.sort(groups, function(a, b) return #a > #b end)
+	local sizes = {}
+	for i, m in ipairs(groups) do
+		sizes[i] = #m
+		for _, cell in ipairs(m) do cell.region = i end
+	end
+
+	data.regions = groups
+	data.stats.regions = #groups
+	data.stats.regionSizes = sizes
+	data.stats.largestRegion = sizes[1] or 0
+	-- a region too small to stand a footprint in is a fragment, worth counting
+	local frag = 0
+	for _, n in ipairs(sizes) do
+		if n * c.step * c.step < c.minWidth * c.minWidth then frag += 1 end
+	end
+	data.stats.regionFragments = frag
+	return data
+end
+
 -- Debug viz. Border cells -- the ones classifyNodes marked wall or dropoff --
 -- go in a `Border` folder per part and interior cells in `Interior`, so either
 -- layer can be hidden on its own. A run never spans the two, so the split is
@@ -683,6 +779,10 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 	if typeof(opts) == "Instance" then parent = opts :: Instance; opts = nil end
 	local o = opts or {}
 	local merge = o.merge ~= false
+	-- Colour and foldering follow regions once they exist; by = "part" restores
+	-- the per-part hue, which is what you want when the question is which PART a
+	-- cell came from rather than what it connects to.
+	local byRegion = (o.by ~= "part") and data.stats.regions ~= nil
 
 	local root = parent or workspace
 	local dbg = root:FindFirstChild("NVGN_Debug")
@@ -708,18 +808,38 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 		return cell.wall == true or cell.dropoff == true
 	end
 
+	local function hueOf(n: number): number
+		return (n * 0.61803398875) % 1
+	end
+
+	local groups: { [string]: Folder } = {}
+	local function groupFolder(name: string): Folder
+		local f = groups[name]
+		if not f then
+			f = Instance.new("Folder"); f.Name = name; f.Parent = folder
+			groups[name] = f
+		end
+		return f
+	end
+
 	local i, drawn, nBorder = 0, 0, 0
 	for part, g in pairs(data.grids) do
 		i += 1
-		local hue = (i * 0.61803398875) % 1
+		local partHue = hueOf(i)
 		local sat = g.fallback and 0.3 or 0.9
-		local pf = Instance.new("Folder"); pf.Name = part.Name; pf.Parent = folder
+		local partName = part.Name
 		local layers = {}
-		local function layer(name: string): Folder
-			local f = layers[name]
+		local function layer(owner: string, name: string): Folder
+			local key = owner .. "/" .. name
+			local f = layers[key]
 			if not f then
-				f = Instance.new("Folder"); f.Name = name; f.Parent = pf
-				layers[name] = f
+				local pf = groupFolder(owner)
+				local sub = pf:FindFirstChild(name)
+				if not sub then
+					sub = Instance.new("Folder"); sub.Name = name; sub.Parent = pf
+				end
+				f = sub :: Folder
+				layers[key] = f
 			end
 			return f
 		end
@@ -734,6 +854,7 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 			-- read the same as they do between unmerged tiles
 			local along = len * step - (1 - w) * step
 			dot.Size = Vector3.new(along, 0.1, w * step)
+			local hue = byRegion and hueOf(first.region or 0) or partHue
 			dot.Color = Color3.fromHSV(hue, sat, v)
 			-- matte interior so the neon Boundary edges pop over the grid layer;
 			-- border nodes get diamond plate, which reads as a distinct surface
@@ -750,7 +871,10 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 			dot.Name = (len == 1)
 				and string.format("c%.1f", first.clearance)
 				or string.format("c%.1f_x%d", first.clearance, len)
-			dot.Parent = layer(isBorder(first) and "Border" or "Interior")
+			local owner = byRegion
+				and string.format("r%03d", first.region or 0)
+				or partName
+			dot.Parent = layer(owner, isBorder(first) and "Border" or "Interior")
 			drawn += 1
 			if isBorder(first) then nBorder += len end
 		end
@@ -778,7 +902,8 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 			for _, cell in ipairs(r) do
 				local cb, cw, cv = band(cell.clearance)
 				if first and cb == bi and cell.ui == last.ui + 1
-					and isBorder(cell) == isBorder(first) then
+					and isBorder(cell) == isBorder(first)
+					and cell.region == first.region then
 					last, len = cell, len + 1
 				else
 					if first then emit(first, last, len, w, v) end
