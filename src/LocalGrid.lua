@@ -334,14 +334,13 @@ end
 -- and nothing was measuring it, so case3 grew cells along stair stringers,
 -- ledges and window trim -- 25 grids and 113 cells, 4.3% of the bake.
 --
--- Width is measured THROUGH the cell rather than out from it: the span is the
--- contiguous run of walkable surface containing this cell, so the edge cells of
--- a wide floor still see the floor's full width and are not eroded away. And it
--- is measured in world space against the shared index, the same way a neighbour
--- lookup is, so a deck planked out of 1-stud parts reads as one wide run
--- instead of a row of rails. A ledge flush with a floor is likewise part of
--- that floor and survives; a rail 3 studs above it does not, because the run
--- stops where the height does.
+-- The test is whether the agent's square footprint fits SOMEWHERE that covers
+-- the cell. Asking for a covering footprint rather than a centred one is what
+-- keeps the edge cells of a wide floor -- their footprint just sits further in.
+-- It is evaluated in world space against the shared index, the same way a
+-- neighbour lookup is, so a deck planked out of 1-stud parts is one wide
+-- surface rather than a row of rails, and a ledge flush with a floor is part of
+-- that floor while a rail three studs above it is not.
 function LocalGrid.pruneNarrow(data: any, cfg: Config?)
 	local c = merged(cfg)
 	if data.config then
@@ -350,15 +349,23 @@ function LocalGrid.pruneNarrow(data: any, cfg: Config?)
 		c.flushTol = (cfg and cfg.flushTol) or data.config.flushTol or c.flushTol
 	end
 	data.stats.narrow = 0
-	if c.minWidth <= c.step then return data end
+	local k = math.ceil(c.minWidth / c.step) -- cells spanning one agent width
+	if k <= 1 then return data end
 
 	local live = buildWorldIndex(data.grids)
 	local r2 = (c.probeRadius * c.step) ^ 2
 	local tol = c.flushTol
-	-- cells needed BESIDE this one, summed over the two opposite directions
-	local need = math.ceil(c.minWidth / c.step) - 1
+	local step = c.step
 
+	-- Windows overlap heavily, so the same world point is probed many times.
+	-- Quantising to an eighth of a stud is far finer than probeRadius, so two
+	-- points that share a key would have answered the same anyway.
+	local memo: { [string]: boolean } = {}
 	local function floorAt(p: Vector3): boolean
+		local key = math.round(p.X * 8) .. ":" .. math.round(p.Y * 8) .. ":" .. math.round(p.Z * 8)
+		local m = memo[key]
+		if m ~= nil then return m end
+		local found = false
 		local bx, bz = math.floor(p.X), math.floor(p.Z)
 		for ox = -1, 1 do
 			for oz = -1, 1 do
@@ -366,23 +373,58 @@ function LocalGrid.pruneNarrow(data: any, cfg: Config?)
 					local q = e.cell.pos
 					local dx, dz = q.X - p.X, q.Z - p.Z
 					if dx * dx + dz * dz <= r2 and math.abs(q.Y - p.Y) <= tol then
-						return true
+						found = true
+						break
 					end
+				end
+				if found then break end
+			end
+			if found then break end
+		end
+		memo[key] = found
+		return found
+	end
+
+	-- Is the whole k x k footprint anchored at `origin` walkable?
+	local function footFits(u: Vector3, v: Vector3, origin: Vector3): boolean
+		for a = 0, k - 1 do
+			for b = 0, k - 1 do
+				if not floorAt(origin + u * (a * step) + v * (b * step)) then
+					return false
+				end
+			end
+		end
+		return true
+	end
+
+	-- A cell is standable if the agent's footprint fits ANYWHERE that covers it.
+	--
+	-- Two 1-D runs through the cell -- the previous test -- ask a weaker
+	-- question, and handrails exploited the gap: a rail has a long run along its
+	-- length, and where it meets a newel post or dies into a wall the crosswise
+	-- run leaks onto that neighbour and reaches width. So the middle of every
+	-- rail was pruned and its ends survived. Requiring a filled square instead
+	-- of two crossing lines closes that, because a post cap is not big enough to
+	-- complete one.
+	--
+	-- Asking whether a covering footprint EXISTS, rather than whether the one
+	-- centred here fits, is what keeps the edge cells of a wide floor: their
+	-- footprint simply sits further in. This is a morphological opening, and the
+	-- centred window is tried first because that is the answer for open floor.
+	local half = math.floor((k - 1) / 2)
+	local function standable(u: Vector3, v: Vector3, cell: Cell): boolean
+		if footFits(u, v, cell.pos - u * (half * step) - v * (half * step)) then
+			return true
+		end
+		for a = 0, k - 1 do
+			for b = 0, k - 1 do
+				if (a ~= half or b ~= half)
+					and footFits(u, v, cell.pos - u * (a * step) - v * (b * step)) then
+					return true
 				end
 			end
 		end
 		return false
-	end
-
-	-- contiguous cells beyond `cell` along `dir`, capped: we only ever need to
-	-- know whether the run reaches minWidth, never how far past it goes.
-	local function reach(cell: Cell, dir: Vector3): number
-		local k = 0
-		while k < need do
-			if not floorAt(cell.pos + dir * ((k + 1) * c.step)) then break end
-			k += 1
-		end
-		return k
 	end
 
 	local nNarrow = 0
@@ -391,9 +433,7 @@ function LocalGrid.pruneNarrow(data: any, cfg: Config?)
 		local v = g.v or Vector3.zAxis
 		local keep, narrow = {}, {}
 		for _, cell in ipairs(g.cells) do
-			local wu = reach(cell, u) + reach(cell, -u)
-			local wv = (wu >= need) and (reach(cell, v) + reach(cell, -v)) or 0
-			if wu >= need and wv >= need then
+			if standable(u, v, cell) then
 				keep[#keep + 1] = cell
 			else
 				narrow[#narrow + 1] = cell
