@@ -610,7 +610,12 @@ function LocalGrid.build(cfg: Config?)
 	return data, floorData, tree, parts
 end
 
--- Debug viz. Cells are merged into runs along the grid's u axis: at step 0.5 a
+-- Debug viz. Border cells -- the ones classifyNodes marked wall or dropoff --
+-- go in a `Border` folder per part and interior cells in `Interior`, so either
+-- layer can be hidden on its own. A run never spans the two, so the split is
+-- exact rather than approximate at the seam.
+--
+-- Cells are merged into runs along the grid's u axis: at step 0.5 a
 -- part-per-cell draw is 200k Parts for case5, and a Part costs ~4KB however
 -- invisible it is. Colour is per-grid hue with a clearance band for value, so
 -- open floor collapses into a handful of long strips and only genuinely broken
@@ -638,16 +643,32 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 		if clearance >= 3 then return 2, 0.7, 0.55 end
 		return 3, 0.55, 0.28
 	end
+	-- A cell is border if it has a wall or a dropoff in any of the 8 directions;
+	-- classifyNodes has already worked that out. Cells carry no masks when the
+	-- caller skipped classification, and then everything reads as interior.
+	local function isBorder(cell: Cell): boolean
+		return cell.wall == true or cell.dropoff == true
+	end
 
-	local i, drawn = 0, 0
+	local i, drawn, nBorder = 0, 0, 0
 	for part, g in pairs(data.grids) do
 		i += 1
 		local hue = (i * 0.61803398875) % 1
 		local sat = g.fallback and 0.3 or 0.9
 		local pf = Instance.new("Folder"); pf.Name = part.Name; pf.Parent = folder
+		local layers = {}
+		local function layer(name: string): Folder
+			local f = layers[name]
+			if not f then
+				f = Instance.new("Folder"); f.Name = name; f.Parent = pf
+				layers[name] = f
+			end
+			return f
+		end
 		local oriented = (not g.fallback) and g.n ~= nil
 
-		-- a run is `len` cells along +u starting at `first`, all in one band
+		-- a run is `len` cells along +u starting at `first`, all in one band and
+		-- all on the same side of the border/interior split
 		local function emit(first: Cell, last: Cell, len: number, w: number, v: number)
 			local dot = Instance.new("Part")
 			dot.Anchored = true; dot.CanCollide = false; dot.CanQuery = false; dot.CanTouch = false
@@ -666,8 +687,9 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 			dot.Name = (len == 1)
 				and string.format("c%.1f", first.clearance)
 				or string.format("c%.1f_x%d", first.clearance, len)
-			dot.Parent = pf
+			dot.Parent = layer(isBorder(first) and "Border" or "Interior")
 			drawn += 1
+			if isBorder(first) then nBorder += len end
 		end
 
 		if not merge then
@@ -692,7 +714,8 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 			local first, last, len, bi, w, v = nil, nil, 0, nil, 0, 0
 			for _, cell in ipairs(r) do
 				local cb, cw, cv = band(cell.clearance)
-				if first and cb == bi and cell.ui == last.ui + 1 then
+				if first and cb == bi and cell.ui == last.ui + 1
+					and isBorder(cell) == isBorder(first) then
 					last, len = cell, len + 1
 				else
 					if first then emit(first, last, len, w, v) end
@@ -703,6 +726,7 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 		end
 	end
 	data.stats.vizParts = drawn
+	data.stats.vizBorderCells = nBorder
 	return folder
 end
 
