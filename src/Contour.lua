@@ -852,8 +852,9 @@ function Contour.connect(L, lines, cfg)
 		return p1 + d1 * ((rx * b2 - ry * a2) / den)
 	end
 
-	local stats = { welded = 0, parallel = 0, capped = 0, unpaired = 0 }
+	local stats = { welded = 0, parallel = 0, capped = 0, unpaired = 0, junction = 0, open = 0 }
 	local done = {}
+	local placed = {}
 	for i, s in ipairs(E) do
 		for _, w in ipairs({ "a", "b" }) do
 			local link = nb[i .. w]
@@ -875,11 +876,79 @@ function Contour.connect(L, lines, cfg)
 				end
 				if not X then X = (s[w] + t[w2]) / 2 else stats.welded += 1 end
 				s[w] = X; t[w2] = X
+				placed[i .. w] = true
+				placed[link.j .. link.w] = true
 			elseif (not link) or link.d > pairMax then
 				stats.unpaired += 1
 			end
 		end
 	end
+
+	-- SECOND PASS: close what mutual-nearest cannot.
+	--
+	-- The pairing above is a MATCHING: an end welds to one partner, and only if
+	-- that partner picks it back. At a junction of three or more ends -- a stub
+	-- meeting two longer lines at a corner -- only one pair can be mutual and
+	-- the rest are left open. Ties make it worse: two ends of the same line are
+	-- often exactly equidistant from a third, and since the angle tie-break
+	-- compares line DIRECTIONS it scores both ends of a line identically, so
+	-- iteration order decides which one wins and the other is abandoned.
+	--
+	-- An open end means the loop is not closed, and an unclosed loop is not a
+	-- polygon, so nothing downstream can build portals from it. Measured on
+	-- case5: 10 of 1086 ends, in 10 separate regions.
+	--
+	-- This pass only ever touches ends the first pass left alone. Every weld the
+	-- tuned pairing made is preserved exactly, including the angle tie-break
+	-- that keeps the two rows of a U-turn from being welded back together.
+	local order = {}
+	for i in ipairs(E) do
+		for _, w in ipairs({ "a", "b" }) do
+			if not placed[i .. w] then order[#order + 1] = { i = i, w = w } end
+		end
+	end
+	for _, e in ipairs(order) do
+		local i, w = e.i, e.w
+		if not placed[i .. w] then
+			local pt = E[i][w]
+			-- nearest end of any OTHER line, preferring one already welded: an
+			-- end that has been placed marks a junction that already exists, and
+			-- joining it is what makes three lines meet at one point.
+			local bj, bw, bd, bPlaced = nil, nil, math.huge, false
+			for j, t in ipairs(E) do
+				if j ~= i then
+					for _, w2 in ipairs({ "a", "b" }) do
+						local dd = (t[w2] - pt).Magnitude
+						local isP = placed[j .. w2] == true
+						if dd <= pairMax and (dd < bd - 1e-6 or (math.abs(dd - bd) <= 1e-6 and isP and not bPlaced)) then
+							bj, bw, bd, bPlaced = j, w2, dd, isP
+						end
+					end
+				end
+			end
+			if not bj then
+				stats.open += 1
+			elseif bPlaced then
+				-- snap onto the existing junction point
+				E[i][w] = E[bj][bw]
+				placed[i .. w] = true
+				stats.junction += 1
+			else
+				-- two orphans facing each other: weld them the same way the
+				-- first pass would have, had either picked the other back
+				local t = E[bj]
+				local ang = math.deg(math.acos(math.clamp(math.abs(E[i].dir:Dot(t.dir)), -1, 1)))
+				local X = (ang >= minAngle) and meet(E[i][w], E[i].dir, t[bw], t.dir) or nil
+				if X and math.max((X - E[i][w]).Magnitude, (X - t[bw]).Magnitude) > maxExtend then X = nil end
+				if not X then X = (E[i][w] + t[bw]) / 2 end
+				E[i][w] = X; t[bw] = X
+				placed[i .. w] = true
+				placed[bj .. bw] = true
+				stats.junction += 2
+			end
+		end
+	end
+
 	return E, stats
 end
 
