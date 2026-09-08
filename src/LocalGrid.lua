@@ -16,6 +16,7 @@ export type Cell = {
 	dropMask: number?,        -- directions with nothing to stand on
 	wall: boolean?,
 	dropoff: boolean?,
+	fit: number?,             -- 1 prone, 2 crouch, 3 stand (from clearance)
 	region: number?,          -- set by LocalGrid.regions; 1 = largest
 	edgeMask: number?,        -- directions where the floor continues into ANOTHER region
 	regionEdge: boolean?,
@@ -47,7 +48,7 @@ export type Grid = {
 export type Config = {
 	step: number?, maxSlope: number?, clearCap: number?, minClearance: number?,
 	flushTol: number?, probeRadius: number?, minWidth: number?, regionAngle: number?,
-	bandHeight: number?,
+	bandHeight: number?, standHeight: number?, crouchHeight: number?,
 }
 
 local DEFAULT = {
@@ -86,6 +87,13 @@ local DEFAULT = {
 	-- this are cut into bands of it; flat ground is untouched, since its span is
 	-- zero. Roughly a storey, and the same reference height Floor uses.
 	bandHeight = 5,
+	-- Headroom a posture needs. Below crouchHeight a cell is prone-only, and
+	-- below minClearance it is not floor at all. These are postures, not
+	-- preferences: a crouch tunnel and the room it opens into are different
+	-- places to move through even where the floor runs straight between them,
+	-- so they are never the same region.
+	standHeight = 5,
+	crouchHeight = 3,
 }
 
 local UP = Vector3.new(0, 1, 0)
@@ -95,6 +103,15 @@ local function merged(cfg): any
 	for k, v in pairs(DEFAULT) do c[k] = v end
 	if cfg then for k, v in pairs(cfg) do if v ~= nil then c[k] = v end end end
 	return c
+end
+
+local FIT_NAME = { "prone", "crouch", "stand" }
+LocalGrid.FIT_NAME = FIT_NAME
+
+local function fitOf(clearance: number, c: any): number
+	if clearance >= c.standHeight then return 3 end
+	if clearance >= c.crouchHeight then return 2 end
+	return 1
 end
 
 local function isClip(p: Instance): boolean
@@ -635,9 +652,18 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 	end
 	probe:Destroy()
 
+	local nFit = { 0, 0, 0 }
+	for _, g in pairs(grids) do
+		for _, cell in ipairs(g.cells) do
+			cell.fit = fitOf(cell.clearance, c)
+			nFit[cell.fit] += 1
+		end
+	end
+
 	local data = {
 		grids = grids, config = c,
-		stats = { parts = nBlock + nFallback, framed = nBlock, block = nBlock, fallback = nFallback, cells = nCells, dead = nDead },
+		stats = { parts = nBlock + nFallback, framed = nBlock, block = nBlock, fallback = nFallback, cells = nCells, dead = nDead,
+			prone = nFit[1], crouch = nFit[2], stand = nFit[3] },
 	}
 	LocalGrid.pruneNarrow(data, cfg)
 	-- regions BEFORE classification: classifyNodes walks every neighbour anyway,
@@ -754,7 +780,8 @@ function LocalGrid.regions(data: any, cfg: Config?)
 							local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
 							if dx * dx + dz * dz <= r2
 								and math.abs(q.pos.Y - p.Y) <= tol
-								and cell.normal:Dot(q.normal) >= cosTol then
+								and cell.normal:Dot(q.normal) >= cosTol
+								and q.fit == cell.fit then
 								union(cell, q)
 							end
 						end
@@ -815,7 +842,8 @@ function LocalGrid.regions(data: any, cfg: Config?)
 							for oz = -1, 1 do
 								for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
 									local q = e.cell
-									if mine[q] and bandOf[q] == bandOf[cell] then
+									if mine[q] and bandOf[q] == bandOf[cell]
+										and q.fit == cell.fit then
 										local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
 										if dx * dx + dz * dz <= r2
 											and math.abs(q.pos.Y - p.Y) <= tol then
@@ -893,10 +921,13 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 	local step = data.config.step
 	-- band: shrink factor and brightness by headroom. Also the merge key -- two
 	-- cells only join if they would have been drawn the same.
-	local function band(clearance: number): (number, number, number)
-		if clearance >= 4 then return 1, 0.9, 1 end
-		if clearance >= 3 then return 2, 0.7, 0.55 end
-		return 3, 0.55, 0.28
+	-- Posture drives the tile's size and brightness: full and bright for stand,
+	-- smaller and dimmer for crouch, smallest and darkest for prone.
+	local function band(cell: Cell): (number, number, number)
+		local f = cell.fit or 3
+		if f >= 3 then return 3, 0.9, 1 end
+		if f == 2 then return 2, 0.7, 0.55 end
+		return 1, 0.55, 0.28
 	end
 	-- A cell is border if it has a wall or a dropoff in any of the 8
 	-- directions, or if the floor continues there into another region.
@@ -970,7 +1001,7 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 				and string.format("c%.1f", first.clearance)
 				or string.format("c%.1f_x%d", first.clearance, len)
 			local owner = byRegion
-				and string.format("r%03d", first.region or 0)
+				and string.format("r%03d_%s", first.region or 0, FIT_NAME[first.fit or 3])
 				or partName
 			dot.Parent = layer(owner, isBorder(first) and "Border" or "Interior")
 			drawn += 1
@@ -979,7 +1010,7 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 
 		if not merge then
 			for _, cell in ipairs(g.cells) do
-				local _, w, v = band(cell.clearance)
+				local _, w, v = band(cell)
 				emit(cell, cell, 1, w, v)
 			end
 			continue
@@ -998,7 +1029,7 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 			table.sort(r, function(a, b) return a.ui < b.ui end)
 			local first, last, len, bi, w, v = nil, nil, 0, nil, 0, 0
 			for _, cell in ipairs(r) do
-				local cb, cw, cv = band(cell.clearance)
+				local cb, cw, cv = band(cell)
 				if first and cb == bi and cell.ui == last.ui + 1
 					and isBorder(cell) == isBorder(first)
 					and cell.region == first.region then
