@@ -996,6 +996,11 @@ function LocalGrid.drawNeighbours(data: any, opts: any?, parent: Instance?)
 	local lift = o.lift or 0.35
 	local dirs = (o.dirs == 4) and DIR4 or DIR8
 	local thick = o.thickness or 0.06
+	-- On a map the size of case5 a link per cell per direction is three quarters
+	-- of a million Parts. `borderOnly` keeps the links that carry the question --
+	-- what a node ON AN EDGE can reach -- and drops the interior lattice, which
+	-- is a uniform grid everywhere and shows nothing by being drawn.
+	local borderOnly = o.borderOnly == true
 
 	local root = parent or workspace
 	local dbg = root:FindFirstChild("NVGN_Debug")
@@ -1019,6 +1024,9 @@ function LocalGrid.drawNeighbours(data: any, opts: any?, parent: Instance?)
 	for _, g in pairs(data.grids) do
 		local up = g.n or Vector3.yAxis
 		for _, cell in ipairs(g.cells) do
+			if borderOnly and not (cell.wall or cell.dropoff or cell.regionEdge) then
+				continue
+			end
 			for _, d in ipairs(half) do
 				local p = neighbourPos(g, cell, d)
 				local bx, bz = math.floor(p.X), math.floor(p.Z)
