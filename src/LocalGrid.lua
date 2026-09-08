@@ -52,7 +52,7 @@ export type Config = {
 	step: number?, maxSlope: number?, clearCap: number?, minClearance: number?,
 	flushTol: number?, probeRadius: number?, minWidth: number?, regionAngle: number?,
 	bandHeight: number?, standHeight: number?, crouchHeight: number?,
-	connectivity: number?, regionPlanarity: number?,
+	connectivity: number?, regionPlanarity: number?, faceAngle: number?,
 }
 
 local DEFAULT = {
@@ -104,6 +104,20 @@ local DEFAULT = {
 	-- running mean drifts along a curve and swallows the whole thing, which is
 	-- the same trap the Contour segmentation had to avoid.
 	regionPlanarity = 5,
+	-- How far two surfels' normals may diverge and still be treated as the same
+	-- FACE of a part. One grid per part is wrong for anything presenting more
+	-- than one walkable face: averaging the normals gives a plane matching
+	-- neither, and every stage downstream inherits the tilt.
+	--
+	-- Measured on case5's small union, a box rotated -49 degrees carrying a flat
+	-- face and a 49 degree face. The averaged frame came out 18 degrees off
+	-- world up, which put a Y component of -0.317 into the in-plane axis v. The
+	-- footprint test walks along v, so the plane climbed away from a surface
+	-- with 0.00 studs of relief -- 0.00, 0.16, 0.32, 0.48 across four cells,
+	-- against a flushTol of 0.30. The last two columns of every footprint
+	-- failed, so 44 of the 66 cells on a flat 3.3 x 5.3 stud slab were pruned as
+	-- "too narrow".
+	faceAngle = 15,
 	-- Tallest rise one region may cover, or 0 to never cut on height. OFF by
 	-- default: a ramp or a roof plane is one surface, and slicing it at an
 	-- arbitrary altitude splits something that is genuinely continuous and puts
@@ -153,6 +167,28 @@ local function groupByPart(surfels: {any}): { [BasePart]: {any} }
 		b[#b + 1] = s
 	end
 	return byPart
+end
+
+-- Split one part's surfels into faces: runs of surfels whose normals agree.
+--
+-- Compared against a cluster's ANCHOR normal rather than a running mean, for the
+-- same reason the region grouping is: a mean drifts across a curve and swallows
+-- everything. A part with a single walkable face -- almost all of them -- yields
+-- exactly one cluster and behaves as it always did.
+local function splitFaces(sfs: {any}, cosFace: number)
+	local clusters = {}
+	for _, sf in ipairs(sfs) do
+		local hit = nil
+		for _, cl in ipairs(clusters) do
+			if sf.normal:Dot(cl.anchor) >= cosFace then hit = cl; break end
+		end
+		if not hit then
+			hit = { anchor = sf.normal, list = {} }
+			clusters[#clusters + 1] = hit
+		end
+		hit.list[#hit.list + 1] = sf
+	end
+	return clusters
 end
 
 -- Average the surfel normals to get the true walkable-face direction.
@@ -386,9 +422,9 @@ local function buildWorldIndex(grids: any)
 		if not b then b = {}; t[k] = b end
 		b[#b + 1] = v
 	end
-	for part, g in pairs(grids) do
-		for _, cell in ipairs(g.cells) do push(live, cell.pos, { cell = cell, part = part }) end
-		for _, d in ipairs(g.dead) do push(dead, d.pos, { dead = d, part = part }) end
+	for _, g in pairs(grids) do
+		for _, cell in ipairs(g.cells) do push(live, cell.pos, { cell = cell, part = g.part }) end
+		for _, d in ipairs(g.dead) do push(dead, d.pos, { dead = d, part = g.part }) end
 	end
 	return live, dead
 end
@@ -679,20 +715,28 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 	rpTerrain.FilterDescendantsInstances = { workspace.Terrain }
 
 	local byPart = groupByPart(floorData.surfels)
-	local grids: { [BasePart]: Grid } = {}
-	local nBlock, nFallback, nCells, nDead = 0, 0, 0, 0
+	-- An ARRAY now, not a map keyed by part: a part can own several grids, one
+	-- per walkable face. Every grid still carries its own `part`.
+	local grids: {Grid} = {}
+	local cosFace = math.cos(math.rad(c.faceAngle))
+	local nBlock, nFallback, nCells, nDead, nParts, nFaces = 0, 0, 0, 0, 0, 0
 	for part, sfs in pairs(byPart) do
-		local g: Grid? = buildGrid(part, sfs, c, filterAll, probe, op, rpTerrain)
-		if g then
-			nBlock += 1
-		else
-			g = buildFallbackGrid(part, sfs, c)
-			nFallback += 1
+		nParts += 1
+		local faces = splitFaces(sfs, cosFace)
+		nFaces += #faces
+		for _, face in ipairs(faces) do
+			local g: Grid? = buildGrid(part, face.list, c, filterAll, probe, op, rpTerrain)
+			if g then
+				nBlock += 1
+			else
+				g = buildFallbackGrid(part, face.list, c)
+				nFallback += 1
+			end
+			g = g :: Grid
+			grids[#grids + 1] = g
+			nCells += #g.cells
+			nDead += #g.dead
 		end
-		g = g :: Grid
-		grids[part] = g
-		nCells += #g.cells
-		nDead += #g.dead
 	end
 	probe:Destroy()
 
@@ -706,7 +750,8 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 
 	local data = {
 		grids = grids, config = c,
-		stats = { parts = nBlock + nFallback, framed = nBlock, block = nBlock, fallback = nFallback, cells = nCells, dead = nDead,
+		stats = { parts = nParts, grids = nBlock + nFallback, faces = nFaces,
+			framed = nBlock, block = nBlock, fallback = nFallback, cells = nCells, dead = nDead,
 			prone = nFit[1], crouch = nFit[2], stand = nFit[3] },
 	}
 	LocalGrid.pruneNarrow(data, cfg)
@@ -1434,11 +1479,11 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 	end
 
 	local i, drawn, nBorder = 0, 0, 0
-	for part, g in pairs(data.grids) do
+	for _, g in pairs(data.grids) do
 		i += 1
 		local partHue = hueOf(i)
 		local sat = g.fallback and 0.3 or 0.9
-		local partName = part.Name
+		local partName = g.part.Name
 		local layers = {}
 		local function layer(owner: string, name: string): Folder
 			local key = owner .. "/" .. name
