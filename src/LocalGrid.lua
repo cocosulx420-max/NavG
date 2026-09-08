@@ -34,6 +34,7 @@ export type Grid = {
 	uExt: number?, vExt: number?, -- half-extents along u and v
 	step: number,
 	cells: {Cell},
+	narrow: {Cell}?,          -- cells dropped by pruneNarrow (kept for debugging)
 	index: { [string]: Cell },-- "ui:vi" -> cell
 	dead: {DeadCell},
 	deadIndex: { [string]: DeadCell },
@@ -41,7 +42,7 @@ export type Grid = {
 
 export type Config = {
 	step: number?, maxSlope: number?, clearCap: number?, minClearance: number?,
-	flushTol: number?, probeRadius: number?,
+	flushTol: number?, probeRadius: number?, minWidth: number?,
 }
 
 local DEFAULT = {
@@ -61,6 +62,13 @@ local DEFAULT = {
 	-- `step` can be up to step*sqrt(2)/2 ~= 0.707 away. Anything below that and
 	-- a foreign floor reads as air, which turns every part join into a dropoff.
 	probeRadius = 0.75,
+	-- Narrowest walkable strip an agent can stand on (studs). A handrail, a
+	-- stair stringer's top edge and a window ledge all pass the slope and
+	-- clearance tests -- at 0 to 40 degrees with open sky above they are not
+	-- measurably different from a sliver of real floor -- and width is the only
+	-- fact that separates them. Default is the Roblox character's shoulder
+	-- width; set it to 0 to keep every surface.
+	minWidth = 2,
 }
 
 local UP = Vector3.new(0, 1, 0)
@@ -318,6 +326,89 @@ local function neighbourPos(g: Grid, cell: Cell, d: {number}): Vector3
 	return cell.pos + Vector3.new(d[1] * g.step, 0, d[2] * g.step)
 end
 
+-- Drop cells on surfaces too narrow to stand on.
+--
+-- Slope and clearance cannot catch a handrail. The top of a 1-stud rail sits at
+-- 0 degrees with open sky above it, which on those two measurements is exactly
+-- what a strip of real floor looks like. Width is the fact that separates them
+-- and nothing was measuring it, so case3 grew cells along stair stringers,
+-- ledges and window trim -- 25 grids and 113 cells, 4.3% of the bake.
+--
+-- Width is measured THROUGH the cell rather than out from it: the span is the
+-- contiguous run of walkable surface containing this cell, so the edge cells of
+-- a wide floor still see the floor's full width and are not eroded away. And it
+-- is measured in world space against the shared index, the same way a neighbour
+-- lookup is, so a deck planked out of 1-stud parts reads as one wide run
+-- instead of a row of rails. A ledge flush with a floor is likewise part of
+-- that floor and survives; a rail 3 studs above it does not, because the run
+-- stops where the height does.
+function LocalGrid.pruneNarrow(data: any, cfg: Config?)
+	local c = merged(cfg)
+	if data.config then
+		c.step = data.config.step or c.step
+		c.minWidth = (cfg and cfg.minWidth) or data.config.minWidth or c.minWidth
+		c.flushTol = (cfg and cfg.flushTol) or data.config.flushTol or c.flushTol
+	end
+	data.stats.narrow = 0
+	if c.minWidth <= c.step then return data end
+
+	local live = buildWorldIndex(data.grids)
+	local r2 = (c.probeRadius * c.step) ^ 2
+	local tol = c.flushTol
+	-- cells needed BESIDE this one, summed over the two opposite directions
+	local need = math.ceil(c.minWidth / c.step) - 1
+
+	local function floorAt(p: Vector3): boolean
+		local bx, bz = math.floor(p.X), math.floor(p.Z)
+		for ox = -1, 1 do
+			for oz = -1, 1 do
+				for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
+					local q = e.cell.pos
+					local dx, dz = q.X - p.X, q.Z - p.Z
+					if dx * dx + dz * dz <= r2 and math.abs(q.Y - p.Y) <= tol then
+						return true
+					end
+				end
+			end
+		end
+		return false
+	end
+
+	-- contiguous cells beyond `cell` along `dir`, capped: we only ever need to
+	-- know whether the run reaches minWidth, never how far past it goes.
+	local function reach(cell: Cell, dir: Vector3): number
+		local k = 0
+		while k < need do
+			if not floorAt(cell.pos + dir * ((k + 1) * c.step)) then break end
+			k += 1
+		end
+		return k
+	end
+
+	local nNarrow = 0
+	for _, g in pairs(data.grids) do
+		local u = g.u or Vector3.xAxis
+		local v = g.v or Vector3.zAxis
+		local keep, narrow = {}, {}
+		for _, cell in ipairs(g.cells) do
+			local wu = reach(cell, u) + reach(cell, -u)
+			local wv = (wu >= need) and (reach(cell, v) + reach(cell, -v)) or 0
+			if wu >= need and wv >= need then
+				keep[#keep + 1] = cell
+			else
+				narrow[#narrow + 1] = cell
+				g.index[string.format("%d:%d", cell.ui, cell.vi)] = nil
+				nNarrow += 1
+			end
+		end
+		g.cells = keep
+		g.narrow = narrow
+	end
+	data.stats.cells -= nNarrow
+	data.stats.narrow = nNarrow
+	return data
+end
+
 -- Mark every cell with the directions in which it has a wall and the
 -- directions in which it has air.
 --
@@ -458,6 +549,7 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 		grids = grids, config = c,
 		stats = { parts = nBlock + nFallback, framed = nBlock, block = nBlock, fallback = nFallback, cells = nCells, dead = nDead },
 	}
+	LocalGrid.pruneNarrow(data, cfg)
 	LocalGrid.classifyNodes(data, cfg)
 	return data
 end
