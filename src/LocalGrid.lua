@@ -979,6 +979,97 @@ function LocalGrid.contours(data: any, cfg: Config?)
 	return data
 end
 
+-- Draw the neighbour graph: one segment per node-to-neighbour link.
+--
+-- `dirs` is 8 or 4 independently of the bake's own connectivity, because this
+-- answers a different question -- what a node can actually see around it --
+-- from the one classifyNodes and regions ask. Each undirected link is drawn
+-- once: only the four forward directions emit, and the backward four would
+-- duplicate them.
+--
+-- A link is drawn only where a real cell sits at the neighbour position, so a
+-- gap in the graph is a gap in the floor, and a link that jumps a wall is
+-- visible as a segment crossing it.
+function LocalGrid.drawNeighbours(data: any, opts: any?, parent: Instance?)
+	if typeof(opts) == "Instance" then parent = opts :: Instance; opts = nil end
+	local o = opts or {}
+	local lift = o.lift or 0.35
+	local dirs = (o.dirs == 4) and DIR4 or DIR8
+	local thick = o.thickness or 0.06
+
+	local root = parent or workspace
+	local dbg = root:FindFirstChild("NVGN_Debug")
+	if not dbg then
+		dbg = Instance.new("Folder"); dbg.Name = "NVGN_Debug"; dbg.Parent = root
+	end
+	local old = dbg:FindFirstChild("Neighbours")
+	if old then old:Destroy() end
+	local folder = Instance.new("Folder"); folder.Name = "Neighbours"; folder.Parent = dbg
+
+	local c = data.config
+	local live = buildWorldIndex(data.grids)
+	local r2 = (c.probeRadius * c.step) ^ 2
+	local tol = c.flushTol
+
+	-- forward half of the ring only, so each link is emitted once
+	local half = {}
+	for i = 1, #dirs // 2 do half[i] = dirs[i] end
+
+	local n, crossRegion = 0, 0
+	for _, g in pairs(data.grids) do
+		local up = g.n or Vector3.yAxis
+		for _, cell in ipairs(g.cells) do
+			for _, d in ipairs(half) do
+				local p = neighbourPos(g, cell, d)
+				local bx, bz = math.floor(p.X), math.floor(p.Z)
+				local best, bestD2 = nil, math.huge
+				for ox = -1, 1 do
+					for oz = -1, 1 do
+						for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
+							local q = e.cell
+							if q ~= cell then
+								local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
+								local dd = dx * dx + dz * dz
+								if dd <= r2 and math.abs(q.pos.Y - p.Y) <= tol and dd < bestD2 then
+									best, bestD2 = q, dd
+								end
+							end
+						end
+					end
+				end
+				if best then
+					local a = cell.pos + up * lift
+					local b = best.pos + up * lift
+					local v = b - a
+					local len = v.Magnitude
+					if len > 1e-3 then
+						local seg = Instance.new("Part")
+						seg.Anchored = true; seg.CanCollide = false
+						seg.CanQuery = false; seg.CanTouch = false
+						seg.Size = Vector3.new(thick, thick, len)
+						seg.CFrame = CFrame.lookAt(a + v * 0.5, b)
+						seg.Material = Enum.Material.Neon
+						-- a link that leaves the region is the interesting one
+						if best.region ~= cell.region then
+							seg.Color = Color3.fromRGB(255, 60, 60)
+							seg.Name = "link_cross"
+							crossRegion += 1
+						else
+							seg.Color = Color3.fromHSV(((cell.region or 0) * 0.61803398875) % 1, 0.5, 1)
+							seg.Name = "link"
+						end
+						seg.Parent = folder
+						n += 1
+					end
+				end
+			end
+		end
+	end
+	data.stats.neighbourLinks = n
+	data.stats.neighbourCrossRegion = crossRegion
+	return folder, n
+end
+
 -- Draw the fitted boundary as neon segments, one colour per region.
 --
 -- `lift` raises them off the surface along its OWN normal rather than along
