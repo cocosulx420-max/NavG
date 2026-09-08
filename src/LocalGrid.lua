@@ -88,7 +88,7 @@ local DEFAULT = {
 	-- the same region. Regions are meant to be surfaces one plane can describe,
 	-- so a ramp meeting a floor is a seam even though you can walk straight
 	-- across it -- that join is a region LINK, not a merge.
-	regionAngle = 15,
+	regionAngle = 10,
 	-- How far a cell's normal may sit from its REGION's normal, as opposed to
 	-- from its neighbour's. regionAngle alone is a pairwise test and pairwise
 	-- tests chain: on a hill every adjacent pair agrees to a degree or two and
@@ -100,7 +100,7 @@ local DEFAULT = {
 	-- Compared against an ANCHOR normal per region, never a running mean -- a
 	-- running mean drifts along a curve and swallows the whole thing, which is
 	-- the same trap the Contour segmentation had to avoid.
-	regionPlanarity = 10,
+	regionPlanarity = 5,
 	-- Tallest rise one region may cover, or 0 to never cut on height. OFF by
 	-- default: a ramp or a roof plane is one surface, and slicing it at an
 	-- arbitrary altitude splits something that is genuinely continuous and puts
