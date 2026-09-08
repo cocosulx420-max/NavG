@@ -81,13 +81,13 @@ local DEFAULT = {
 	-- so a ramp meeting a floor is a seam even though you can walk straight
 	-- across it -- that join is a region LINK, not a merge.
 	regionAngle = 15,
-	-- Tallest rise one region may cover. A ramp or a roof plane is a single
-	-- surface geometrically, but a region that climbs 15 studs is not a place --
-	-- it is a route between places, and everything downstream that treats a
-	-- region as roughly one altitude gets it wrong. Regions that span more than
-	-- this are cut into bands of it; flat ground is untouched, since its span is
-	-- zero. Roughly a storey, and the same reference height Floor uses.
-	bandHeight = 5,
+	-- Tallest rise one region may cover, or 0 to never cut on height. OFF by
+	-- default: a ramp or a roof plane is one surface, and slicing it at an
+	-- arbitrary altitude splits something that is genuinely continuous and puts
+	-- a seam in the middle of a clear run. Set it only if a downstream stage
+	-- really does need a region to be roughly one altitude. Flat ground never
+	-- reaches this code either way, since its span is zero.
+	bandHeight = 0,
 	-- Headroom a posture needs. Below crouchHeight a cell is prone-only, and
 	-- below minClearance it is not floor at all. These are postures, not
 	-- preferences: a crouch tunnel and the room it opens into are different
@@ -980,7 +980,14 @@ function LocalGrid.contours(data: any, cfg: Config?)
 end
 
 -- Draw the fitted boundary as neon segments, one colour per region.
-function LocalGrid.drawContours(data: any, parent: Instance?)
+--
+-- `lift` raises them off the surface along its OWN normal rather than along
+-- world up, so the outline of a ramp or a roof stands off its face by the same
+-- amount as a floor's does instead of shearing across it.
+function LocalGrid.drawContours(data: any, opts: any?, parent: Instance?)
+	if typeof(opts) == "Instance" then parent = opts :: Instance; opts = nil end
+	local o = opts or {}
+	local lift = o.lift or 1
 	local root = parent or workspace
 	local dbg = root:FindFirstChild("NVGN_Debug")
 	if not dbg then
@@ -995,15 +1002,17 @@ function LocalGrid.drawContours(data: any, parent: Instance?)
 		if res.edges then
 			local rf = Instance.new("Folder"); rf.Name = string.format("r%03d", r); rf.Parent = folder
 			local col = Color3.fromHSV((r * 0.61803398875) % 1, 0.9, 1)
+			local off = (res.lattice and res.lattice.up or Vector3.yAxis) * lift
 			for _, e in ipairs(res.edges) do
-				local d = e.b - e.a
+				local a, b = e.a + off, e.b + off
+				local d = b - a
 				local len = d.Magnitude
 				if len > 1e-3 then
 					local seg = Instance.new("Part")
 					seg.Anchored = true; seg.CanCollide = false
 					seg.CanQuery = false; seg.CanTouch = false
 					seg.Size = Vector3.new(0.12, 0.12, len)
-					seg.CFrame = CFrame.lookAt(e.a + d * 0.5, e.b)
+					seg.CFrame = CFrame.lookAt(a + d * 0.5, b)
 					seg.Color = col
 					seg.Material = Enum.Material.Neon
 					seg.Name = string.format("e%d_%.1f", e.id or 0, len)
