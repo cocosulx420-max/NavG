@@ -917,11 +917,20 @@ function Contour.connect(L, lines, cfg)
 			local bj, bw, bd, bPlaced = nil, nil, math.huge, false
 			for j, t in ipairs(E) do
 				if j ~= i then
-					for _, w2 in ipairs({ "a", "b" }) do
-						local dd = (t[w2] - pt).Magnitude
-						local isP = placed[j .. w2] == true
-						if dd <= pairMax and (dd < bd - 1e-6 or (math.abs(dd - bd) <= 1e-6 and isP and not bPlaced)) then
-							bj, bw, bd, bPlaced = j, w2, dd, isP
+					-- NEAR-PARALLEL IS NOT A CORNER. Two ends whose lines run at
+					-- the same angle are the two rows of a U-turn, and joining
+					-- them at a single point rebuilds the 180 degree reversal
+					-- that stealUTurns exists to remove -- as a zero degree
+					-- coincident pair. Measured: without this the pass closed 20
+					-- ends on case3 and created 4 such spikes.
+					local ang = math.deg(math.acos(math.clamp(math.abs(E[i].dir:Dot(t.dir)), -1, 1)))
+					if ang >= minAngle then
+						for _, w2 in ipairs({ "a", "b" }) do
+							local dd = (t[w2] - pt).Magnitude
+							local isP = placed[j .. w2] == true
+							if dd <= pairMax and (dd < bd - 1e-6 or (math.abs(dd - bd) <= 1e-6 and isP and not bPlaced)) then
+								bj, bw, bd, bPlaced = j, w2, dd, isP
+							end
 						end
 					end
 				end
