@@ -876,6 +876,15 @@ function LocalGrid.regions(data: any, cfg: Config?)
 		for _, cell in ipairs(m) do cell.region = i end
 	end
 
+	-- Recount postures over the SURVIVING cells: fit is assigned before
+	-- pruneNarrow runs, so the counts taken there include cells the width test
+	-- went on to remove.
+	local nFit = { 0, 0, 0 }
+	for _, g in pairs(data.grids) do
+		for _, cell in ipairs(g.cells) do nFit[cell.fit or 3] += 1 end
+	end
+	data.stats.prone, data.stats.crouch, data.stats.stand = nFit[1], nFit[2], nFit[3]
+
 	data.regions = groups
 	data.stats.regions = #groups
 	data.stats.regionSizes = sizes
