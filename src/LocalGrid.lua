@@ -967,18 +967,53 @@ function LocalGrid.contours(data: any, cfg: Config?)
 	local Contour = require(script.Parent:WaitForChild("Contour"))
 	local step = data.config.step
 
-	local byRegion: { [number]: {any} } = {}
+	-- ONE frame per region, from the region's OWN mean normal.
+	--
+	-- Contour takes its lattice axes from whichever cell it anchors on -- the
+	-- lexicographically smallest, i.e. a corner -- and then rebuilds every line
+	-- endpoint as origin + u*i + v*j. If those axes are tilted against the
+	-- surface the rebuild drifts LINEARLY with distance from that corner, and a
+	-- line sinks into the floor at the far end while sitting correctly at the
+	-- near one. Measured on r22: a flat region, cells spanning 0.2 studs of Y,
+	-- whose drawn endpoints ran up to 2.37 studs below them, the error growing
+	-- steadily along the region.
+	--
+	-- Cells within a region may differ by up to regionPlanarity, so no single
+	-- cell's frame speaks for the region. Averaging the normals does: the plane
+	-- then sits through the middle of the deviation instead of being pinned to
+	-- whatever tilt the corner cell happened to have.
+	local sumN: { [number]: Vector3 } = {}
+	local axisU: { [number]: Vector3 } = {}
+	local cellsOf: { [number]: {any} } = {}
 	for _, g in pairs(data.grids) do
 		local u = g.u or Vector3.xAxis
-		local n = g.n or Vector3.yAxis
 		for _, cell in ipairs(g.cells) do
 			local r = cell.region
 			if r then
-				local t = byRegion[r]
-				if not t then t = {}; byRegion[r] = t end
-				t[#t + 1] = { cf = CFrame.fromMatrix(cell.pos, u, n) }
+				sumN[r] = (sumN[r] or Vector3.zero) + cell.normal
+				axisU[r] = axisU[r] or u
+				local t = cellsOf[r]
+				if not t then t = {}; cellsOf[r] = t end
+				t[#t + 1] = cell
 			end
 		end
+	end
+
+	local byRegion: { [number]: {any} } = {}
+	for r, cells in pairs(cellsOf) do
+		local n = sumN[r]
+		n = (n.Magnitude > 1e-4) and n.Unit or Vector3.yAxis
+		local u = axisU[r] - n * axisU[r]:Dot(n)
+		if u.Magnitude < 1e-3 then
+			u = Vector3.xAxis - n * Vector3.xAxis:Dot(n)
+			if u.Magnitude < 1e-3 then u = Vector3.zAxis - n * Vector3.zAxis:Dot(n) end
+		end
+		u = u.Unit
+		local t = {}
+		for _, cell in ipairs(cells) do
+			t[#t + 1] = { cf = CFrame.fromMatrix(cell.pos, u, n) }
+		end
+		byRegion[r] = t
 	end
 
 	local out, nCells, nSlots, nLines, nLoops, nFailed = {}, 0, 0, 0, 0, 0
