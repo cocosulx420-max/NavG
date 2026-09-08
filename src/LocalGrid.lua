@@ -289,6 +289,7 @@ end
 local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: RaycastParams, probe: BasePart, op: OverlapParams, rpTerrain: RaycastParams): Grid?
 	local n, u, v, uExt, vExt, surfaceCenter, dev = surfaceFrame(part, surfels, c.step)
 	if not n then return nil end
+	local cosFace = math.cos(math.rad(c.faceAngle))
 
 	-- Centre the lattice on the face it describes. `nu` cells of `step` rarely
 	-- divide the extent exactly, and anchoring at a corner dumps the whole
@@ -332,6 +333,13 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 			if not res then continue end
 			local slope = math.deg(math.acos(math.clamp(res.Normal:Dot(UP), -1, 1)))
 			if not ((slope <= c.maxSlope) or isClip(part)) then continue end
+			-- This grid describes ONE face. Its lattice spans the part, so the ray
+			-- also lands on the part's other faces; without this those cells would
+			-- be built twice, once per face grid, and the duplicates would union
+			-- into regions of doubled size sitting on the same surface. A cell
+			-- more than faceAngle off this face belongs to another face, and that
+			-- face has a grid of its own to claim it.
+			if res.Normal:Dot(n) < cosFace then continue end
 			probe.CFrame = CFrame.new(res.Position + UP * (0.1 + (c.minClearance - 0.1) * 0.5))
 			local killer: Instance? = nil
 			for _, hit in ipairs(workspace:GetPartsInPart(probe, op)) do
