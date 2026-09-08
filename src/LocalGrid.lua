@@ -45,6 +45,7 @@ export type Grid = {
 export type Config = {
 	step: number?, maxSlope: number?, clearCap: number?, minClearance: number?,
 	flushTol: number?, probeRadius: number?, minWidth: number?, regionAngle: number?,
+	bandHeight: number?,
 }
 
 local DEFAULT = {
@@ -76,6 +77,13 @@ local DEFAULT = {
 	-- so a ramp meeting a floor is a seam even though you can walk straight
 	-- across it -- that join is a region LINK, not a merge.
 	regionAngle = 15,
+	-- Tallest rise one region may cover. A ramp or a roof plane is a single
+	-- surface geometrically, but a region that climbs 15 studs is not a place --
+	-- it is a route between places, and everything downstream that treats a
+	-- region as roughly one altitude gets it wrong. Regions that span more than
+	-- this are cut into bands of it; flat ground is untouched, since its span is
+	-- zero. Roughly a storey, and the same reference height Floor uses.
+	bandHeight = 5,
 }
 
 local UP = Vector3.new(0, 1, 0)
@@ -693,6 +701,7 @@ function LocalGrid.regions(data: any, cfg: Config?)
 		c.step = data.config.step or c.step
 		c.flushTol = (cfg and cfg.flushTol) or data.config.flushTol or c.flushTol
 		c.regionAngle = (cfg and cfg.regionAngle) or data.config.regionAngle or c.regionAngle
+		c.bandHeight = (cfg and cfg.bandHeight) or data.config.bandHeight or c.bandHeight
 	end
 	local live = buildWorldIndex(data.grids)
 	local r2 = (c.probeRadius * c.step) ^ 2
@@ -711,8 +720,10 @@ function LocalGrid.regions(data: any, cfg: Config?)
 		if ra ~= rb then up[ra] = rb end
 	end
 
+	local gridOf: { [any]: any } = {}
 	for _, g in pairs(data.grids) do
 		for _, cell in ipairs(g.cells) do
+			gridOf[cell] = g
 			for _, d in ipairs(DIR8) do
 				local p = neighbourPos(g, cell, d)
 				local bx, bz = math.floor(p.X), math.floor(p.Z)
@@ -744,6 +755,72 @@ function LocalGrid.regions(data: any, cfg: Config?)
 	end
 	local groups = {}
 	for _, m in pairs(members) do groups[#groups + 1] = m end
+
+	-- Cut regions that climb too far into bands of bandHeight.
+	--
+	-- Banding alone would leave a band in several disconnected pieces (think of
+	-- a ramp that switches back through the same band twice), so each spanning
+	-- region is re-connected inside its bands rather than just sliced. Only
+	-- regions that actually span are reprocessed -- flat ground, which is nearly
+	-- all of a map, never enters this path.
+	local band = c.bandHeight
+	if band and band > 0 then
+		local out = {}
+		for _, m in ipairs(groups) do
+			local lo, hi = math.huge, -math.huge
+			for _, cell in ipairs(m) do
+				lo = math.min(lo, cell.pos.Y); hi = math.max(hi, cell.pos.Y)
+			end
+			if hi - lo <= band then
+				out[#out + 1] = m
+			else
+				local mine, bandOf = {}, {}
+				for _, cell in ipairs(m) do
+					mine[cell] = true
+					bandOf[cell] = math.floor((cell.pos.Y - lo) / band + 1e-6)
+				end
+				local bup: { [any]: any } = {}
+				local function bfind(x)
+					local r = x
+					while bup[r] do r = bup[r] end
+					while bup[x] do bup[x], x = r, bup[x] end
+					return r
+				end
+				for _, cell in ipairs(m) do
+					local g = gridOf[cell]
+					for _, d in ipairs(DIR8) do
+						local p = neighbourPos(g, cell, d)
+						local bx, bz = math.floor(p.X), math.floor(p.Z)
+						for ox = -1, 1 do
+							for oz = -1, 1 do
+								for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
+									local q = e.cell
+									if mine[q] and bandOf[q] == bandOf[cell] then
+										local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
+										if dx * dx + dz * dz <= r2
+											and math.abs(q.pos.Y - p.Y) <= tol then
+											local ra, rb = bfind(cell), bfind(q)
+											if ra ~= rb then bup[ra] = rb end
+										end
+									end
+								end
+							end
+						end
+					end
+				end
+				local parts: { [any]: {Cell} } = {}
+				for _, cell in ipairs(m) do
+					local r = bfind(cell)
+					local t = parts[r]
+					if not t then t = {}; parts[r] = t end
+					t[#t + 1] = cell
+				end
+				for _, t in pairs(parts) do out[#out + 1] = t end
+			end
+		end
+		groups = out
+	end
+
 	table.sort(groups, function(a, b) return #a > #b end)
 	local sizes = {}
 	for i, m in ipairs(groups) do
