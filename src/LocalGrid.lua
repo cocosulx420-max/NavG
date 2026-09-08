@@ -26,7 +26,7 @@ export type DeadCell = {
 
 export type Grid = {
 	part: BasePart,
-	fallback: boolean,        -- true => world-aligned (non-block part)
+	fallback: boolean,        -- true => world-aligned (degenerate frame only)
 	origin: Vector3?,         -- face corner (world); block grids only
 	u: Vector3?, v: Vector3?, -- in-plane unit axes (world); block grids only
 	n: Vector3?,              -- surface normal (world); block grids only
@@ -72,10 +72,6 @@ local function merged(cfg): any
 	return c
 end
 
-local function isBlock(p: BasePart): boolean
-	return p:IsA("Part") and p.Shape == Enum.PartType.Block
-end
-
 local function isClip(p: Instance): boolean
 	return p.Name:find("ClipRamp") ~= nil
 end
@@ -98,7 +94,25 @@ local function avgNormal(surfels: {any}): Vector3
 	return (s.Magnitude > 1e-4) and s.Unit or Vector3.yAxis
 end
 
-local function topFace(part: BasePart, surfaceN: Vector3)
+-- Orientation from the part's own CFrame, plane from the surfels.
+--
+-- The CFrame axis most aligned with the average surfel normal names the face we
+-- are standing on, and the other two axes are the in-plane pair. But the plane
+-- ITSELF -- normal and offset -- comes from the surfels, never from the box: a
+-- union's or mesh's bounding box is negotiated geometry and its face is not
+-- where the real surface is. Projecting the CFrame's in-plane axes onto the
+-- surfel plane keeps the lattice running along the part's own edges without
+-- pinning it to a box that may be tilted off that surface.
+--
+-- Every BasePart has a CFrame, so this works for unions and meshes too. It used
+-- to be gated on `p:IsA("Part") and p.Shape == Block`, which sent every union
+-- and every mesh to a world-axis lattice that ignored their orientation
+-- entirely -- the tiles staircased across the part's edges instead of running
+-- along them.
+--
+-- Returns nil if the part has no usable in-plane axis (a degenerate Size).
+local function surfaceFrame(part: BasePart, surfels: {any}, step: number)
+	local n = avgNormal(surfels)
 	local cf = part.CFrame
 	local sz = part.Size
 	local axes = {
@@ -108,23 +122,61 @@ local function topFace(part: BasePart, surfaceN: Vector3)
 	}
 	local bi, best = 2, -math.huge
 	for i, a in ipairs(axes) do
-		local d = math.abs(a.dir:Dot(surfaceN))
+		local d = math.abs(a.dir:Dot(n))
 		if d > best then best = d; bi = i end
 	end
-	local a = axes[bi]
-	local n = (a.dir:Dot(surfaceN) >= 0) and a.dir or -a.dir
 	local plane = {}
 	for i, ax in ipairs(axes) do
 		if i ~= bi then plane[#plane + 1] = ax end
 	end
-	return n, a.ext, plane[1], plane[2]
+
+	-- Project an in-plane axis onto the surfel plane, then force the second
+	-- orthogonal to it so the lattice stays square on a face the box is tilted
+	-- against. The axis we drop is the one nearest the normal, so at least one
+	-- of the remaining two always projects to something well conditioned.
+	local u = plane[1].dir - n * plane[1].dir:Dot(n)
+	local uExt, vExt = plane[1].ext, plane[2].ext
+	if u.Magnitude < 1e-3 then
+		u = plane[2].dir - n * plane[2].dir:Dot(n)
+		uExt, vExt = plane[2].ext, plane[1].ext
+		if u.Magnitude < 1e-3 then return nil end
+	end
+	u = u.Unit
+	local v = n:Cross(u)
+	if v.Magnitude < 1e-3 then return nil end
+	v = v.Unit
+
+	-- Offset: slide the part centre along n until the plane passes through the
+	-- surfels' centroid. On a block this lands on the box face; on a union it
+	-- lands on the surface the rays actually found.
+	local ctr = Vector3.zero
+	for _, s in ipairs(surfels) do ctr += s.pos end
+	ctr /= #surfels
+	local center = part.Position + n * (ctr - part.Position):Dot(n)
+
+	-- How far the real surface strays from that plane, and how far the surfels
+	-- reach in-plane. The box half-extents are a lower bound only: a projected
+	-- face is wider than the box side it came from, and a union's surface can
+	-- sit outside its own box axes. Grow to whatever the surfels need.
+	local dev, uMax, vMax = 0, 0, 0
+	for _, s in ipairs(surfels) do
+		local r = s.pos - center
+		dev = math.max(dev, math.abs(r:Dot(n)))
+		uMax = math.max(uMax, math.abs(r:Dot(u)))
+		vMax = math.max(vMax, math.abs(r:Dot(v)))
+	end
+	uExt = math.max(uExt, uMax + step)
+	vExt = math.max(vExt, vMax + step)
+	-- Cap the stray: it only sizes the probe ray, and a wild surfel should not
+	-- turn that into an arbitrarily long cast.
+	dev = math.min(dev, 32)
+
+	return n, u, v, uExt, vExt, center, dev
 end
 
-local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll: RaycastParams, probe: BasePart, op: OverlapParams, rpTerrain: RaycastParams): Grid
-	local n, nExt, ua, va = topFace(part, avgNormal(surfels))
-	local u, uExt = ua.dir, ua.ext
-	local v, vExt = va.dir, va.ext
-	local surfaceCenter = part.Position + n * nExt
+local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: RaycastParams, probe: BasePart, op: OverlapParams, rpTerrain: RaycastParams): Grid?
+	local n, u, v, uExt, vExt, surfaceCenter, dev = surfaceFrame(part, surfels, c.step)
+	if not n then return nil end
 	local corner = surfaceCenter - u * uExt - v * vExt
 
 	local rpPart = RaycastParams.new()
@@ -147,12 +199,15 @@ local function buildBlockGrid(part: BasePart, surfels: {any}, c: any, filterAll:
 	local step = c.step
 	local nu = math.max(1, math.floor(2 * uExt / step + 1e-6))
 	local nv = math.max(1, math.floor(2 * vExt / step + 1e-6))
-	local castH = 2 -- studs above the surface to start the (downward-along-normal) ray
+	-- Start above the highest stray and reach past the lowest one; on a block
+	-- dev is ~0 and this is the old 2 / 2.5.
+	local castH = 2 + dev
+	local castLen = castH + dev + 0.5
 
 	for iu = 0, nu - 1 do
 		for iv = 0, nv - 1 do
 			local p = corner + u * ((iu + 0.5) * step) + v * ((iv + 0.5) * step)
-			local res = workspace:Raycast(p + n * castH, -n * (castH + 0.5), rpPart)
+			local res = workspace:Raycast(p + n * castH, -n * castLen, rpPart)
 			if not res then continue end
 			local slope = math.deg(math.acos(math.clamp(res.Normal:Dot(UP), -1, 1)))
 			if not ((slope <= c.maxSlope) or isClip(part)) then continue end
@@ -238,6 +293,7 @@ end
 
 -- Where the neighbour in local direction d would be, in world space. Block
 -- grids step along their own face axes; fallback grids are world-aligned.
+-- Only a part with a degenerate Size ends up world-aligned now.
 local function neighbourPos(g: Grid, cell: Cell, d: {number}): Vector3
 	if not g.fallback and g.u and g.v then
 		return cell.pos + g.u * (d[1] * g.step) + g.v * (d[2] * g.step)
@@ -367,14 +423,14 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 	local grids: { [BasePart]: Grid } = {}
 	local nBlock, nFallback, nCells, nDead = 0, 0, 0, 0
 	for part, sfs in pairs(byPart) do
-		local g: Grid
-		if isBlock(part) then
-			g = buildBlockGrid(part, sfs, c, filterAll, probe, op, rpTerrain)
+		local g: Grid? = buildGrid(part, sfs, c, filterAll, probe, op, rpTerrain)
+		if g then
 			nBlock += 1
 		else
 			g = buildFallbackGrid(part, sfs, c)
 			nFallback += 1
 		end
+		g = g :: Grid
 		grids[part] = g
 		nCells += #g.cells
 		nDead += #g.dead
@@ -383,7 +439,7 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 
 	local data = {
 		grids = grids, config = c,
-		stats = { parts = nBlock + nFallback, block = nBlock, fallback = nFallback, cells = nCells, dead = nDead },
+		stats = { parts = nBlock + nFallback, framed = nBlock, block = nBlock, fallback = nFallback, cells = nCells, dead = nDead },
 	}
 	LocalGrid.classifyNodes(data, cfg)
 	return data
