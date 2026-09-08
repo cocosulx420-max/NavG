@@ -979,6 +979,75 @@ function LocalGrid.contours(data: any, cfg: Config?)
 	return data
 end
 
+-- Draw the cells that did NOT survive, so a gap in the walkable surface says
+-- what removed it instead of just being absent.
+--
+--   red    -- killed by cover: something overhangs within minClearance, so the
+--             floor is there but the headroom is not. This is what puts holes
+--             in an otherwise clean border run.
+--   orange -- pruned as too narrow to stand on (rails, ledges, stringers).
+--
+-- Nothing is drawn where the surface simply ends; open air is not a dead cell,
+-- and a border with nothing beyond it is an ordinary dropoff.
+function LocalGrid.drawDead(data: any, opts: any?, parent: Instance?)
+	if typeof(opts) == "Instance" then parent = opts :: Instance; opts = nil end
+	local o = opts or {}
+	local lift = o.lift or 0.05
+	local showNarrow = o.narrow ~= false
+	local showCover = o.cover ~= false
+
+	local root = parent or workspace
+	local dbg = root:FindFirstChild("NVGN_Debug")
+	if not dbg then
+		dbg = Instance.new("Folder"); dbg.Name = "NVGN_Debug"; dbg.Parent = root
+	end
+	local old = dbg:FindFirstChild("Dead")
+	if old then old:Destroy() end
+	local folder = Instance.new("Folder"); folder.Name = "Dead"; folder.Parent = dbg
+	local coverF = Instance.new("Folder"); coverF.Name = "Cover"; coverF.Parent = folder
+	local narrowF = Instance.new("Folder"); narrowF.Name = "Narrow"; narrowF.Parent = folder
+
+	local step = data.config.step
+	local nCover, nNarrow = 0, 0
+
+	local function tile(pos: Vector3, up: Vector3, u: Vector3?, col: Color3, name: string, into: Folder)
+		local d = Instance.new("Part")
+		d.Anchored = true; d.CanCollide = false; d.CanQuery = false; d.CanTouch = false
+		d.Size = Vector3.new(0.8 * step, 0.1, 0.8 * step)
+		d.Color = col
+		d.Material = Enum.Material.Neon
+		if u then
+			d.CFrame = CFrame.fromMatrix(pos + up * lift, u, up)
+		else
+			d.CFrame = CFrame.new(pos + up * lift)
+		end
+		d.Name = name
+		d.Parent = into
+	end
+
+	for _, g in pairs(data.grids) do
+		local up = g.n or Vector3.yAxis
+		local u = g.u
+		if showCover then
+			for _, d in ipairs(g.dead) do
+				local who = d.killer and d.killer.Name or "nil"
+				tile(d.pos, up, u, Color3.fromRGB(255, 40, 40), "cover_" .. who, coverF)
+				nCover += 1
+			end
+		end
+		if showNarrow then
+			for _, cell in ipairs(g.narrow or {}) do
+				tile(cell.pos, up, u, Color3.fromRGB(255, 150, 0), "narrow", narrowF)
+				nNarrow += 1
+			end
+		end
+	end
+
+	data.stats.deadDrawn = nCover
+	data.stats.narrowDrawn = nNarrow
+	return folder, nCover, nNarrow
+end
+
 -- Draw the neighbour graph: one segment per node-to-neighbour link.
 --
 -- `dirs` is 8 or 4 independently of the bake's own connectivity, because this
