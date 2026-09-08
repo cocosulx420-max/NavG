@@ -61,7 +61,15 @@ local DEFAULT = {
 	-- would continue, and still count as the same floor. Not a step height: a
 	-- step up of any size is a wall now, and pathfinding deals with climbing it.
 	-- It is only slack for authoring mismatch and raycast noise.
-	flushTol = 0.5,
+	--
+	-- 0.3, not 0.5. This slack is applied to the offset from where THIS surface's
+	-- plane would continue, and on a slope that plane point has already moved
+	-- most of a step: on a 45 degree ramp it drops 0.354 studs per 0.5 stud step,
+	-- so half a stud of slack was nearly a whole step height and the edge of a
+	-- clipramp merged with whatever lay 0.34 below it instead of reading as a
+	-- border. Measured on case5: 0.5 left those cells interior, 0.3 marks them,
+	-- and the whole map moved by 44 cells and 27 border nodes out of 202k.
+	flushTol = 0.3,
 	-- How far from the expected neighbour position a foreign grid's cell may sit
 	-- and still count as that neighbour. A neighbour on another part's grid is
 	-- on a different lattice at a different angle, so it never lands on our
