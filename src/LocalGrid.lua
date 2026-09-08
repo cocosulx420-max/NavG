@@ -17,6 +17,8 @@ export type Cell = {
 	wall: boolean?,
 	dropoff: boolean?,
 	region: number?,          -- set by LocalGrid.regions; 1 = largest
+	edgeMask: number?,        -- directions where the floor continues into ANOTHER region
+	regionEdge: boolean?,
 
 }
 
@@ -501,11 +503,11 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	local live, dead = buildWorldIndex(data.grids)
 	local r2 = (c.probeRadius * c.step) ^ 2
 	local tol = c.flushTol
-	local nWall, nDrop, nBoth = 0, 0, 0
+	local nWall, nDrop, nBoth, nEdge = 0, 0, 0, 0
 
 	for _, g in pairs(data.grids) do
 		for _, cell in ipairs(g.cells) do
-			local wallMask, dropMask = 0, 0
+			local wallMask, dropMask, edgeMask = 0, 0, 0
 			for bit, d in ipairs(DIR8) do
 				local p = neighbourPos(g, cell, d)
 				local bx, bz = math.floor(p.X), math.floor(p.Z)
@@ -538,6 +540,18 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 								local dy = q.Y - p.Y
 								if math.abs(dy) <= tol then
 									floor = true
+									-- The floor continues here, so this is not a
+									-- wall or a dropoff -- but if it continues
+									-- into a DIFFERENT region it is still an edge
+									-- of this one. A ramp running into a floor and
+									-- a band seam on a long slope both look like
+									-- open ground to the wall/drop tests, and both
+									-- are boundaries that have to be crossed
+									-- deliberately.
+									if cell.region and e.cell.region
+										and e.cell.region ~= cell.region then
+										edgeMask = bit32.bor(edgeMask, bit32.lshift(1, bit - 1))
+									end
 								elseif dy > tol then
 									above = true
 								else
@@ -568,15 +582,18 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 					if above then wallMask = bit32.bor(wallMask, m) else dropMask = bit32.bor(dropMask, m) end
 				end
 			end
-			cell.wallMask, cell.dropMask = wallMask, dropMask
+			cell.wallMask, cell.dropMask, cell.edgeMask = wallMask, dropMask, edgeMask
 			cell.wall, cell.dropoff = wallMask ~= 0, dropMask ~= 0
+			cell.regionEdge = edgeMask ~= 0
 			if cell.wall then nWall += 1 end
 			if cell.dropoff then nDrop += 1 end
 			if cell.wall and cell.dropoff then nBoth += 1 end
+			if cell.regionEdge then nEdge += 1 end
 		end
 	end
 
 	data.stats.wallNodes, data.stats.dropNodes, data.stats.bothNodes = nWall, nDrop, nBoth
+	data.stats.regionEdgeNodes = nEdge
 	return data
 end
 
@@ -623,8 +640,11 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 		stats = { parts = nBlock + nFallback, framed = nBlock, block = nBlock, fallback = nFallback, cells = nCells, dead = nDead },
 	}
 	LocalGrid.pruneNarrow(data, cfg)
-	LocalGrid.classifyNodes(data, cfg)
+	-- regions BEFORE classification: classifyNodes walks every neighbour anyway,
+	-- so it can mark the seams between regions in the same pass instead of
+	-- paying for a third walk of its own.
 	LocalGrid.regions(data, cfg)
+	LocalGrid.classifyNodes(data, cfg)
 	return data
 end
 
@@ -878,11 +898,12 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 		if clearance >= 3 then return 2, 0.7, 0.55 end
 		return 3, 0.55, 0.28
 	end
-	-- A cell is border if it has a wall or a dropoff in any of the 8 directions;
-	-- classifyNodes has already worked that out. Cells carry no masks when the
-	-- caller skipped classification, and then everything reads as interior.
+	-- A cell is border if it has a wall or a dropoff in any of the 8
+	-- directions, or if the floor continues there into another region.
+	-- classifyNodes has already worked all three out. Cells carry no masks when
+	-- the caller skipped classification, and then everything reads as interior.
 	local function isBorder(cell: Cell): boolean
-		return cell.wall == true or cell.dropoff == true
+		return cell.wall == true or cell.dropoff == true or cell.regionEdge == true
 	end
 
 	local function hueOf(n: number): number
