@@ -49,7 +49,7 @@ export type Config = {
 	step: number?, maxSlope: number?, clearCap: number?, minClearance: number?,
 	flushTol: number?, probeRadius: number?, minWidth: number?, regionAngle: number?,
 	bandHeight: number?, standHeight: number?, crouchHeight: number?,
-	connectivity: number?,
+	connectivity: number?, regionPlanarity: number?,
 }
 
 local DEFAULT = {
@@ -89,6 +89,18 @@ local DEFAULT = {
 	-- so a ramp meeting a floor is a seam even though you can walk straight
 	-- across it -- that join is a region LINK, not a merge.
 	regionAngle = 15,
+	-- How far a cell's normal may sit from its REGION's normal, as opposed to
+	-- from its neighbour's. regionAngle alone is a pairwise test and pairwise
+	-- tests chain: on a hill every adjacent pair agrees to a degree or two and
+	-- the whole slope becomes one region, which then gets flattened onto a
+	-- single plane by Contour and comes out quietly wrong rather than visibly
+	-- broken. Measured on case5 r2: 25954 cells, normals spread 20 degrees, 11
+	-- studs of relief, contoured as one plane.
+	--
+	-- Compared against an ANCHOR normal per region, never a running mean -- a
+	-- running mean drifts along a curve and swallows the whole thing, which is
+	-- the same trap the Contour segmentation had to avoid.
+	regionPlanarity = 10,
 	-- Tallest rise one region may cover, or 0 to never cut on height. OFF by
 	-- default: a ramp or a roof plane is one surface, and slicing it at an
 	-- arbitrary altitude splits something that is genuinely continuous and puts
@@ -782,9 +794,15 @@ function LocalGrid.regions(data: any, cfg: Config?)
 	local r2 = (c.probeRadius * c.step) ^ 2
 	local tol = c.flushTol
 	local cosTol = math.cos(math.rad(c.regionAngle))
+	local cosPlanar = math.cos(math.rad(c.regionPlanarity))
 	local dirs = dirsFor(c)
 
 	local up: { [any]: any } = {}
+	-- each root carries the normal of its anchor cell and its size; the anchor
+	-- is what new members are judged against, and the larger side keeps its own
+	-- anchor on a merge so the reference does not wander
+	local anchorN: { [any]: Vector3 } = {}
+	local size: { [any]: number } = {}
 	local function find(x)
 		local r = x
 		while up[r] do r = up[r] end
@@ -793,7 +811,15 @@ function LocalGrid.regions(data: any, cfg: Config?)
 	end
 	local function union(a, b)
 		local ra, rb = find(a), find(b)
-		if ra ~= rb then up[ra] = rb end
+		if ra == rb then return end
+		local na = anchorN[ra] or a.normal
+		local nb = anchorN[rb] or b.normal
+		-- the two surfaces must be the same surface, not merely locally parallel
+		if na:Dot(nb) < cosPlanar then return end
+		if (size[ra] or 1) < (size[rb] or 1) then ra, rb = rb, ra; na, nb = nb, na end
+		up[rb] = ra
+		anchorN[ra] = na
+		size[ra] = (size[ra] or 1) + (size[rb] or 1)
 	end
 
 	local gridOf: { [any]: any } = {}
@@ -1164,6 +1190,19 @@ function LocalGrid.drawContours(data: any, opts: any?, parent: Instance?)
 	if typeof(opts) == "Instance" then parent = opts :: Instance; opts = nil end
 	local o = opts or {}
 	local lift = o.lift or 1
+	-- `only` restricts the draw to a set of region ids, given as a list or as a
+	-- map of id -> true. Useful for inspecting one region without the rest of
+	-- the map on top of it.
+	local only = nil
+	if o.only then
+		only = {}
+		if typeof(o.only) == "table" then
+			for k, v in pairs(o.only) do
+				if typeof(k) == "number" and typeof(v) == "number" then only[v] = true
+				else only[k] = v and true or nil end
+			end
+		end
+	end
 	local root = parent or workspace
 	local dbg = root:FindFirstChild("NVGN_Debug")
 	if not dbg then
@@ -1175,7 +1214,7 @@ function LocalGrid.drawContours(data: any, opts: any?, parent: Instance?)
 
 	local n = 0
 	for r, res in pairs(data.contours or {}) do
-		if res.edges then
+		if res.edges and (not only or only[r]) then
 			local rf = Instance.new("Folder"); rf.Name = string.format("r%03d", r); rf.Parent = folder
 			local col = Color3.fromHSV((r * 0.61803398875) % 1, 0.9, 1)
 			local off = (res.lattice and res.lattice.up or Vector3.yAxis) * lift
