@@ -18,6 +18,9 @@ export type Cell = {
 	dropoff: boolean?,
 	fit: number?,             -- 1 prone, 2 crouch, 3 stand (from clearance)
 	region: number?,          -- set by LocalGrid.regions; 1 = largest
+	line: number?,            -- set by LocalGrid.contours: the fitted line this
+	                          -- border cell belongs to, unique across the bake
+	loop: number?,            -- which boundary loop of its region
 	edgeMask: number?,        -- directions where the floor continues into ANOTHER region
 	regionEdge: boolean?,
 
@@ -1011,7 +1014,9 @@ function LocalGrid.contours(data: any, cfg: Config?)
 		u = u.Unit
 		local t = {}
 		for _, cell in ipairs(cells) do
-			t[#t + 1] = { cf = CFrame.fromMatrix(cell.pos, u, n) }
+			-- the cell rides along on the entry, so the lines Contour returns can
+			-- be attributed back to the nodes they were fitted from
+			t[#t + 1] = { cf = CFrame.fromMatrix(cell.pos, u, n), cell = cell }
 		end
 		byRegion[r] = t
 	end
@@ -1027,6 +1032,23 @@ function LocalGrid.contours(data: any, cfg: Config?)
 			res.stats.collapsed = #parts - slots
 			local frac = res.stats.collapsed / math.max(1, #parts)
 			if frac > worstCollapse then worstCollapse = frac; worstAt = r end
+			-- stamp the line back onto the cells. Line ids are made unique across
+			-- the whole bake rather than per region, so a colour identifies one
+			-- line on the map instead of one line within some region.
+			local L = res.lattice
+			for li, seq in ipairs(res.lines) do
+				for _, k in ipairs(seq) do
+					local e = L.partAt[k]
+					if e and e.cell then e.cell.line = nLines + li end
+				end
+			end
+			for lo, seq in ipairs(res.loops) do
+				for _, k in ipairs(seq) do
+					local e = L.partAt[k]
+					if e and e.cell then e.cell.loop = nLoops + lo end
+				end
+			end
+
 			out[r] = res
 			nCells += #parts; nSlots += slots
 			nLines += res.stats.lines; nLoops += res.stats.loops
@@ -1366,7 +1388,8 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 	-- Colour and foldering follow regions once they exist; by = "part" restores
 	-- the per-part hue, which is what you want when the question is which PART a
 	-- cell came from rather than what it connects to.
-	local byRegion = (o.by ~= "part") and data.stats.regions ~= nil
+	local byLine = o.by == "line"
+	local byRegion = (not byLine) and (o.by ~= "part") and data.stats.regions ~= nil
 
 	local root = parent or workspace
 	local dbg = root:FindFirstChild("NVGN_Debug")
@@ -1442,8 +1465,18 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 			-- read the same as they do between unmerged tiles
 			local along = len * step - (1 - w) * step
 			dot.Size = Vector3.new(along, 0.1, w * step)
-			local hue = byRegion and hueOf(first.region or 0) or partHue
-			dot.Color = Color3.fromHSV(hue, sat, v)
+			if byLine then
+				-- a cell Contour never put on a line is not part of the boundary
+				-- description, so it recedes rather than competing for attention
+				if first.line then
+					dot.Color = Color3.fromHSV(hueOf(first.line), 0.95, 1)
+				else
+					dot.Color = Color3.fromRGB(70, 70, 78)
+				end
+			else
+				local hue = byRegion and hueOf(first.region or 0) or partHue
+				dot.Color = Color3.fromHSV(hue, sat, v)
+			end
 			-- matte interior so the neon Boundary edges pop over the grid layer;
 			-- border nodes get diamond plate, which reads as a distinct surface
 			-- at a glance without spending a colour channel that hue and the
@@ -1459,10 +1492,16 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 			dot.Name = (len == 1)
 				and string.format("c%.1f", first.clearance)
 				or string.format("c%.1f_x%d", first.clearance, len)
-			local owner = byRegion
-				and string.format("r%03d_%s", first.region or 0, FIT_NAME[first.fit or 3])
-				or partName
-			dot.Parent = layer(owner, isBorder(first) and "Border" or "Interior")
+			local owner, layerName
+			if byLine then
+				owner = string.format("r%03d_%s", first.region or 0, FIT_NAME[first.fit or 3])
+				layerName = first.line and "Line" or "Unassigned"
+				dot.Name = first.line and ("l" .. first.line) or dot.Name
+			else
+				owner = byRegion and string.format("r%03d_%s", first.region or 0, FIT_NAME[first.fit or 3]) or partName
+				layerName = isBorder(first) and "Border" or "Interior"
+			end
+			dot.Parent = layer(owner, layerName)
 			drawn += 1
 			if isBorder(first) then nBorder += len end
 		end
@@ -1491,7 +1530,8 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 				local cb, cw, cv = band(cell)
 				if first and cb == bi and cell.ui == last.ui + 1
 					and isBorder(cell) == isBorder(first)
-					and cell.region == first.region then
+					and cell.region == first.region
+					and cell.line == first.line then
 					last, len = cell, len + 1
 				else
 					if first then emit(first, last, len, w, v) end
