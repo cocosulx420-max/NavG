@@ -677,7 +677,12 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 			local along = len * step - (1 - w) * step
 			dot.Size = Vector3.new(along, 0.1, w * step)
 			dot.Color = Color3.fromHSV(hue, sat, v)
-			dot.Material = Enum.Material.SmoothPlastic
+			-- matte interior so the neon Boundary edges pop over the grid layer;
+			-- border nodes get diamond plate, which reads as a distinct surface
+			-- at a glance without spending a colour channel that hue and the
+			-- clearance band already use.
+			dot.Material = isBorder(first) and Enum.Material.DiamondPlate
+				or Enum.Material.SmoothPlastic
 			local mid = first.pos:Lerp(last.pos, 0.5)
 			if oriented then
 				dot.CFrame = CFrame.fromMatrix(mid, g.u, g.n)
