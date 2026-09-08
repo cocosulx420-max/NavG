@@ -177,7 +177,19 @@ end
 local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: RaycastParams, probe: BasePart, op: OverlapParams, rpTerrain: RaycastParams): Grid?
 	local n, u, v, uExt, vExt, surfaceCenter, dev = surfaceFrame(part, surfels, c.step)
 	if not n then return nil end
-	local corner = surfaceCenter - u * uExt - v * vExt
+
+	-- Centre the lattice on the face it describes. `nu` cells of `step` rarely
+	-- divide the extent exactly, and anchoring at a corner dumps the whole
+	-- remainder on the +u/+v edge, so the tiles sit visibly off to one side of
+	-- the part. Rounding the count UP and splitting the slack puts half on each
+	-- side: the lattice is symmetric about surfaceCenter, and the part's centre
+	-- lands on a cell centre for an odd count and a cell corner for an even one.
+	-- The extra ring costs nothing -- those cells miss the part-filtered ray and
+	-- are dropped before they reach the grid.
+	local step = c.step
+	local nu = math.max(1, math.ceil(2 * uExt / step - 1e-6))
+	local nv = math.max(1, math.ceil(2 * vExt / step - 1e-6))
+	local corner = surfaceCenter - u * (nu * step * 0.5) - v * (nv * step * 0.5)
 
 	local rpPart = RaycastParams.new()
 	rpPart.FilterType = Enum.RaycastFilterType.Include
@@ -187,7 +199,7 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 		part = part, fallback = false, origin = corner,
 		u = u, v = v, n = n, step = c.step, cells = {}, index = {},
 		dead = {}, deadIndex = {},
-		center = surfaceCenter, uExt = uExt, vExt = vExt,
+		center = surfaceCenter, uExt = nu * step * 0.5, vExt = nv * step * 0.5,
 	}
 
 	local function kill(iu: number, iv: number, pos: Vector3, killer: Instance?)
@@ -196,9 +208,6 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 		grid.deadIndex[string.format("%d:%d", iu, iv)] = d
 	end
 
-	local step = c.step
-	local nu = math.max(1, math.floor(2 * uExt / step + 1e-6))
-	local nv = math.max(1, math.floor(2 * vExt / step + 1e-6))
 	-- Start above the highest stray and reach past the lowest one; on a block
 	-- dev is ~0 and this is the old 2 / 2.5.
 	local castH = 2 + dev
