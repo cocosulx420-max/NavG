@@ -1163,18 +1163,24 @@ function NodeWalk.regions(walk, alive, cfg)
 	--
 	-- Using the bucket's own normal makes the offset a property of the bucket
 	-- rather than of where the geometry happens to sit in the world.
-	local QN, QD = 100, 1 / (c.leaf * 0.5)
+	-- NO OFFSET TERM. It quantised `face:Dot(qn)` onto a 0.25 grid, and that grid
+	-- CUT RAMPS. `qn` is the normal rounded to 1/100 per component, so it sits up
+	-- to ~0.4 deg off the true normal, and an offset measured against it drifts
+	-- along a tilted surface: a 45 deg ramp drifts 0.141 studs across one piece
+	-- against a 0.25 bucket. A ramp whose span straddles a bucket edge is cut in
+	-- a straight stair-stepped line while an identical ramp a stud away is not --
+	-- `driftTrue` was 0.000 for every such piece, so they are one physical plane.
+	--
+	-- Separating stacked planes falls to the flood fill below, which joins cells
+	-- only within leaf * 1.6.
+	local QN = 100
 	local planes = {}
 	for i = 1, n do
 		if alive == nil or alive[i] then
 			local cell = walk[i]
 			local u = cell.up
 			local qx, qy, qz = math.round(u.X*QN), math.round(u.Y*QN), math.round(u.Z*QN)
-			local qn = Vector3.new(qx, qy, qz)
-			qn = (qn.Magnitude > 1e-6) and qn.Unit or u
-			local d = cell.face:Dot(qn)
-			local k = string.format("%s|%d,%d,%d|%d", cell.mode or "?",
-				qx, qy, qz, math.round(d*QD))
+			local k = string.format("%s|%d,%d,%d", cell.mode or "?", qx, qy, qz)
 			local b = planes[k]; if not b then b = {}; planes[k] = b end
 			table.insert(b, i)
 		end
