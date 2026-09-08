@@ -159,6 +159,13 @@ end
 -- Keep the part's own lattice direction: take whichever part axis is least
 -- aligned with the normal and flatten it into the plane, so cells still line up
 -- with their neighbours instead of being re-gridded onto some arbitrary axis.
+-- One spatial hash key for every stage that grids cells by position. Four
+-- copies of this expression had accumulated across NodeWalk and RegionLink;
+-- they were always these same three primes.
+local function gridKey(x: number, y: number, z: number): number
+	return x * 73856093 + y * 19349663 + z * 83492791
+end
+
 local function frameFor(cf: CFrame, up: Vector3): CFrame
 	local best, bd = nil, math.huge
 	for _, a in ipairs({ cf.RightVector, cf.UpVector, cf.LookVector }) do
@@ -321,8 +328,66 @@ function NodeWalk.cells(parts: {BasePart}, cfg)
 			end
 		end
 	end
+	-- RAYCAST RESCUE.
+	-- The column test above can only vouch for a cell with SKY above it: it is a
+	-- ROOF test. An interior floor -- a ground storey with a building on top of
+	-- it -- fails it by construction, and `probe` then refuses the cell as
+	-- unproven. Measured on case3, whose entire ground floor is a single
+	-- 23.3 x 42.6 union: the column test vouched for 16 cells out of 8505 and
+	-- 3500 were refused, which deleted the ground floor from the bake. v1-v4
+	-- baked it at 2866 cells; v5 and v6 at 184.
+	--
+	-- So ask the PART, not the column. A ray cast down onto the cell's own part
+	-- reports the true surface normal at that point -- the same evidence that
+	-- showed case5's box normal to be 49 degrees off -- and it does not care what
+	-- is stacked above. Two properties make this honest rather than another
+	-- guess:
+	--
+	--   * The ray is filtered to the cell's OWN part, so a floor cannot be
+	--     vouched for by the ceiling above it.
+	--   * A ray never hits the part it starts inside, so it starts just outside
+	--     the cell's own top face. An INTERIOR cell's start point is inside the
+	--     solid and returns no hit -- it stays unproven, which is correct.
+	--
+	-- Only cells the column test could not rescue are considered, so the surfaces
+	-- v5 already handled are untouched.
+	local rayRescued = 0
+	if #nilCells > 0 then
+		local byPart = {}
+		for _, cell in ipairs(nilCells) do
+			if not cell.worldTop then
+				local b = byPart[cell.part]; if not b then b = {}; byPart[cell.part] = b end
+				table.insert(b, cell)
+			end
+		end
+		local START = 0.06   -- above the cell's top: outside the solid, barely
+		for part, group in pairs(byPart) do
+			local rp = RaycastParams.new()
+			rp.FilterType = Enum.RaycastFilterType.Include
+			rp.FilterDescendantsInstances = { part }
+			rp.IgnoreWater = true
+			for _, cell in ipairs(group) do
+				local cf = cell.cf
+				local extY = (c.leaf * 0.5) * (math.abs(cf.RightVector.Y)
+					+ math.abs(cf.UpVector.Y) + math.abs(cf.LookVector.Y))
+				local top = Vector3.new(cf.Position.X, cf.Position.Y + extY, cf.Position.Z)
+				local hit = workspace:Raycast(top + UP * START, UP * -(START + c.leaf), rp)
+				-- Attribute the surface to THIS cell only. A hit further down the
+				-- ray belongs to some other cell in the column, not to this one.
+				if hit and (hit.Position - top).Magnitude <= c.leaf * 0.75 then
+					cell.up = hit.Normal
+					cell.face = hit.Position
+					cell.realNormal = true
+					cell.rayTop = true
+					cell.frame = frameFor(cf, hit.Normal)
+					rayRescued += 1
+				end
+			end
+		end
+	end
+
 	return out, { maxEdge = maxEdge, fellBack = fellBack, rescued = rescued,
-	              distrusted = distrusted }
+	              rayRescued = rayRescued, distrusted = distrusted }
 end
 
 -- The brick test. Materialises the cells as query-only proxies, probes each,
@@ -434,7 +499,13 @@ function NodeWalk.probe(cells, cfg, state)
 
 				-- 1. buried: something of the cell's OWN part sits on its face. A free
 				--    tree walk, and it removes ~80% of cells before any spatial query.
-				if cell.tree and cell.tree:containsPoint(cell.face + up * 0.05) then
+				-- `rayTop` is exempt. containsPoint answers from the VOXELISATION,
+				-- which is quantised to leaf: case3's ground slab is 0.375 thick
+				-- inside 0.5 cells, so a point just above its true surface still
+				-- reads as solid and every ray-rescued cell came back buried. The
+				-- ray is the better evidence -- it started OUTSIDE the part and hit
+				-- this cell's top, which is precisely what "not buried" means.
+				if (not cell.rayTop) and cell.tree and cell.tree:containsPoint(cell.face + up * 0.05) then
 					cell.buried = true
 					state.buried += 1
 
@@ -511,9 +582,9 @@ function NodeWalk.purge(walk, cfg)
 
 	local CELLSZ = 1.0
 	local hash = {}
-	local function key(x, y, z) return x * 73856093 + y * 19349663 + z * 83492791 end
+	local function key(x, y, z) return gridKey(x, y, z) end
 	for i, cell in ipairs(walk) do
-		local k = key(math.floor(cell.face.X/CELLSZ), math.floor(cell.face.Y/CELLSZ), math.floor(cell.face.Z/CELLSZ))
+		local k = gridKey(math.floor(cell.face.X/CELLSZ), math.floor(cell.face.Y/CELLSZ), math.floor(cell.face.Z/CELLSZ))
 		local b = hash[k]; if not b then b = {}; hash[k] = b end
 		table.insert(b, i)
 	end
@@ -1114,7 +1185,9 @@ function NodeWalk.regions(walk, alive, cfg)
 		-- local hash so connectivity is cheap inside the plane
 		local hash = {}
 		local CS = c.leaf * 2
-		local function key(p) return math.floor(p.X/CS)*73856093 + math.floor(p.Y/CS)*19349663 + math.floor(p.Z/CS)*83492791 end
+		local function key(p)
+			return gridKey(math.floor(p.X/CS), math.floor(p.Y/CS), math.floor(p.Z/CS))
+		end
 		for _, i in ipairs(members) do
 			local k = key(walk[i].face)
 			local b = hash[k]; if not b then b = {}; hash[k] = b end
@@ -1350,9 +1423,12 @@ function NodeWalk.run(target: Instance, cfg)
 		cells = cells, walk = walk, alive = alive,
 		stats = {
 			parts = #parts, cells = #cells, maxEdge = info.maxEdge,
-			fellBack = info.fellBack, rescued = info.rescued, walkable = #walk,
+			fellBack = info.fellBack, rescued = info.rescued,
+			rayRescued = info.rayRescued, distrusted = info.distrusted,
+			walkable = #walk,
 			kept = stats.kept, cutIsolated = stats.cutIsolated,
 			cutThin = stats.cutThin, cutSmall = stats.cutSmall,
+			cutStrip = stats.cutStrip, topClusters = stats.topClusters,
 			components = stats.components, componentsKept = stats.componentsKept,
 			drawn = drawn and drawn.drawn or 0,
 			modes = pinfo.counts, probesRun = pinfo.probesRun,

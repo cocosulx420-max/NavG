@@ -833,7 +833,11 @@ function Contour.connect(L, lines, cfg)
 	for i in ipairs(E) do
 		for _, w in ipairs({ "a", "b" }) do
 			local j, w2, dd = nearest(i, w)
-			nb[i .. w] = { j = j, w = w2, d = dd }
+			-- A region can come out as a SINGLE line -- a lone strip, or the one
+			-- stretch left after the small loops are dropped. `nearest` then has
+			-- no candidate and returns nil, so there is no neighbour to record:
+			-- leave the slot empty rather than storing a partner with no index.
+			if j then nb[i .. w] = { j = j, w = w2, d = dd } end
 		end
 	end
 
@@ -854,8 +858,11 @@ function Contour.connect(L, lines, cfg)
 		for _, w in ipairs({ "a", "b" }) do
 			local link = nb[i .. w]
 			local back = link and nb[link.j .. link.w]
-			local key = math.min(i, link.j) .. "|" .. ((i < link.j) and (w .. link.w) or (link.w .. w))
-			if link.d <= pairMax and back and back.j == i and back.w == w and not done[key] then
+			-- An endpoint can have NO partner at all -- a line whose end faces
+			-- nothing in the region. `key` used to be built before this was
+			-- checked, so `link.j` threw on those. Nothing to weld: skip it.
+			local key = link and (math.min(i, link.j) .. "|" .. ((i < link.j) and (w .. link.w) or (link.w .. w)))
+			if link and link.d <= pairMax and back and back.j == i and back.w == w and not done[key] then
 				done[key] = true
 				local t = E[link.j]
 				local w2 = link.w
@@ -868,7 +875,7 @@ function Contour.connect(L, lines, cfg)
 				end
 				if not X then X = (s[w] + t[w2]) / 2 else stats.welded += 1 end
 				s[w] = X; t[w2] = X
-			elseif link.d > pairMax then
+			elseif (not link) or link.d > pairMax then
 				stats.unpaired += 1
 			end
 		end
