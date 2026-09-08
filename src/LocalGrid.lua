@@ -46,7 +46,7 @@ export type Config = {
 }
 
 local DEFAULT = {
-	step = 1,           -- local cell size (studs)
+	step = 0.5,         -- local cell size (studs)
 	maxSlope = 65,      -- max walkable slope (deg); Cocosulx-tested
 	clearCap = 20,      -- clearance raycast cap
 	minClearance = 1.5, -- below this a cell isn't standable floor (crawl minimum)
@@ -610,7 +610,17 @@ function LocalGrid.build(cfg: Config?)
 	return data, floorData, tree, parts
 end
 
-function LocalGrid.visualize(data: any, parent: Instance?)
+-- Debug viz. Cells are merged into runs along the grid's u axis: at step 0.5 a
+-- part-per-cell draw is 200k Parts for case5, and a Part costs ~4KB however
+-- invisible it is. Colour is per-grid hue with a clearance band for value, so
+-- open floor collapses into a handful of long strips and only genuinely broken
+-- ground stays granular. Pass `opts.merge = false` for one Part per cell when
+-- you need to select or rename an individual node.
+function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
+	if typeof(opts) == "Instance" then parent = opts :: Instance; opts = nil end
+	local o = opts or {}
+	local merge = o.merge ~= false
+
 	local root = parent or workspace
 	local dbg = root:FindFirstChild("NVGN_Debug")
 	if not dbg then
@@ -621,36 +631,78 @@ function LocalGrid.visualize(data: any, parent: Instance?)
 	local folder = Instance.new("Folder"); folder.Name = "LocalGrid"; folder.Parent = dbg
 
 	local step = data.config.step
-	local i = 0
+	-- band: shrink factor and brightness by headroom. Also the merge key -- two
+	-- cells only join if they would have been drawn the same.
+	local function band(clearance: number): (number, number, number)
+		if clearance >= 4 then return 1, 0.9, 1 end
+		if clearance >= 3 then return 2, 0.7, 0.55 end
+		return 3, 0.55, 0.28
+	end
+
+	local i, drawn = 0, 0
 	for part, g in pairs(data.grids) do
 		i += 1
 		local hue = (i * 0.61803398875) % 1
 		local sat = g.fallback and 0.3 or 0.9
 		local pf = Instance.new("Folder"); pf.Name = part.Name; pf.Parent = folder
-		for _, cell in ipairs(g.cells) do
+		local oriented = (not g.fallback) and g.n ~= nil
+
+		-- a run is `len` cells along +u starting at `first`, all in one band
+		local function emit(first: Cell, last: Cell, len: number, w: number, v: number)
 			local dot = Instance.new("Part")
 			dot.Anchored = true; dot.CanCollide = false; dot.CanQuery = false; dot.CanTouch = false
-			local w, v
-			if cell.clearance >= 4 then
-				w, v = 0.9, 1
-			elseif cell.clearance >= 3 then
-				w, v = 0.7, 0.55
-			else
-				w, v = 0.55, 0.28
-			end
-			dot.Size = Vector3.new(w * step, 0.1, w * step)
+			-- along the run: full length less one inter-tile gap, so the seams
+			-- read the same as they do between unmerged tiles
+			local along = len * step - (1 - w) * step
+			dot.Size = Vector3.new(along, 0.1, w * step)
 			dot.Color = Color3.fromHSV(hue, sat, v)
-			-- matte, so the neon Boundary edges pop over the grid layer
 			dot.Material = Enum.Material.SmoothPlastic
-			if not g.fallback and g.n then
-				dot.CFrame = CFrame.fromMatrix(cell.pos, g.u, g.n)
+			local mid = first.pos:Lerp(last.pos, 0.5)
+			if oriented then
+				dot.CFrame = CFrame.fromMatrix(mid, g.u, g.n)
 			else
-				dot.CFrame = CFrame.new(cell.pos)
+				dot.CFrame = CFrame.new(mid)
 			end
-			dot.Name = string.format("c%.1f", cell.clearance)
+			dot.Name = (len == 1)
+				and string.format("c%.1f", first.clearance)
+				or string.format("c%.1f_x%d", first.clearance, len)
 			dot.Parent = pf
+			drawn += 1
+		end
+
+		if not merge then
+			for _, cell in ipairs(g.cells) do
+				local _, w, v = band(cell.clearance)
+				emit(cell, cell, 1, w, v)
+			end
+			continue
+		end
+
+		-- bucket by row, then walk each row in ui order joining consecutive
+		-- cells of the same band. A hole in the row breaks the run, so pruned
+		-- and dead cells still show as gaps.
+		local rows: { [number]: {Cell} } = {}
+		for _, cell in ipairs(g.cells) do
+			local r = rows[cell.vi]
+			if not r then r = {}; rows[cell.vi] = r end
+			r[#r + 1] = cell
+		end
+		for _, r in pairs(rows) do
+			table.sort(r, function(a, b) return a.ui < b.ui end)
+			local first, last, len, bi, w, v = nil, nil, 0, nil, 0, 0
+			for _, cell in ipairs(r) do
+				local cb, cw, cv = band(cell.clearance)
+				if first and cb == bi and cell.ui == last.ui + 1 then
+					last, len = cell, len + 1
+				else
+					if first then emit(first, last, len, w, v) end
+					first, last, len, bi, w, v = cell, cell, 1, cb, cw, cv
+				end
+			end
+			if first then emit(first, last, len, w, v) end
 		end
 	end
+	data.stats.vizParts = drawn
 	return folder
 end
 
