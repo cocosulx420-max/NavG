@@ -89,6 +89,9 @@ local DEFAULT = {
 	-- the region, in cells. 1 allows the ordinary case of a chord running along
 	-- the outside of the border band.
 	chordSlack = 1,
+	-- How many times a line may be split trying to keep its chord inside. A
+	-- boundary that needs more than this is not a line under any subdivision.
+	splitDepth = 8,
 }
 
 local function merged(cfg)
@@ -839,6 +842,69 @@ function Contour.chordInside(L, p, q, slack)
 	return true
 end
 
+-- Split any line whose CHORD leaves the region.
+--
+-- A line is fitted to cells that follow the boundary, but it is drawn -- and
+-- consumed downstream -- as the straight chord between its endpoints. Around a
+-- concavity those are different things: the cells hug the notch, the chord cuts
+-- straight across it, and the result is a boundary running over open space or
+-- through a wall. Measured on case5: 5 edges, the worst of them 45 studs long.
+--
+-- The break goes at the cell FURTHEST from the chord, not at the midpoint of the
+-- sequence. That is the corner the chord is cutting, so one split usually
+-- suffices where a midpoint split would need several. The two halves share the
+-- break cell, so they still meet.
+--
+-- This runs before connect, so the pieces are ordinary lines by the time
+-- anything tries to weld them.
+function Contour.splitOutside(L, lines, cfg)
+	local c = merged(cfg)
+	local stats = { split = 0, refused = 0 }
+	local function world(k)
+		local cc = L.coord[k]
+		return L.origin + L.u * (cc[1] * L.leaf) + L.v * (cc[2] * L.leaf)
+	end
+	local out = {}
+	local function process(seg, depth)
+		if #seg < 4 or depth >= c.splitDepth then
+			if #seg > 0 then out[#out + 1] = seg end
+			return
+		end
+		local kLo, kHi = endpointsOf(L, seg)
+		local a, b = world(kLo), world(kHi)
+		if Contour.chordInside(L, a, b, c.chordSlack) then
+			out[#out + 1] = seg
+			return
+		end
+		-- furthest cell from the chord, measured in the region's own plane
+		local d = b - a
+		local len = d.Magnitude
+		if len < 1e-6 then out[#out + 1] = seg; return end
+		local dir = d / len
+		local bestAt, bestOff = nil, -1
+		for x = 2, #seg - 1 do
+			local pcell = world(seg[x])
+			local rel = pcell - a
+			local along = rel:Dot(dir)
+			local off = (rel - dir * along).Magnitude
+			if off > bestOff then bestOff = off; bestAt = x end
+		end
+		if not bestAt then
+			out[#out + 1] = seg
+			stats.refused += 1
+			return
+		end
+		local first, second = {}, {}
+		for x = 1, bestAt do first[#first + 1] = seg[x] end
+		for x = bestAt, #seg do second[#second + 1] = seg[x] end
+		stats.split += 1
+		process(first, depth + 1)
+		process(second, depth + 1)
+	end
+	for _, seg in ipairs(lines) do process(seg, 0) end
+	return out, stats
+end
+
 function Contour.connect(L, lines, cfg)
 	local c = merged(cfg)
 	local pairMax = c.pairMax or 1.5
@@ -1029,6 +1095,10 @@ function Contour.run(parts, cfg)
 	local steal
 	lines, steal = Contour.stealUTurns(L, lines, loops, c)
 
+	-- break any line whose chord would cut across a concavity
+	local splitStats
+	lines, splitStats = Contour.splitOutside(L, lines, c)
+
 	-- quality: RMS deviation is the fair measure. Worst-cell deviation always
 	-- looks bad because the worst cell in a line is, by construction, the corner
 	-- cell at its end.
@@ -1059,6 +1129,7 @@ function Contour.run(parts, cfg)
 			links = steal.links, splits = steal.splits, firstLink = steal.firstLink,
 			dissolved = dissolveStats.dissolved, dissolveRefused = dissolveStats.refused,
 			dissolveOutside = dissolveStats.outside,
+			chordSplits = splitStats.split, chordSplitRefused = splitStats.refused,
 			rmsDeviation = rms / math.max(1, #lines),
 			worstDeviation = worst, bent = nb,
 		},
