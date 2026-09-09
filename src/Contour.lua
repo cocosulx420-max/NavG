@@ -1128,7 +1128,7 @@ function Contour.run(parts, cfg)
 			smallLoops = stats.smallLoops, uturns = stats.uturns, kept = stats.kept,
 			links = steal.links, splits = steal.splits, firstLink = steal.firstLink,
 			dissolved = dissolveStats.dissolved, dissolveRefused = dissolveStats.refused,
-			dissolveOutside = dissolveStats.outside,
+			dissolveOutside = dissolveStats.outside, dissolveCapped = dissolveStats.capped,
 			chordSplits = splitStats.split, chordSplitRefused = splitStats.refused,
 			rmsDeviation = rms / math.max(1, #lines),
 			worstDeviation = worst, bent = nb,
@@ -1152,7 +1152,7 @@ end
 -- should meet is not defined there.
 function Contour.dissolveShort(L, E, cfg)
 	local c = merged(cfg)
-	local stats = { dissolved = 0, refused = 0, outside = 0 }
+	local stats = { dissolved = 0, refused = 0, outside = 0, capped = 0 }
 	if not c.minEdge or c.minEdge <= 0 then return E, stats end
 
 	local function key(v: Vector3): string
@@ -1187,8 +1187,21 @@ function Contour.dissolveShort(L, E, cfg)
 			else
 				local A, B = E[nA], E[nB]
 				local X = planeMeet(L, A[wA], A.dir, B[wB], B.dir)
-				if not X then
+				-- CAP THE EXTENSION, exactly as connect does. Two neighbours of a
+				-- stub are often near parallel -- the two sides of a narrow notch,
+				-- or the ring around a small hole in the floor -- and near
+				-- parallel lines meet a long way off. Uncapped, a 2-cell line with
+				-- a half-stud chord came out drawn as an 8-stud spike shooting
+				-- away from the surface. A corner replacement that has to travel
+				-- further than maxExtend is not a corner.
+				if X and math.max((X - A[wA]).Magnitude, (X - B[wB]).Magnitude) > c.maxExtend then
+					X = nil
+					stats.capped += 1
+				elseif not X then
 					stats.refused += 1
+				end
+				if not X then
+					-- already counted above
 				else
 					-- the far end of each neighbour, which the new chord runs from
 					local farA = (wA == "a") and A.b or A.a
