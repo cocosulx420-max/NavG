@@ -1153,6 +1153,8 @@ end
 function Contour.dissolveShort(L, E, cfg)
 	local c = merged(cfg)
 	local stats = { dissolved = 0, refused = 0, outside = 0, capped = 0 }
+	-- maxExtend is not in DEFAULT; connect reads it with this same fallback
+	local maxExtend = c.maxExtend or 3.0
 	if not c.minEdge or c.minEdge <= 0 then return E, stats end
 
 	local function key(v: Vector3): string
@@ -1194,7 +1196,7 @@ function Contour.dissolveShort(L, E, cfg)
 				-- a half-stud chord came out drawn as an 8-stud spike shooting
 				-- away from the surface. A corner replacement that has to travel
 				-- further than maxExtend is not a corner.
-				if X and math.max((X - A[wA]).Magnitude, (X - B[wB]).Magnitude) > c.maxExtend then
+				if X and math.max((X - A[wA]).Magnitude, (X - B[wB]).Magnitude) > maxExtend then
 					X = nil
 					stats.capped += 1
 				elseif not X then
