@@ -1443,6 +1443,12 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 	-- cell came from rather than what it connects to.
 	local byLine = o.by == "line"
 	local byRegion = (not byLine) and (o.by ~= "part") and data.stats.regions ~= nil
+	-- Skip the interior entirely rather than building it and deleting it after.
+	-- On case5 the interior is 187k of the 202k cells, so a border-only draw that
+	-- filters here costs a tenth of one that filters afterwards -- and it was
+	-- building-then-deleting that kept pushing a single call past the tool's
+	-- time limit.
+	local borderOnly = o.borderOnly == true
 
 	local root = parent or workspace
 	local dbg = root:FindFirstChild("NVGN_Debug")
@@ -1561,8 +1567,10 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 
 		if not merge then
 			for _, cell in ipairs(g.cells) do
-				local _, w, v = band(cell)
-				emit(cell, cell, 1, w, v)
+				if not (borderOnly and not isBorder(cell)) then
+					local _, w, v = band(cell)
+					emit(cell, cell, 1, w, v)
+				end
 			end
 			continue
 		end
@@ -1572,9 +1580,11 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 		-- and dead cells still show as gaps.
 		local rows: { [number]: {Cell} } = {}
 		for _, cell in ipairs(g.cells) do
-			local r = rows[cell.vi]
-			if not r then r = {}; rows[cell.vi] = r end
-			r[#r + 1] = cell
+			if not (borderOnly and not isBorder(cell)) then
+				local r = rows[cell.vi]
+				if not r then r = {}; rows[cell.vi] = r end
+				r[#r + 1] = cell
+			end
 		end
 		for _, r in pairs(rows) do
 			table.sort(r, function(a, b) return a.ui < b.ui end)
