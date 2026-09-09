@@ -97,7 +97,11 @@ local DEFAULT = {
 	-- passes over cells of this region; it cannot see a wall standing between
 	-- two cells at the same height. A ray between the two corner nodes can.
 	rayLift = 0.6,     -- studs along the surface normal, to clear the floor itself
-	rayMinChord = 1.5, -- lines shorter than this are not worth testing
+	-- Shortest chord worth casting along. This exists to skip sub-cell noise,
+	-- NOT to protect small loops -- at 1.5 it exempted every 2-to-3 cell line,
+	-- and a 1-stud line crosses a thin wall perfectly well. Small loops are
+	-- protected by rayMinCells and by refusing to shred what cannot be walked.
+	rayMinChord = 0.75,
 	rayMinCells = 2,   -- never walk a line below this many cells
 }
 
@@ -957,9 +961,20 @@ function Contour.validateLines(L, lines, tangent, cfg)
 			elseif #dropped > 0 then
 				out[#out + 1] = dropped
 			end
+		elseif #seg >= 4 then
+			-- Walking from one end could not clear it, which means the blame was
+			-- not all at one end. Halve it and test both: on a boundary that
+			-- doubles back, each half has a straight run the whole did not.
+			local h = math.floor(#seg / 2)
+			local first, second = {}, {}
+			for i = 1, h do first[#first + 1] = seg[i] end
+			for i = h, #seg do second[#second + 1] = seg[i] end
+			queue[#queue + 1] = first
+			queue[#queue + 1] = second
+			stats.spawned += 1
 		else
-			-- nothing survived the walk: keep the line as it was rather than
-			-- shredding it, and say so
+			-- two or three cells that still fail: too small to walk and too small
+			-- to halve. Keep it rather than shredding the boundary, and say so.
 			out[#out + 1] = seg
 			stats.refused += 1
 		end
@@ -1099,7 +1114,17 @@ function Contour.connect(L, lines, cfg)
 		return p1 + d1 * ((rx * b2 - ry * a2) / den)
 	end
 
-	local stats = { welded = 0, parallel = 0, capped = 0, unpaired = 0, junction = 0, open = 0 }
+	local stats = { welded = 0, parallel = 0, capped = 0, unpaired = 0, junction = 0, open = 0, blocked = 0 }
+	-- is the edge still clear if this end moves to X?
+	local rp = c.rayFilter
+	local lift = (L.up or Vector3.yAxis) * (c.rayLift or 0.6)
+	local function clearTo(e, w, X)
+		if not rp then return true end
+		local far = (w == "a") and e.b or e.a
+		local d = (X + lift) - (far + lift)
+		if d.Magnitude < 1e-4 then return true end
+		return workspace:Raycast(far + lift, d, rp) == nil
+	end
 	local done = {}
 	local placed = {}
 	for i, s in ipairs(E) do
@@ -1118,6 +1143,12 @@ function Contour.connect(L, lines, cfg)
 				local X = (ang >= minAngle) and meet(s[w], s.dir, t[w2], t.dir) or nil
 				if X and math.max((X - s[w]).Magnitude, (X - t[w2]).Magnitude) > maxExtend then
 					X = nil; stats.capped += 1
+				elseif X and not clearTo(s, w, X) then
+					-- extending to the crossing point would push this edge through
+					-- a wall; the midpoint of two on-surface ends cannot
+					X = nil; stats.blocked += 1
+				elseif X and not clearTo(t, w2, X) then
+					X = nil; stats.blocked += 1
 				elseif not X then
 					stats.parallel += 1
 				end
