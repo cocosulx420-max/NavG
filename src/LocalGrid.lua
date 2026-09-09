@@ -53,6 +53,7 @@ export type Config = {
 	flushTol: number?, probeRadius: number?, minWidth: number?, regionAngle: number?,
 	bandHeight: number?, standHeight: number?, crouchHeight: number?,
 	connectivity: number?, regionPlanarity: number?, faceAngle: number?,
+	minEdge: number?, chordSlack: number?, contourTol: number?, contourWindow: number?,
 }
 
 local DEFAULT = {
@@ -1021,6 +1022,7 @@ end
 -- the line output -- it is the same failure the other approach hit on case3.
 function LocalGrid.contours(data: any, cfg: Config?)
 	local Contour = require(script.Parent:WaitForChild("Contour"))
+	local c = merged(cfg)
 	local step = data.config.step
 
 	-- ONE frame per region, from the region's OWN mean normal.
@@ -1077,7 +1079,15 @@ function LocalGrid.contours(data: any, cfg: Config?)
 	local out, nCells, nSlots, nLines, nLoops, nFailed = {}, 0, 0, 0, 0, 0
 	local worstCollapse, worstAt = 0, 0
 	for r, parts in pairs(byRegion) do
-		local ok, res = pcall(Contour.run, parts, { leaf = step })
+		-- pass the contour knobs through, so a caller can A/B the fitting stage
+		-- (minEdge = 0 disables the dissolve) without editing Contour itself
+		local ok, res = pcall(Contour.run, parts, {
+			leaf = step,
+			minEdge = c.minEdge,
+			chordSlack = c.chordSlack,
+			tol = c.contourTol,
+			window = c.contourWindow,
+		})
 		if ok and typeof(res) == "table" then
 			local slots = 0
 			for _ in pairs(res.lattice.occ) do slots += 1 end
