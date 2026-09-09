@@ -758,7 +758,8 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 	end
 
 	local data = {
-		grids = grids, config = c,
+		-- kept so later stages can raycast against the same set the bake used
+		grids = grids, parts = parts, config = c,
 		stats = { parts = nParts, grids = nBlock + nFallback, faces = nFaces,
 			framed = nBlock, block = nBlock, fallback = nFallback, cells = nCells, dead = nDead,
 			prone = nFit[1], crouch = nFit[2], stand = nFit[3] },
@@ -1076,6 +1077,16 @@ function LocalGrid.contours(data: any, cfg: Config?)
 		byRegion[r] = t
 	end
 
+	-- one filter for the whole bake: the line validator casts against exactly the
+	-- parts the floor was built from, so scenery that was never walkable cannot
+	-- veto a line
+	local rayFilter = nil
+	if data.parts then
+		rayFilter = RaycastParams.new()
+		rayFilter.FilterType = Enum.RaycastFilterType.Include
+		rayFilter.FilterDescendantsInstances = data.parts
+	end
+
 	local out, nCells, nSlots, nLines, nLoops, nFailed = {}, 0, 0, 0, 0, 0
 	local worstCollapse, worstAt = 0, 0
 	for r, parts in pairs(byRegion) do
@@ -1083,6 +1094,7 @@ function LocalGrid.contours(data: any, cfg: Config?)
 		-- (minEdge = 0 disables the dissolve) without editing Contour itself
 		local ok, res = pcall(Contour.run, parts, {
 			leaf = step,
+			rayFilter = rayFilter,
 			minEdge = c.minEdge,
 			chordSlack = c.chordSlack,
 			tol = c.contourTol,

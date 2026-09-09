@@ -92,6 +92,13 @@ local DEFAULT = {
 	-- How many times a line may be split trying to keep its chord inside. A
 	-- boundary that needs more than this is not a line under any subdivision.
 	splitDepth = 8,
+
+	-- Line-of-sight validation. The lattice test only knows whether a chord
+	-- passes over cells of this region; it cannot see a wall standing between
+	-- two cells at the same height. A ray between the two corner nodes can.
+	rayLift = 0.6,     -- studs along the surface normal, to clear the floor itself
+	rayMinChord = 1.5, -- lines shorter than this are not worth testing
+	rayMinCells = 2,   -- never walk a line below this many cells
 }
 
 local function merged(cfg)
@@ -842,6 +849,125 @@ function Contour.chordInside(L, p, q, slack)
 	return true
 end
 
+-- Validate each line against real geometry, and cut back the end that fails.
+--
+-- The lattice test (chordInside) only knows whether a chord passes over cells of
+-- this region. It cannot see a WALL standing between two cells at the same
+-- height, because both endpoints and everything between them are perfectly good
+-- floor -- the wall is simply in the way. A ray between the two corner nodes
+-- sees it.
+--
+-- When a line fails, the end to blame is the one whose own tangent disagrees
+-- most with the line as a whole: that is the end that has bent away from the
+-- straight run and dragged the chord off the surface. It is walked back ONE node
+-- at a time, re-casting each time, rather than bisected -- a bisect overshoots
+-- and shatters a line that needed to lose two cells. The nodes walked off are
+-- not discarded: they become a line of their own and are validated in turn, so
+-- the boundary keeps every cell it started with.
+--
+-- SMALL LOOPS ARE LEFT ALONE. A ring only a couple of studs across (the hole
+-- around a crate, say) has no meaningful straight run in it: its chord is
+-- shorter than the ray lift, the tangents wrap the whole ring, and walking it
+-- back produces noise rather than lines. `rayMinChord` and `rayMinCells` keep
+-- the pass out of them.
+function Contour.validateLines(L, lines, tangent, cfg)
+	local c = merged(cfg)
+	local stats = { tested = 0, failed = 0, walked = 0, spawned = 0, refused = 0 }
+	local rp = c.rayFilter
+	if not rp then return lines, stats end
+
+	local lift = (L.up or Vector3.yAxis) * c.rayLift
+	local function world(k)
+		local cc = L.coord[k]
+		return L.origin + L.u * (cc[1] * L.leaf) + L.v * (cc[2] * L.leaf)
+	end
+	local function clear(a, b)
+		local d = (b + lift) - (a + lift)
+		if d.Magnitude < 1e-4 then return true end
+		return workspace:Raycast(a + lift, d, rp) == nil
+	end
+
+	local out = {}
+	local queue = {}
+	for _, seg in ipairs(lines) do queue[#queue + 1] = seg end
+
+	local guard = 0
+	while #queue > 0 and guard < 20000 do
+		guard += 1
+		local seg = table.remove(queue, 1)
+		if #seg < c.rayMinCells then
+			if #seg > 0 then out[#out + 1] = seg end
+			continue
+		end
+		local kLo, kHi = endpointsOf(L, seg)
+		local a, b = world(kLo), world(kHi)
+		if (b - a).Magnitude < c.rayMinChord then
+			out[#out + 1] = seg
+			continue
+		end
+		stats.tested += 1
+		if clear(a, b) then
+			out[#out + 1] = seg
+			continue
+		end
+		stats.failed += 1
+
+		-- Which end is to blame? The one whose tangent sits furthest from the
+		-- line's own mean direction. Without tangents, fall back to the end
+		-- whose neighbour turns the sharpest.
+		local mean = meanAngle(seg, tangent)
+		local tLo = tangent and tangent[kLo]
+		local tHi = tangent and tangent[kHi]
+		local badIsHi
+		if tLo and tHi then
+			badIsHi = angDiff(tHi, mean) >= angDiff(tLo, mean)
+		else
+			badIsHi = true
+		end
+
+		-- walk that end back one node at a time
+		local work = {}
+		for i, k in ipairs(seg) do work[i] = k end
+		local dropped = {}
+		local ok = false
+		while #work >= c.rayMinCells do
+			-- the sequence end nearest the bad corner is the one to shorten
+			local headDist = (world(work[1]) - (badIsHi and b or a)).Magnitude
+			local tailDist = (world(work[#work]) - (badIsHi and b or a)).Magnitude
+			local k
+			if headDist <= tailDist then
+				k = table.remove(work, 1)
+				table.insert(dropped, 1, k)
+			else
+				k = table.remove(work)
+				dropped[#dropped + 1] = k
+			end
+			stats.walked += 1
+			if #work < c.rayMinCells then break end
+			local lo2, hi2 = endpointsOf(L, work)
+			local a2, b2 = world(lo2), world(hi2)
+			if (b2 - a2).Magnitude < c.rayMinChord or clear(a2, b2) then ok = true; break end
+		end
+
+		if ok and #work >= c.rayMinCells then
+			out[#out + 1] = work
+			if #dropped >= c.rayMinCells then
+				queue[#queue + 1] = dropped
+				stats.spawned += 1
+			elseif #dropped > 0 then
+				out[#out + 1] = dropped
+			end
+		else
+			-- nothing survived the walk: keep the line as it was rather than
+			-- shredding it, and say so
+			out[#out + 1] = seg
+			stats.refused += 1
+		end
+	end
+	for _, seg in ipairs(queue) do out[#out + 1] = seg end
+	return out, stats
+end
+
 -- Split any line whose CHORD leaves the region.
 --
 -- A line is fitted to cells that follow the boundary, but it is drawn -- and
@@ -1099,6 +1225,10 @@ function Contour.run(parts, cfg)
 	local splitStats
 	lines, splitStats = Contour.splitOutside(L, lines, c)
 
+	-- then test what is left against real geometry, walking back the bad end
+	local rayStats
+	lines, rayStats = Contour.validateLines(L, lines, tangent, c)
+
 	-- quality: RMS deviation is the fair measure. Worst-cell deviation always
 	-- looks bad because the worst cell in a line is, by construction, the corner
 	-- cell at its end.
@@ -1130,6 +1260,9 @@ function Contour.run(parts, cfg)
 			dissolved = dissolveStats.dissolved, dissolveRefused = dissolveStats.refused,
 			dissolveOutside = dissolveStats.outside, dissolveCapped = dissolveStats.capped,
 			chordSplits = splitStats.split, chordSplitRefused = splitStats.refused,
+			rayTested = rayStats.tested, rayFailed = rayStats.failed,
+			rayWalked = rayStats.walked, raySpawned = rayStats.spawned,
+			rayRefused = rayStats.refused,
 			rmsDeviation = rms / math.max(1, #lines),
 			worstDeviation = worst, bent = nb,
 		},
