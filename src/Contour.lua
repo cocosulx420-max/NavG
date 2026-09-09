@@ -853,6 +853,37 @@ function Contour.chordInside(L, p, q, slack)
 	return true
 end
 
+-- Break every line into maximal CONTIGUOUS runs.
+--
+-- Contour.lines groups cells by tangent direction and then distributes the
+-- leftovers cell by cell, so a "line" is a set of cells that agree on direction
+-- -- NOT necessarily a connected run. Measured on case5: 304 of 711 lines
+-- contain a step between cells that are not lattice neighbours.
+--
+-- Everything downstream assumes otherwise. A line is drawn as the chord between
+-- its two extreme cells, and if the cells in between are not actually joined,
+-- that chord crosses whatever lies in the gap: three cells came out drawn 44.9
+-- studs long. Splitting, walking back and dissolving all inherit the same
+-- assumption. Enforce it once, here, and the rest becomes sound.
+function Contour.splitDisjoint(L, lines)
+	local out, stats = {}, { split = 0 }
+	for _, seg in ipairs(lines) do
+		local run = { seg[1] }
+		for i = 2, #seg do
+			local a, b = L.coord[seg[i - 1]], L.coord[seg[i]]
+			if math.abs(a[1] - b[1]) <= 1 and math.abs(a[2] - b[2]) <= 1 then
+				run[#run + 1] = seg[i]
+			else
+				out[#out + 1] = run
+				stats.split += 1
+				run = { seg[i] }
+			end
+		end
+		if #run > 0 then out[#out + 1] = run end
+	end
+	return out, stats
+end
+
 -- Validate each line against real geometry, and cut back the end that fails.
 --
 -- The lattice test (chordInside) only knows whether a chord passes over cells of
@@ -1259,6 +1290,10 @@ function Contour.run(parts, cfg)
 	local steal
 	lines, steal = Contour.stealUTurns(L, lines, loops, c)
 
+	-- a line must be a connected run before anything measures a chord across it
+	local disjointStats
+	lines, disjointStats = Contour.splitDisjoint(L, lines)
+
 	-- break any line whose chord would cut across a concavity
 	local splitStats
 	lines, splitStats = Contour.splitOutside(L, lines, c)
@@ -1297,6 +1332,7 @@ function Contour.run(parts, cfg)
 			links = steal.links, splits = steal.splits, firstLink = steal.firstLink,
 			dissolved = dissolveStats.dissolved, dissolveRefused = dissolveStats.refused,
 			dissolveOutside = dissolveStats.outside, dissolveCapped = dissolveStats.capped,
+			disjointSplits = disjointStats.split,
 			chordSplits = splitStats.split, chordSplitRefused = splitStats.refused,
 			rayTested = rayStats.tested, rayFailed = rayStats.failed,
 			rayWalked = rayStats.walked, raySpawned = rayStats.spawned,
