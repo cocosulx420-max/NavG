@@ -934,12 +934,19 @@ function Contour.validateLines(L, lines, tangent, cfg)
 		for i, k in ipairs(seg) do work[i] = k end
 		local dropped = {}
 		local ok = false
+		-- CHOOSE THE END ONCE. Re-deciding each step looks harmless and is not:
+		-- as the near end erodes it gets further from the bad corner, the
+		-- comparison flips, and the walk starts eating the OTHER end. `dropped`
+		-- then holds cells from both ends of the original run -- not a
+		-- contiguous line at all -- and the piece it becomes is drawn as a chord
+		-- across everything between them. That is how a 3-cell line came out
+		-- drawn 44.9 studs long.
+		local fromHead =
+			(world(seg[1]) - (badIsHi and b or a)).Magnitude
+			<= (world(seg[#seg]) - (badIsHi and b or a)).Magnitude
 		while #work >= c.rayMinCells do
-			-- the sequence end nearest the bad corner is the one to shorten
-			local headDist = (world(work[1]) - (badIsHi and b or a)).Magnitude
-			local tailDist = (world(work[#work]) - (badIsHi and b or a)).Magnitude
 			local k
-			if headDist <= tailDist then
+			if fromHead then
 				k = table.remove(work, 1)
 				table.insert(dropped, 1, k)
 			else
