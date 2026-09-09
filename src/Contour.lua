@@ -76,6 +76,19 @@ local DEFAULT = {
 	sepMax = 2.5,    -- perpendicular separation, in cells, for a side-by-side pair
 	joinMax = 3.0,   -- furthest apart two ends may be and still get a connector
 	overlapMin = 2,  -- cells of overlap before a pair counts as running alongside
+
+	-- Shortest edge worth keeping, in studs. A 1-stud chamfer is a real feature
+	-- and the segmentation is right to find it, but at this scale it is a corner
+	-- wearing a line's clothes: it costs an edge, two joints and a colour to say
+	-- what a single corner says. Below this the edge is dissolved and its two
+	-- neighbours are extended to meet each other -- but ONLY if the replacement
+	-- chords stay inside the region, since cutting a corner is exactly how a
+	-- boundary ends up running through a wall. Set to 0 to keep every edge.
+	minEdge = 1.5,
+	-- How far off the lattice a chord may stray before it counts as having left
+	-- the region, in cells. 1 allows the ordinary case of a chord running along
+	-- the outside of the border band.
+	chordSlack = 1,
 }
 
 local function merged(cfg)
@@ -784,6 +797,48 @@ end
 -- U-turn the two lines are parallel and their ends are adjacent, so extension
 -- cannot join them -- there is no crossing to find. The connector supplies the
 -- perpendicular edge that gives each side something to meet at right angles.
+-- Where two lines cross, in the region's own plane.
+local function planeMeet(L, p1, d1, p2, d2)
+	local function planar(v) return v:Dot(L.u), v:Dot(L.v) end
+	local a1, b1 = planar(d1)
+	local a2, b2 = planar(d2)
+	local den = a1 * b2 - b1 * a2
+	if math.abs(den) < 1e-9 then return nil end
+	local rx, ry = planar(p2 - p1)
+	return p1 + d1 * ((rx * b2 - ry * a2) / den)
+end
+
+-- Does the straight run from `p` to `q` stay over the region?
+--
+-- This is the test the fitted edges never had. A line is fitted to cells that
+-- follow the boundary, but it is DRAWN as the chord between its endpoints, and
+-- a chord across a concavity leaves the region -- which is how a boundary ends
+-- up crossing a wall. Sampling at half a cell is finer than any feature the
+-- lattice can hold, and `slack` cells of tolerance allow the ordinary case of a
+-- chord running just outside the border band it was fitted to.
+function Contour.chordInside(L, p, q, slack)
+	slack = slack or 1
+	local d = q - p
+	local len = d.Magnitude
+	if len < 1e-6 then return true end
+	local steps = math.max(1, math.ceil(len / (L.leaf * 0.5)))
+	for x = 0, steps do
+		local at = p + d * (x / steps)
+		local rel = at - L.origin
+		local i = math.round(rel:Dot(L.u) / L.leaf)
+		local j = math.round(rel:Dot(L.v) / L.leaf)
+		local hit = false
+		for di = -slack, slack do
+			for dj = -slack, slack do
+				if L.occ[K(i + di, j + dj)] then hit = true; break end
+			end
+			if hit then break end
+		end
+		if not hit then return false end
+	end
+	return true
+end
+
 function Contour.connect(L, lines, cfg)
 	local c = merged(cfg)
 	local pairMax = c.pairMax or 1.5
@@ -990,6 +1045,8 @@ function Contour.run(parts, cfg)
 		worst = math.max(worst, w)
 	end
 	local edges, joinStats = Contour.connect(L, lines, c)
+	local dissolveStats
+	edges, dissolveStats = Contour.dissolveShort(L, edges, c)
 
 	return {
 		lattice = L, seed = seed, depth = depth, loops = loops,
@@ -1000,11 +1057,90 @@ function Contour.run(parts, cfg)
 			distributed = stats.distributed, refused = stats.refused,
 			smallLoops = stats.smallLoops, uturns = stats.uturns, kept = stats.kept,
 			links = steal.links, splits = steal.splits, firstLink = steal.firstLink,
+			dissolved = dissolveStats.dissolved, dissolveRefused = dissolveStats.refused,
+			dissolveOutside = dissolveStats.outside,
 			rmsDeviation = rms / math.max(1, #lines),
 			worstDeviation = worst, bent = nb,
 		},
 		config = c,
 	}
+end
+
+-- Dissolve edges too short to be worth an edge, extending their neighbours to
+-- meet instead.
+--
+-- Runs after connect, so every endpoint already coincides with its neighbour's
+-- and adjacency is exact rather than a proximity guess. Shortest first, and an
+-- edge whose neighbour was already dissolved is left alone, so a run of stubs
+-- cannot cascade into one long chord across a curve.
+--
+-- REFUSED whenever the replacement would not stay over the region. Cutting a
+-- corner is precisely how a boundary starts running through a wall, and the two
+-- new chords are checked against the occupancy lattice before anything is
+-- committed. A junction of more than two edges is also refused: which pair
+-- should meet is not defined there.
+function Contour.dissolveShort(L, E, cfg)
+	local c = merged(cfg)
+	local stats = { dissolved = 0, refused = 0, outside = 0 }
+	if not c.minEdge or c.minEdge <= 0 then return E, stats end
+
+	local function key(v: Vector3): string
+		return string.format("%d:%d:%d",
+			math.round(v.X * 64), math.round(v.Y * 64), math.round(v.Z * 64))
+	end
+
+	local order = {}
+	for idx, e in ipairs(E) do
+		local len = (e.b - e.a).Magnitude
+		if len < c.minEdge then order[#order + 1] = { idx = idx, len = len } end
+	end
+	table.sort(order, function(x, y) return x.len < y.len end)
+
+	local dead = {}
+	for _, o in ipairs(order) do
+		local s = E[o.idx]
+		if not dead[o.idx] then
+			-- exactly one live neighbour at each end, or this is a junction
+			local nA, nB, wA, wB, countA, countB = nil, nil, nil, nil, 0, 0
+			local ka, kb = key(s.a), key(s.b)
+			for j, t in ipairs(E) do
+				if j ~= o.idx and not dead[j] then
+					for _, w in ipairs({ "a", "b" }) do
+						if key(t[w]) == ka then countA += 1; nA, wA = j, w end
+						if key(t[w]) == kb then countB += 1; nB, wB = j, w end
+					end
+				end
+			end
+			if countA ~= 1 or countB ~= 1 or nA == nB then
+				stats.refused += 1
+			else
+				local A, B = E[nA], E[nB]
+				local X = planeMeet(L, A[wA], A.dir, B[wB], B.dir)
+				if not X then
+					stats.refused += 1
+				else
+					-- the far end of each neighbour, which the new chord runs from
+					local farA = (wA == "a") and A.b or A.a
+					local farB = (wB == "a") and B.b or B.a
+					if Contour.chordInside(L, farA, X, c.chordSlack)
+						and Contour.chordInside(L, X, farB, c.chordSlack) then
+						A[wA] = X; B[wB] = X
+						dead[o.idx] = true
+						stats.dissolved += 1
+					else
+						stats.outside += 1
+					end
+				end
+			end
+		end
+	end
+
+	if stats.dissolved == 0 then return E, stats end
+	local out = {}
+	for i, e in ipairs(E) do
+		if not dead[i] then out[#out + 1] = e end
+	end
+	return out, stats
 end
 
 local function hueFor(i: number): Color3
