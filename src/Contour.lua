@@ -84,7 +84,14 @@ local DEFAULT = {
 	-- neighbours are extended to meet each other -- but ONLY if the replacement
 	-- chords stay inside the region, since cutting a corner is exactly how a
 	-- boundary ends up running through a wall. Set to 0 to keep every edge.
-	minEdge = 1.5,
+	--
+	-- 2.5, not 1.5. Once splitDisjoint began cutting lines into contiguous runs
+	-- the leftovers at corners came out at 1.6 to 2.4 studs -- just above the old
+	-- threshold -- so a corner that should be one vertex was described by a
+	-- little bridging segment instead, and that bridge cut the corner and clipped
+	-- the wall. Raising the threshold is only safe because the dissolve now
+	-- casts a ray as well as testing the lattice.
+	minEdge = 2.5,
 	-- How far off the lattice a chord may stray before it counts as having left
 	-- the region, in cells. 1 allows the ordinary case of a chord running along
 	-- the outside of the border band.
@@ -1362,6 +1369,8 @@ function Contour.dissolveShort(L, E, cfg)
 	local stats = { dissolved = 0, refused = 0, outside = 0, capped = 0 }
 	-- maxExtend is not in DEFAULT; connect reads it with this same fallback
 	local maxExtend = c.maxExtend or 3.0
+	local rp = c.rayFilter
+	local lift = (L.up or Vector3.yAxis) * (c.rayLift or 0.6)
 	if not c.minEdge or c.minEdge <= 0 then return E, stats end
 
 	local function key(v: Vector3): string
@@ -1415,7 +1424,19 @@ function Contour.dissolveShort(L, E, cfg)
 					-- the far end of each neighbour, which the new chord runs from
 					local farA = (wA == "a") and A.b or A.a
 					local farB = (wB == "a") and B.b or B.a
-					if Contour.chordInside(L, farA, X, c.chordSlack)
+					-- BOTH tests. The lattice one catches a replacement passing over
+					-- a hole in the region; the ray catches one passing through a
+					-- wall standing on it, which the lattice cannot see because
+					-- the cells either side of a wall are both good floor.
+					local rayOK = true
+					if rp then
+						local dA = (X + lift) - (farA + lift)
+						local dB = (farB + lift) - (X + lift)
+						if dA.Magnitude > 1e-4 and workspace:Raycast(farA + lift, dA, rp) then rayOK = false end
+						if rayOK and dB.Magnitude > 1e-4 and workspace:Raycast(X + lift, dB, rp) then rayOK = false end
+					end
+					if rayOK
+						and Contour.chordInside(L, farA, X, c.chordSlack)
 						and Contour.chordInside(L, X, farB, c.chordSlack) then
 						A[wA] = X; B[wB] = X
 						dead[o.idx] = true
