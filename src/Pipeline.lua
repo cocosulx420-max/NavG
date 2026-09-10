@@ -319,20 +319,33 @@ function Pipeline.measure(result: any): any
 	local step = result.config.bake.step or 0.5
 	for _, L in ipairs(result.loops) do
 		local poly, pts, nP, n = L.poly, L.pts, #L.poly, #L.pts
-		local function nearest(q: Vector3): number
-			local bi, bd = 1, math.huge
-			for i = 1, nP do
+		-- MATCH CORNERS TO RAW NODES MONOTONICALLY. A nearest-node search over the
+		-- whole loop is wrong wherever the raw boundary revisits a position, which
+		-- a pinch does: two corners then map to raw indices in the wrong order and
+		-- the forward walk wraps almost the entire loop, reporting a deviation
+		-- dozens of studs wide on a two stud edge. Corners appear in the same order
+		-- as the nodes they came from, so the cursor may only ever advance.
+		local cursor = 1
+		local function nextNode(q: Vector3): number
+			local bi, bd = cursor, math.huge
+			for s = 0, nP - 1 do
+				local i = ((cursor + s - 1) % nP) + 1
 				local d = (poly[i] - q).Magnitude
 				if d < bd then bi, bd = i, d end
+				if bd < 1e-6 then break end
 			end
+			cursor = bi
 			return bi
 		end
+		local first = nextNode(pts[1])
 		for i = 1, (L.closed and n or n - 1) do
 			local A, B = pts[i], pts[(i % n) + 1]
 			local d = B - A
 			if d.Magnitude > 1e-6 then
 				local e = d.Unit
-				local k, stop, w, guard = nearest(A), nearest(B), 0, 0
+				local kStart = cursor
+				local stopAt = (i == n) and first or nextNode(B)
+				local k, stop, w, guard = kStart, stopAt, 0, 0
 				repeat
 					local rr = poly[k] - A
 					local dist = (rr - e * rr:Dot(e)).Magnitude
