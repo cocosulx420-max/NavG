@@ -52,13 +52,18 @@ Pipeline.OVERRIDES = {
 	-- Raised only so the clamp stays coherent once mergeMin moves. Still far below
 	-- the 1.77 studs that let a 4 stud link fold into a 35 stud run.
 	mergeMax = 1.2,
+	-- 1.5, below minWidth's 2.0. minWidth is a standing agent's shoulders; this
+	-- decides whether a region is worth tracing at all, and the crawl spaces this
+	-- gate exists to keep are narrower than shoulders by definition. case5's is
+	-- 1.5 studs across, so at 2.0 it was discarded and its loop never drawn.
+	traceMinWidth = 1.5,
 } :: { [string]: any }
 
 -- The parameters each stage reads. Used to snapshot what a run actually used,
 -- so a result is self-describing.
 local BAKE_KEYS = {
 	"step", "maxSlope", "clearCap", "minClearance", "flushTol", "probeRadius",
-	"minWidth", "regionAngle", "regionPlanarity", "bandHeight", "standHeight",
+	"minWidth", "traceMinWidth", "regionAngle", "regionPlanarity", "bandHeight", "standHeight",
 	"crouchHeight", "connectivity", "faceAngle",
 }
 local SIMPLIFY_KEYS = {

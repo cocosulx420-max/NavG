@@ -26,10 +26,6 @@ local DIR4 = { {1,0}, {0,1}, {-1,0}, {0,-1} }
 -- the four corner directions, probed so a diagonal touch reads as CONNECTED
 local DIAG = { {1,1}, {-1,1}, {-1,-1}, {1,-1} }
 
--- A region too small to stand a footprint in is a fragment, not a surface, and
--- tracing it yields a ring of three or four nodes that describes nothing. The
--- test is LocalGrid's own: area against minWidth squared, the agent's shoulder
--- width, so the cutoff is the same one that already prunes narrow strips.
 -- WIDTH, NOT AREA. This used to compare the region's cell count against
 -- minWidth squared, which is an area test wearing a width test's name: it asks
 -- whether a region is BIG, and a small region that is perfectly wide enough to
