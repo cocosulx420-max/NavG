@@ -294,13 +294,21 @@ end
 -- nodes whose in and out degree already disagree, so a healthy loop can never
 -- be damaged by it.
 --
--- SEAM_TOL is probeRadius * step, the same distance the rest of the pipeline
--- calls "the same neighbour", and it is below one step, so two distinct nodes on
--- one grid can never merge.
+-- SEAM_TOL reaches FURTHER THAN ONE STEP, which is only safe because of what it
+-- is allowed to touch. Real seam gaps measure just over a step -- 0.500, 0.504
+-- and 0.705 studs in r004 -- so a tolerance below one step refuses every one of
+-- them and leaves the region as open paths rather than a polygon.
+--
+-- The protection is not the distance. It is that this tier only ever considers
+-- nodes whose in and out degree already disagree, and only pairs them when their
+-- imbalances have OPPOSITE sign, so it can only ever join an end that is missing
+-- an outgoing edge to one missing an incoming edge. Every node on a healthy loop
+-- is balanced and is never a candidate, whatever it is standing next to.
 local WELD_EPS = 0.01
+local SEAM_STEPS = 1.6
 
 function Boundary.weld(faces: {any}, step: number)
-	local seamTol = 0.75 * step
+	local seamTol = SEAM_STEPS * step
 	local ids = {}
 	local pos: {Vector3} = {}
 	local hash: { [string]: {number} } = {}
