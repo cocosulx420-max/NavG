@@ -306,61 +306,49 @@ function Pipeline.stamp(result: any): Instance
 	return v
 end
 
--- WORST PERPENDICULAR DISTANCE FROM THE RAW BOUNDARY TO THE SIMPLIFIED ONE.
+-- WORST DISTANCE FROM THE RAW BOUNDARY TO THE SIMPLIFIED ONE.
 --
 -- The number that says whether the polygons still describe the floor. Every
 -- other statistic counts things; this one measures error, and a merge that
 -- wanders off a floor edge shows up here and nowhere else -- not in the corner
 -- count, and not in the raycast validator, because leaving a floor hits nothing.
 --
--- O(corners * raw nodes) per loop, so it is a separate call and not part of run.
+-- MEASURED PER RAW NODE AGAINST THE WHOLE POLYGON, never per edge against a span
+-- of raw nodes. Pairing a simplified edge with the raw nodes it covers needs the
+-- two to run in the same order, and they do not: where a boundary pinches, the
+-- raw walk goes out along a spur and back, and consecutive corners land on raw
+-- indices that run backwards. case3 has such a pinch, and the span walk wrapped
+-- almost the whole loop there and reported 29.9 studs of error on a 2.5 stud
+-- edge. Asking instead how far each raw node sits from the nearest simplified
+-- edge needs no correspondence at all and cannot be fooled by one.
+--
+-- O(raw nodes * corners) per loop, so it is a separate call and not part of run.
 function Pipeline.measure(result: any): any
 	local worst, where, over = 0, nil, 0
 	local step = result.config.bake.step or 0.5
+	local limit = step * 1.1
 	for _, L in ipairs(result.loops) do
-		local poly, pts, nP, n = L.poly, L.pts, #L.poly, #L.pts
-		-- MATCH CORNERS TO RAW NODES MONOTONICALLY. A nearest-node search over the
-		-- whole loop is wrong wherever the raw boundary revisits a position, which
-		-- a pinch does: two corners then map to raw indices in the wrong order and
-		-- the forward walk wraps almost the entire loop, reporting a deviation
-		-- dozens of studs wide on a two stud edge. Corners appear in the same order
-		-- as the nodes they came from, so the cursor may only ever advance.
-		local cursor = 1
-		local function nextNode(q: Vector3): number
-			local bi, bd = cursor, math.huge
-			for s = 0, nP - 1 do
-				local i = ((cursor + s - 1) % nP) + 1
-				local d = (poly[i] - q).Magnitude
-				if d < bd then bi, bd = i, d end
-				if bd < 1e-6 then break end
+		local poly, pts, n = L.poly, L.pts, #L.pts
+		local last = L.closed and n or n - 1
+		for _, q in ipairs(poly) do
+			local best = math.huge
+			for i = 1, last do
+				local a = pts[i]
+				local d = pts[(i % n) + 1] - a
+				local dd = d:Dot(d)
+				local t = dd > 1e-12 and math.clamp((q - a):Dot(d) / dd, 0, 1) or 0
+				local dist = (q - (a + d * t)).Magnitude
+				if dist < best then best = dist end
+				if best <= 1e-6 then break end
 			end
-			cursor = bi
-			return bi
-		end
-		local first = nextNode(pts[1])
-		for i = 1, (L.closed and n or n - 1) do
-			local A, B = pts[i], pts[(i % n) + 1]
-			local d = B - A
-			if d.Magnitude > 1e-6 then
-				local e = d.Unit
-				local kStart = cursor
-				local stopAt = (i == n) and first or nextNode(B)
-				local k, stop, w, guard = kStart, stopAt, 0, 0
-				repeat
-					local rr = poly[k] - A
-					local dist = (rr - e * rr:Dot(e)).Magnitude
-					if dist > w then w = dist end
-					k = (k % nP) + 1
-					guard += 1
-				until k == stop or guard > nP
-				if w > step * 1.1 then over += 1 end
-				if w > worst then
-					worst = w
-					where = ("r%03d loop%d edge%d, len %.1f"):format(L.region, L.index, i, d.Magnitude)
-				end
+			if best > limit then over += 1 end
+			if best > worst then
+				worst = best
+				where = ("r%03d loop%d, raw node at (%.1f,%.1f,%.1f)"):format(L.region, L.index, q.X, q.Y, q.Z)
 			end
 		end
 	end
+	-- `over` counts RAW NODES beyond a step, not edges
 	return { worst = worst, where = where, overStep = over }
 end
 
