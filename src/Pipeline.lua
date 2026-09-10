@@ -38,6 +38,20 @@ Pipeline.OVERRIDES = {
 	-- the angle when the drift ceiling was 2.0 studs is exactly what let a 4 stud
 	-- link fold into a 35 stud run and stop describing the floor.
 	mergeAngle = 30,
+	-- 2.0, against PathSimplify's own 1.5. A diagonal boundary quantised at half
+	-- a step comes out as runs joined by lateral links, and on case5 those links
+	-- measure 1.80 studs -- sqrt(1.5^2 + 1^2), a three-by-two lattice move. At
+	-- 1.5 every one of them survived and the line visibly wobbled: r001 loop3
+	-- alone kept 62 corners with 45 shallow turns.
+	--
+	-- The collinearity pass cannot help here. A jog's two vertices only cancel
+	-- as a PAIR, and dissolving either alone swings the line by the whole offset,
+	-- which is why the drift bound refuses it. Widening the jog is the only pass
+	-- that can take both at once.
+	--
+	-- 2.0 takes r001 loop3 to 35 corners and halves the shallow turns across the
+	-- map, at no cost in worst deviation. 2.5 and 3.0 buy almost nothing more.
+	jogMax = 2.0,
 } :: { [string]: any }
 
 -- The parameters each stage reads. Used to snapshot what a run actually used,
