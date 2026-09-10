@@ -262,11 +262,24 @@ end
 --
 -- `validate` is the reason this can afford to be aggressive: the caller passes a
 -- raycast, and any merge that would put the line through a wall is refused
--- whatever the numbers say.
+-- whatever the numbers say. It does NOT stand in for the drift bound: drifting
+-- off the edge of a floor hits nothing, so a merge can be geometrically clear
+-- and still stop describing the floor.
+--
+-- mergeMax IS THE LOAD-BEARING GUARD, not mergeAngle. mergeRel of a long span is
+-- a large absolute number -- 0.05 of 39 studs is nearly 2 -- so on anything long
+-- the ceiling is what actually decides. At 2.0 a 4 stud link folded into a 35
+-- stud run and the line ended up 1.77 studs, three and a half cells, off the
+-- boundary it was meant to describe; the turn was 29 degrees and only mergeAngle
+-- refused it, which meant the protection vanished the moment that was loosened.
+-- Just over one step is the right ceiling: enough to absorb the quantisation the
+-- boundary already carries, never enough to reshape it by a cell. Holds the
+-- boundary to 0.5 studs even at 60 degrees of angle tolerance, and costs one
+-- corner in 675 at the default 12.
 PathSimplify.mergeAngle = 12    -- degrees; a turn under this is a candidate
 PathSimplify.mergeRel = 0.05   -- allowed drift as a fraction of merged length
 PathSimplify.mergeMin = 0.35   -- studs; drift floor for short spans
-PathSimplify.mergeMax = 2.0    -- studs; drift ceiling however long the span
+PathSimplify.mergeMax = 0.6    -- studs; drift ceiling however long the span
 
 -- worst perpendicular distance of orig[from..to] from the chord, walking forward
 local function spanDev(orig: {Vector3}, nOrig: number, from: number, to: number,
