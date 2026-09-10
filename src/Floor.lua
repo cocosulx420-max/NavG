@@ -1,13 +1,13 @@
 --!strict
 -- NVGN.Floor — walkable surface extraction
 --
--- Produces one surfel per 1-stud walkable cell. The SVO finds candidates
--- (solid voxels with empty space above); each candidate's top face is walked at
--- 1-stud resolution and a raycast onto the REAL part gives exact height + normal
--- (so ramps are smooth, not stair-stepped, and a collapsed node covering several
--- parts is sampled per-cell). Clearance = precise overlap probe (embedded-origin
--- detection) + upward raycast to the real ceiling; terrain via a separate ray pair.
--- Only walkable surfels are kept (steep faces feed the later boundary stage).
+-- Produces one surfel per 1-stud walkable cell. The SVO finds candidates (solid
+-- voxels with empty space above); each candidate's top face is walked at 1-stud
+-- resolution and a raycast onto the real part gives exact height and normal, so
+-- ramps are smooth and a collapsed node covering several parts is sampled per
+-- cell. Clearance is an overlap probe for embedded origins plus an upward
+-- raycast to the ceiling, with terrain handled by its own ray pair. Only
+-- walkable surfels are kept.
 
 local SVO = require(script.Parent:WaitForChild("SVO"))
 
@@ -25,10 +25,8 @@ export type Surfel = {
 	clip: boolean,
 }
 
--- NOTE: horizontal "width" (distance to nearest wall) is intentionally NOT baked.
--- It is redundant with the navmesh boundary edges and is derived cheaply at
--- pathfinding time (portal-edge length + funnel radius offset). Clearance IS
--- baked because vertical headroom cannot be recovered from 2D boundaries.
+-- Clearance is baked, horizontal width is not: width is recoverable from the
+-- navmesh boundary edges, vertical headroom is not.
 
 export type Config = {
 	leaf: number?, maxSlope: number?, agentHeight: number?,

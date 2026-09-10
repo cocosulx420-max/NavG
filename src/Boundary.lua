@@ -1,885 +1,1120 @@
 --!strict
--- NavGen.Boundary — clean outlines from the local grids, by DESIGN.md's method.
+-- NVGN.Boundary -- trace a region's boundary on LocalGrid's OWN data.
 --
--- The input is LocalGrid's per-part, part-aligned cell masks. The method is
--- DESIGN.md steps 3-5, 7 and 8: chain the boundary edges of a mask, grow a
--- best-fit line along the boundary cells while the MAXIMUM residual stays under
--- a cell, and take corners as the places where that fit failed.
+-- Stage one of the LocalGrid-native tracer: cells -> directed boundary faces ->
+-- closed loops. No lattice of its own, so nothing is re-quantized and no cell
+-- collapses into a shared slot.
 --
--- THIS MODULE NEVER ASKS A PART ANYTHING. No CFrames, no face planes, no sizes,
--- no raycasts, no overlap queries. It reads cell centres and nothing else. That
--- is DESIGN.md's central rule and it is not an aesthetic one: a Union or a
--- MeshPart has no readable planar face, and interpenetrating parts report faces
--- that are not surfaces. An earlier version of this module took its lines from
--- the side planes of whichever part killed each cell. It was more accurate on
--- SmallMap -- and it is exactly the approach DESIGN.md records as having given
--- this project hell on real maps, so it is gone.
+-- A face is emitted where a cell has no same-region neighbour, and the test is
+-- SYMMETRIC: adjacency is collected as undirected pairs first and both sides are
+-- marked interior, so the two cells can never disagree about the face between
+-- them. The per-cell masks are read for labelling only.
 --
--- WHY THE FIT IS CHEAP HERE, WHICH IS THE POINT OF THE LOCAL GRIDS. On a
--- world-aligned raster every rotated part staircases, so the fit is doing heavy
--- reconstruction everywhere and its tolerance is load-bearing everywhere. On a
--- part-aligned grid the host's own rim already lies along whole lattice lines,
--- so the fit reproduces it with zero residual and has nothing to undo. What is
--- left for the fit is the genuinely hard case: the footprint of some OTHER part
--- crossing this one's lattice at an angle. Same method as DESIGN.md, applied to
--- a fraction of the edges, which is why the tolerances stop fighting.
+-- Symmetry is the whole invariant. classifyNodes probes from each cell's own
+-- plane with its own tolerance, so cell A can find B while B does not find A.
+-- Emitting straight from those masks puts a T-junction in the boundary, which
+-- leaves a node a walk can enter but not leave, and one such node unbalances the
+-- rest of the region and shreds it into open paths.
 --
--- SAFETY. The only morphology is erosion. Lines are biased inward (step 5) and
--- polygons are fitted to cell centres, so the boundary sits at or inside the
--- walkable cells and never outside them. Erosion can remove walkable ground but
--- can never invent connectivity, so no amount of it welds two rooms through a
--- wall. Nothing here dilates.
+-- Faces are welded on exact position: a face corner is bit identical to its
+-- neighbour's, across part seams included, so chaining is a hash join.
 
 local Boundary = {}
 
-export type Config = {
-	-- Fallback grids only. A world-aligned grid can hold two surfaces at once
-	-- (a mesh with a ledge), so its trace needs to know what counts as a cliff.
-	-- A block grid is a single plane and never consults this.
-	stepTol: number?,
+-- classifyNodes writes its bits over these, in this order
+local DIR4 = { {1,0}, {0,1}, {-1,0}, {0,-1} }
+-- the four corner directions, probed so a diagonal touch reads as CONNECTED
+local DIAG = { {1,1}, {-1,1}, {-1,-1}, {1,-1} }
 
-	-- STEP 4. The maximum perpendicular distance a boundary cell centre may sit
-	-- from its segment's line. One cell: anything the mask can express as
-	-- "straight" is straight.
-	fitTol: number?,
-
-	-- STEP 8. Runs shorter than this are absorbed, and runs whose directions
-	-- agree to within collinearDeg are merged -- both BEFORE corners are
-	-- intersected, because short runs are what make an intersection unstable.
-	minSegLen: number?,
-	collinearDeg: number?,
-
-	-- STEP 7. An acute corner throws two lines' intersection arbitrarily far
-	-- out -- the classic miter spike. Past this distance from the corner it
-	-- replaces, bevel across instead.
-	miterLimit: number?,
-
-
-	-- How long a stretch of foreign-typed nodes a line may ignore before that
-	-- stretch counts as a boundary of its own. This is the doorway guard: below
-	-- it a speck is invisible, above it a wall cannot leap the opening.
-	maxGap: number?,
-}
-
-local DEFAULT = {
-	stepTol = 2.2,
-	fitTol = 1.0,
-	minSegLen = 1.0,
-	collinearDeg = 5,
-	miterLimit = 3.0,
-	maxGap = 3.0,
-}
-
-local function merged(cfg): any
-	local c = {}
-	for k, v in pairs(DEFAULT) do c[k] = v end
-	if cfg then for k, v in pairs(cfg) do if v ~= nil then c[k] = v end end end
-	return c
-end
-
---------------------------------------------------------------------------
--- 2D helpers, in the grid's own face coordinates
---------------------------------------------------------------------------
-
-type P2 = { x: number, z: number }
-
-local function sub(a: P2, b: P2): P2 return { x = a.x - b.x, z = a.z - b.z } end
-local function dot(a: P2, b: P2): number return a.x * b.x + a.z * b.z end
-local function len(a: P2): number return math.sqrt(a.x * a.x + a.z * a.z) end
-
--- Interior lies to the LEFT of travel, so this is the outward side.
-local function outwardOf(d: P2): P2
-	local m = len(d)
-	if m < 1e-9 then return { x = 0, z = 0 } end
-	return { x = d.z / m, z = -d.x / m }
-end
-
--- Total least squares: the principal axis of the point set. NOT ordinary least
--- squares -- a boundary run can be near-vertical in the grid's frame, where
--- fitting one coordinate as a function of the other blows up.
---
--- Takes an explicit list of point INDICES rather than a range: the run that
--- straddles the loop's arbitrary start point wraps, and a range cannot express
--- that.
-local function fitLine(pts: {P2}, idx: {number}): (P2, P2)
-	local n = #idx
-	local sx, sz = 0, 0
-	for _, i in ipairs(idx) do sx += pts[i].x; sz += pts[i].z end
-	local cx, cz = sx / n, sz / n
-	local sxx, szz, sxz = 0, 0, 0
-	for _, i in ipairs(idx) do
-		local dx, dz = pts[i].x - cx, pts[i].z - cz
-		sxx += dx * dx; szz += dz * dz; sxz += dx * dz
+-- A region too small to stand a footprint in is a fragment, not a surface, and
+-- tracing it yields a ring of three or four nodes that describes nothing. The
+-- test is LocalGrid's own: area against minWidth squared, the agent's shoulder
+-- width, so the cutoff is the same one that already prunes narrow strips.
+local function liveRegions(data: any): { [number]: boolean }
+	local c = data.config
+	local minArea = (c.minWidth or 0) ^ 2
+	local cell = (c.step or 0.5) ^ 2
+	local out = {}
+	for r, n in ipairs(data.stats.regionSizes or {}) do
+		if n * cell >= minArea then out[r] = true end
 	end
-	-- larger eigenvalue of the 2x2 covariance, closed form
-	local tr, det = sxx + szz, sxx * szz - sxz * sxz
-	local disc = math.max(tr * tr * 0.25 - det, 0)
-	local lam = tr * 0.5 + math.sqrt(disc)
-	local dx, dz
-	if math.abs(sxz) > 1e-12 then
-		dx, dz = lam - szz, sxz
-	elseif sxx >= szz then
-		dx, dz = 1, 0
-	else
-		dx, dz = 0, 1
+	return out
+end
+Boundary.liveRegions = liveRegions
+
+local function nodeKey(p: Vector3): string
+	return string.format("%d:%d:%d",
+		math.round(p.X * 256), math.round(p.Y * 256), math.round(p.Z * 256))
+end
+Boundary.nodeKey = nodeKey
+
+-- Where the neighbour in local direction d would sit, in world space.
+local function neighbourPos(g: any, cell: any, d: {number}): Vector3
+	if not g.fallback and g.u and g.v then
+		return cell.pos + g.u * (d[1] * g.step) + g.v * (d[2] * g.step)
 	end
-	-- ORIENT ALONG TRAVEL. A principal axis has no sign -- PCA is just as happy
-	-- to hand back the reverse direction -- but everything downstream reads the
-	-- sign as meaning something. outwardOf() assumes interior-on-the-left, which
-	-- is only true if dir runs the way the loop was walked; a flipped segment
-	-- gets its "outward" normal pointing INTO the floor, and the inward bias
-	-- then pushes the line the wrong way, straight through the wall.
-	local sxs = pts[idx[n]].x - pts[idx[1]].x
-	local szs = pts[idx[n]].z - pts[idx[1]].z
-	if dx * sxs + dz * szs < 0 then dx, dz = -dx, -dz end
-	local m = math.sqrt(dx * dx + dz * dz)
-	if m < 1e-12 then dx, dz, m = 1, 0, 1 end
-	return { x = cx, z = cz }, { x = dx / m, z = dz / m }
+	return cell.pos + Vector3.new(d[1] * g.step, 0, d[2] * g.step)
 end
 
-local function maxResidual(pts: {P2}, idx: {number}, c: P2, d: P2): number
-	local nx, nz = -d.z, d.x
-	local worst = 0
-	for _, i in ipairs(idx) do
-		local r = math.abs((pts[i].x - c.x) * nx + (pts[i].z - c.z) * nz)
-		if r > worst then worst = r end
+-- Which of `cell`'s four directions faces the point `p`. Used to mark the far
+-- side of an adjacency, whose own lattice may be rotated or offset against this
+-- one.
+--
+-- CAPPED on probeRadius. Nearest-of-four alone is not good enough: where the far
+-- cell's lattice is rotated against this one, the nearest direction can be the
+-- wrong one, and marking it interior deletes a face that genuinely exists. That
+-- is what rounds a square corner off into a diagonal, because the corner cell's
+-- own exposed face is suppressed and the boundary walks around a cell that is
+-- there.
+--
+-- Returning nil leaves the far side unmarked, which can leave an asymmetric pair
+-- the walk has to close later. That is the cheaper failure by a wide margin:
+-- uncapped cost 1173 corners to save 21 asymmetric nodes.
+local function directionTo(g: any, cell: any, p: Vector3, r2: number): number?
+	local best, bd = nil, math.huge
+	for bit, d in ipairs(DIR4) do
+		local dd = (neighbourPos(g, cell, d) - p).Magnitude
+		if dd < bd then bd = dd; best = bit end
 	end
-	return worst
+	if best and bd * bd <= r2 then return best end
+	return nil
 end
 
---------------------------------------------------------------------------
--- STEP 3 — trace the contour of a cell mask
+-- One directed segment per boundary face, wound so the region lies on the LEFT.
 --
--- Boundary EDGES are chained rather than boundary cells walked: the boundary of
--- a set of cells is a closed loop by construction, so there is no open end to
--- chase and no tolerance involved. The ordered cells the fit needs fall out of
--- the edge order.
+-- The outward direction of the face is o, and the travel direction is up x o:
+-- up x (up x o) is -o, so the region side ends up on the left of travel. `up` is
+-- the surface normal rather than u x v, which keeps the winding consistent even
+-- where a grid's in-plane frame is left-handed.
 --
--- `cliff(a, b)` reports that two lattice-adjacent cells are not continuous
--- ground even though both are in the mask. On a block grid it is never true;
--- on a fallback grid it is what stops a polygon spanning a mesh's ledge.
---------------------------------------------------------------------------
+-- Pass one collects adjacency and marks BOTH cells interior in the direction
+-- that faces the other. Pass two emits a face for every direction left unmarked.
+-- A neighbour in a different region is not adjacency, so a region seam is a
+-- boundary like any wall or drop.
+function Boundary.faces(data: any)
+	local c = data.config
+	local step = c.step
+	local r2 = (c.probeRadius * step) ^ 2
+	local tol = c.flushTol
 
-local DIRS = { { 1, 0 }, { 0, 1 }, { -1, 0 }, { 0, -1 } }
-
--- lattice corners of cell (u,v)'s edge in direction di, oriented so the loop
--- runs with the interior on its left
-local function cornersOf(u: number, v: number, di: number)
-	if di == 1 then return { u + 1, v }, { u + 1, v + 1 }
-	elseif di == 2 then return { u + 1, v + 1 }, { u, v + 1 }
-	elseif di == 3 then return { u, v + 1 }, { u, v }
-	else return { u, v }, { u + 1, v } end
-end
-
-local function traceMask(cells: {any}, index: {[string]: any}, cliff: ((any, any) -> boolean)?)
-	local segs: {any} = {}
-	local byStart: {[string]: {any}} = {}
-	for _, cell in ipairs(cells) do
-		for di, d in ipairs(DIRS) do
-			local nu, nv = cell.ui + d[1], cell.vi + d[2]
-			local nb = index[nu .. ":" .. nv]
-			if not nb or (cliff and cliff(cell, nb)) then
-				local a, b = cornersOf(cell.ui, cell.vi, di)
-				local s = { a = a, b = b, cell = cell, nu = nu, nv = nv, dir = d }
-				segs[#segs + 1] = s
-				local k = a[1] .. "," .. a[2]
-				local bucket = byStart[k]
-				if not bucket then bucket = {}; byStart[k] = bucket end
-				bucket[#bucket + 1] = s
+	-- world XZ buckets, so a neighbour is found without knowing which grid owns it
+	local keep = liveRegions(data)
+	local live: { [string]: {any} } = {}
+	for _, g in ipairs(data.grids) do
+		for _, cell in ipairs(g.cells) do
+			if cell.region and keep[cell.region] then
+				local k = math.floor(cell.pos.X) .. ":" .. math.floor(cell.pos.Z)
+				local b = live[k]; if not b then b = {}; live[k] = b end
+				b[#b + 1] = { cell = cell, g = g }
 			end
 		end
 	end
 
-	-- CHAINING AT A JUNCTION is not a free choice. A cliff between two cells
-	-- that are both in the mask emits an edge from EACH side, on the same
-	-- lattice edge in opposite directions, because the upper rim and the lower
-	-- rim are two different boundaries that coincide in plan. The outline
-	-- therefore has zero-width slits whose ends are vertices with four edges
-	-- leaving them, and taking whichever candidate came first there splices one
-	-- rim onto the other and drops degenerate slivers out of the walk.
-	--
-	-- Standard face traversal of an embedded planar graph fixes it: arriving
-	-- along an edge, leave on the next edge CLOCKWISE from it. With the interior
-	-- kept on the left, that walks each rim whole and turns a slit around at its
-	-- tip.
-	local function angle(s: any): number
-		return math.atan2(s.b[2] - s.a[2], s.b[1] - s.a[1])
+	local interior: { [any]: {boolean} } = {}
+	local diag: { [any]: {[any]: boolean} } = {}
+	local function mark(cell: any, bit: number)
+		local t = interior[cell]
+		if not t then t = {}; interior[cell] = t end
+		t[bit] = true
 	end
-	local TAU = math.pi * 2
-	local used: {[any]: boolean} = {}
-	local loops: {{any}} = {}
-	for _, s0 in ipairs(segs) do
-		if not used[s0] then
-			local loop, cur = {}, s0
+
+	local stats = { faces = 0, cells = 0, wall = 0, drop = 0, edge = 0,
+		pairs_ = 0, asymmetric = 0, diagonals = 0 }
+
+	for _, g in ipairs(data.grids) do
+		for _, cell in ipairs(g.cells) do
+			if cell.region and keep[cell.region] then
+				for bit, d in ipairs(DIR4) do
+					local p = neighbourPos(g, cell, d)
+					local bx, bz = math.floor(p.X), math.floor(p.Z)
+					local found, fg = nil, nil
+					local bd = math.huge
+					for ox = -1, 1 do for oz = -1, 1 do
+						for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
+							local q = e.cell
+							if q ~= cell and q.region == cell.region then
+								local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
+								local dd = dx * dx + dz * dz
+								if dd <= r2 and math.abs(q.pos.Y - p.Y) <= tol and dd < bd then
+									bd = dd; found = q; fg = e.g
+								end
+							end
+						end
+					end end
+					if found then
+						stats.pairs_ += 1
+						mark(cell, bit)
+						-- the far side, in ITS own direction indexing
+						local back = directionTo(fg, found, cell.pos, r2)
+						if back then mark(found, back) else stats.asymmetric += 1 end
+					end
+				end
+				-- 8-CONNECTED, for pinches only. A diagonal neighbour shares no face,
+				-- so it can never suppress one -- doing that would punch holes in the
+				-- boundary. What it decides is what happens where two cells touch at a
+				-- single corner: under 4-connectivity that corner is a pinch the walk
+				-- has to guess at, and under 8 the two cells are connected, so the
+				-- boundary passes around the pair instead of between them.
+				for _, d in ipairs(DIAG) do
+					local p = neighbourPos(g, cell, d)
+					local bx, bz = math.floor(p.X), math.floor(p.Z)
+					for ox = -1, 1 do for oz = -1, 1 do
+						for _, en in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
+							local q = en.cell
+							if q ~= cell and q.region == cell.region then
+								local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
+								if dx * dx + dz * dz <= r2 and math.abs(q.pos.Y - p.Y) <= tol then
+									local t = diag[cell]
+									if not t then t = {}; diag[cell] = t end
+									t[q] = true
+									local t2 = diag[q]
+									if not t2 then t2 = {}; diag[q] = t2 end
+									t2[cell] = true
+									stats.diagonals += 1
+								end
+							end
+						end
+					end end
+				end
+			end
+		end
+	end
+
+	local out = {}
+	for _, g in ipairs(data.grids) do
+		local u = g.u or Vector3.xAxis
+		local v = g.v or Vector3.zAxis
+		local up = g.n or u:Cross(v)
+		for _, cell in ipairs(g.cells) do
+			local r = cell.region
+			if r and keep[r] then
+				local mine = interior[cell]
+				local wm, dm, em = cell.wallMask or 0, cell.dropMask or 0, cell.edgeMask or 0
+				local any = false
+				for bit, d in ipairs(DIR4) do
+					if not (mine and mine[bit]) then
+						local list = out[r]
+						if not list then list = {}; out[r] = list end
+						local o = (u * d[1] + v * d[2])
+						local ctr = cell.pos + o * (step / 2)
+						local t = up:Cross(o)
+						local m = bit32.lshift(1, bit - 1)
+						local kind = (bit32.band(em, m) ~= 0 and "edge")
+							or (bit32.band(wm, m) ~= 0 and "wall")
+							or (bit32.band(dm, m) ~= 0 and "drop") or "none"
+						if stats[kind] then stats[kind] += 1 end
+						stats.faces += 1
+						any = true
+						list[#list + 1] = {
+							a = ctr - t * (step / 2),
+							b = ctr + t * (step / 2),
+							up = up, cell = cell, kind = kind, dir = bit,
+						}
+					end
+				end
+				if any then stats.cells += 1 end
+			end
+		end
+	end
+	return out, stats, diag
+end
+
+-- The 8-CONNECTED border set: every cell missing a neighbour in any of the eight
+-- directions, not just the four it has faces on.
+--
+-- A cell whose four faces are all covered can still touch empty space at a
+-- corner. It contributes no face, so face tracing never sees it and it reads as
+-- interior, which leaves gaps along every diagonal. It is a border cell all the
+-- same, so it is reported here separately from the tracing.
+--
+-- This does NOT feed the loops. A diagonal touch has no edge to emit, and the
+-- chaining depends on faces meeting at shared corners.
+function Boundary.borderCells(data: any)
+	local c = data.config
+	local step = c.step
+	local r2 = (c.probeRadius * step) ^ 2
+	local tol = c.flushTol
+	local keep = liveRegions(data)
+	local live: { [string]: {any} } = {}
+	for _, g in ipairs(data.grids) do
+		for _, cell in ipairs(g.cells) do
+			if cell.region and keep[cell.region] then
+				local k = math.floor(cell.pos.X) .. ":" .. math.floor(cell.pos.Z)
+				local b = live[k]; if not b then b = {}; live[k] = b end
+				b[#b + 1] = cell
+			end
+		end
+	end
+	local function hasNeighbour(g, cell, d)
+		local p = neighbourPos(g, cell, d)
+		local bx, bz = math.floor(p.X), math.floor(p.Z)
+		for ox = -1, 1 do for oz = -1, 1 do
+			for _, q in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
+				if q ~= cell and q.region == cell.region then
+					local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
+					if dx * dx + dz * dz <= r2 and math.abs(q.pos.Y - p.Y) <= tol then
+						return true
+					end
+				end
+			end
+		end end
+		return false
+	end
+	local out, stats = {}, { border = 0, ortho = 0, diagonalOnly = 0 }
+	for _, g in ipairs(data.grids) do
+		for _, cell in ipairs(g.cells) do
+			if cell.region and keep[cell.region] then
+				local ortho, diagonal = false, false
+				for _, d in ipairs(DIR4) do
+					if not hasNeighbour(g, cell, d) then ortho = true; break end
+				end
+				if not ortho then
+					for _, d in ipairs(DIAG) do
+						if not hasNeighbour(g, cell, d) then diagonal = true; break end
+					end
+				end
+				if ortho or diagonal then
+					out[cell] = { region = cell.region, grid = g, ortho = ortho }
+					stats.border += 1
+					if ortho then stats.ortho += 1 else stats.diagonalOnly += 1 end
+				end
+			end
+		end
+	end
+	return out, stats
+end
+
+-- Give every face endpoint a canonical node id.
+--
+-- Two tiers, because the endpoints fail to coincide for two unrelated reasons.
+-- WELD_EPS collapses float noise: a face corner and its neighbour's agree to
+-- about 1e-5 studs, which straddles any fixed rounding boundary and would
+-- otherwise split one node in two. SEAM_TOL then stitches genuine gaps where a
+-- region crosses from one part's grid to another, and it is applied ONLY to
+-- nodes whose in and out degree already disagree, so a healthy loop can never
+-- be damaged by it.
+--
+-- SEAM_TOL is probeRadius * step, the same distance the rest of the pipeline
+-- calls "the same neighbour", and it is below one step, so two distinct nodes on
+-- one grid can never merge.
+local WELD_EPS = 0.01
+
+function Boundary.weld(faces: {any}, step: number)
+	local seamTol = 0.75 * step
+	local ids = {}
+	local pos: {Vector3} = {}
+	local hash: { [string]: {number} } = {}
+	local function bkey(p: Vector3, s: number): string
+		return math.floor(p.X / s) .. ":" .. math.floor(p.Y / s) .. ":" .. math.floor(p.Z / s)
+	end
+	local function canonical(p: Vector3): number
+		local bx = math.floor(p.X / WELD_EPS)
+		local by = math.floor(p.Y / WELD_EPS)
+		local bz = math.floor(p.Z / WELD_EPS)
+		for ox = -1, 1 do for oy = -1, 1 do for oz = -1, 1 do
+			for _, id in ipairs(hash[(bx+ox)..":"..(by+oy)..":"..(bz+oz)] or {}) do
+				if (pos[id] - p).Magnitude <= WELD_EPS then return id end
+			end
+		end end end
+		pos[#pos + 1] = p
+		local id = #pos
+		local k = bkey(p, WELD_EPS)
+		local b = hash[k]; if not b then b = {}; hash[k] = b end
+		b[#b + 1] = id
+		return id
+	end
+	for i, f in ipairs(faces) do
+		ids[i] = { a = canonical(f.a), b = canonical(f.b) }
+	end
+
+	-- second tier: only nodes that are already unbalanced
+	local indeg, outdeg = {}, {}
+	for _, e in ipairs(ids) do
+		outdeg[e.a] = (outdeg[e.a] or 0) + 1
+		indeg[e.b] = (indeg[e.b] or 0) + 1
+	end
+	local loose = {}
+	for id = 1, #pos do
+		if (indeg[id] or 0) ~= (outdeg[id] or 0) then loose[#loose + 1] = id end
+	end
+	local remap, stitched = {}, 0
+	for x = 1, #loose do
+		local i = loose[x]
+		if not remap[i] then
+			local best, bd = nil, seamTol
+			for y = x + 1, #loose do
+				local j = loose[y]
+				if not remap[j] then
+					local d = (pos[j] - pos[i]).Magnitude
+					-- opposite imbalance, or the merge just moves the problem
+					local si = (indeg[i] or 0) - (outdeg[i] or 0)
+					local sj = (indeg[j] or 0) - (outdeg[j] or 0)
+					if d <= bd and si * sj < 0 then best = j; bd = d end
+				end
+			end
+			if best then remap[best] = i; stitched += 1 end
+		end
+	end
+	if stitched > 0 then
+		for _, e in ipairs(ids) do
+			e.a = remap[e.a] or e.a
+			e.b = remap[e.b] or e.b
+		end
+	end
+	return ids, { nodes = #pos - stitched, stitched = stitched }
+end
+
+-- Chain one region's faces into closed loops.
+--
+-- Most nodes join exactly two faces and the walk is forced. Where more meet, the
+-- node is a PINCH: two cells of the same region touching at a single corner.
+--
+-- 8-CONNECTED, so a corner touch is a connection. The walk takes the SHALLOWEST
+-- turn there, which carries the boundary around the outside of the pair. Taking
+-- the sharpest instead cuts between them, which threads the boundary through a
+-- join that is not a gap and leaves a spurious notch a cell wide.
+--
+-- At an ordinary node there is only one unused continuation and the angle never
+-- comes into it.
+function Boundary.chain(faces: {any}, ids: {any}, cw: boolean?)
+	local outAt: { [number]: {number} } = {}
+	local inAt: { [number]: {number} } = {}
+	for i in ipairs(faces) do
+		local ka, kb = ids[i].a, ids[i].b
+		local b = outAt[ka]; if not b then b = {}; outAt[ka] = b end
+		b[#b + 1] = i
+		local c = inAt[kb]; if not c then c = {}; inAt[kb] = c end
+		c[#c + 1] = i
+	end
+
+	local used = {}
+	local loops, broken = {}, 0
+	local function pick(atKey: number, din: Vector3?, up: Vector3): number?
+		local cand = outAt[atKey]
+		if not cand then return nil end
+		local live = {}
+		for _, i in ipairs(cand) do
+			if not used[i] then live[#live + 1] = i end
+		end
+		if #live == 0 then return nil end
+		if #live == 1 or not din then return live[1] end
+		-- a pinch: keep the diagonally touching cells together by turning as
+		-- little as possible
+		local best, bestAng = nil, nil
+		for _, i in ipairs(live) do
+			local f = faces[i]
+			local dout = (f.b - f.a)
+			if dout.Magnitude > 1e-9 then
+				dout = dout.Unit
+				local rev = -din
+				local ang = math.atan2(rev:Cross(dout):Dot(up), rev:Dot(dout))
+				if ang <= 1e-9 then ang += 2 * math.pi end
+				if cw then ang = 2 * math.pi - ang end
+				if bestAng == nil or ang > bestAng then bestAng = ang; best = i end
+			end
+		end
+		return best or live[1]
+	end
+
+	for seed = 1, #faces do
+		if not used[seed] then
+			local seq, cur, din = {}, seed, nil
+			local startKey = ids[seed].a
+			local closed = false
 			while cur and not used[cur] do
 				used[cur] = true
-				loop[#loop + 1] = cur
-				local cands = byStart[cur.b[1] .. "," .. cur.b[2]]
-				local nxt, bestTurn = nil, math.huge
-				if cands then
-					local back = angle(cur) + math.pi
-					for _, s in ipairs(cands) do
-						if not used[s] then
-							local turn = (back - angle(s)) % TAU
-							-- straight back is the full turn, taken only when
-							-- nothing else is left: the tip of a slit
-							if turn <= 1e-9 then turn = TAU end
-							if turn < bestTurn then nxt, bestTurn = s, turn end
+				local f = faces[cur]
+				seq[#seq + 1] = cur
+				local endKey = ids[cur].b
+				local d = f.b - f.a
+				din = (d.Magnitude > 1e-9) and d.Unit or din
+				if endKey == startKey then closed = true; break end
+				cur = pick(endKey, din, f.up)
+			end
+			-- An open path is extended BACKWARDS from its seed as well. Without
+			-- this a single unbalanced node shreds the rest of the region: each
+			-- later seed lands mid-path and reports its own fragment, so one
+			-- defect is counted hundreds of times and the real count is hidden.
+			if not closed then
+				local head = startKey
+				while true do
+					local nxt = nil
+					for _, i in ipairs(inAt[head] or {}) do
+						if not used[i] then nxt = i; break end
+					end
+					if not nxt then break end
+					used[nxt] = true
+					table.insert(seq, 1, nxt)
+					head = ids[nxt].a
+				end
+				broken += 1
+			end
+			loops[#loops + 1] = { faces = seq, closed = closed }
+		end
+	end
+	table.sort(loops, function(x, y) return #x.faces > #y.faces end)
+	return loops, broken
+end
+
+-- Angles live on a 180-degree axis: a boundary direction has no head or tail.
+local function angDiff(a: number, b: number): number
+	local d = math.abs(a - b) % 180
+	return (d > 90) and (180 - d) or d
+end
+Boundary.angDiff = angDiff
+
+-- Hard corners: vertices the tangent window must not sample across.
+--
+-- Measured against the NET direction of the faces either side, never the single
+-- step between two faces. On a lattice every step turns by exactly 90 degrees,
+-- so a single-step test marks every vertex of a 45 degree staircase as a corner
+-- and shatters a run that is genuinely straight. Over a window the staircase's
+-- alternation cancels and its net direction is the diagonal, while a real L
+-- corner still reads 90 degrees.
+--
+-- Every vertex past the threshold is flagged. A window-based detector has width,
+-- so one geometric corner fires as a short run of flags, and every vertex in that
+-- run becomes a hard boundary for the fitting window.
+--
+-- The two ends of an open path are hard boundaries too: there is nothing beyond
+-- them to fit to.
+function Boundary.corners(trace: any, cfg: any?)
+	local W = (cfg and cfg.cornerWindow) or 3
+	local thr = math.cos(math.rad((cfg and cfg.cornerAngle) or 45))
+	local stats = { corners = 0, vertices = 0 }
+	for _, e in pairs(trace) do
+		for _, lp in ipairs(e.loops) do
+			local F = lp.faces
+			local n = #F
+			local dir = {}
+			for i, fi in ipairs(F) do
+				local f = e.faces[fi]
+				local d = f.b - f.a
+				dir[i] = (d.Magnitude > 1e-9) and d.Unit or Vector3.zero
+			end
+			-- how sharply the boundary turns at each vertex, as a dot product:
+			-- +1 straight on, 0 a right angle, -1 a reversal
+			local dot = {}
+			for v = 1, n do
+				stats.vertices += 1
+				local before, after = Vector3.zero, Vector3.zero
+				for x = 0, W - 1 do
+					local j = v - x
+					if lp.closed then j = ((j - 1) % n) + 1 elseif j < 1 then j = nil end
+					if j then before += dir[j] end
+				end
+				for x = 1, W do
+					local j = v + x
+					if lp.closed then j = ((j - 1) % n) + 1 elseif j > n then j = nil end
+					if j then after += dir[j] end
+				end
+				if before.Magnitude > 1e-6 and after.Magnitude > 1e-6 then
+					dot[v] = before.Unit:Dot(after.Unit)
+				end
+			end
+
+			local C = {}
+			for v = 1, n do
+				if dot[v] and dot[v] < thr then
+					C[v] = true
+					stats.corners += 1
+				end
+			end
+			if not lp.closed and not C[n] then
+				C[n] = true
+				stats.corners += 1
+			end
+			lp.corner = C
+			lp.turnDot = dot
+		end
+	end
+	return stats
+end
+
+-- A direction per FACE, fitted from the faces either side of it ALONG THE LOOP.
+--
+-- The window is arc length, not a radius in space, and it is clamped to less
+-- than half the loop. That is what makes a small ring safe: a spatial window
+-- wraps a ring smaller than itself and returns the ring's diameter instead of a
+-- local direction, so cells on opposite sides of a hole come back with the same
+-- tangent. An arc-length window cannot reach round to the far side.
+--
+-- The window is also TRUNCATED AT HARD CORNERS, so no fit ever samples across
+-- one. A window that straddles a corner averages the two edges into a direction
+-- belonging to neither, which rounds the corner off and leaves the weld nothing
+-- crisp to intersect. Truncated, the two edges meet at a real 90 degrees.
+--
+-- Fitted in the loop's own plane, from the mean of its faces' normals, so the
+-- two principal axes are a real 2-D fit rather than a 3-D one that spends a
+-- degree of freedom on the surface normal.
+function Boundary.tangents(trace: any, cfg: any?)
+	local window = (cfg and cfg.window) or 1.5
+	local step = (cfg and cfg.step) or 0.5
+	local k0 = math.max(1, math.round(window / step))
+	local stats = { fitted = 0, loops = 0, clamped = 0, shortLoops = 0, linSum = 0,
+		truncated = 0 }
+
+	for _, e in pairs(trace) do
+		for _, lp in ipairs(e.loops) do
+			local F = lp.faces
+			local n = #F
+			stats.loops += 1
+
+			-- loop plane and an in-plane basis
+			local nrm = Vector3.zero
+			for _, fi in ipairs(F) do nrm += e.faces[fi].up end
+			nrm = (nrm.Magnitude > 1e-6) and nrm.Unit or Vector3.yAxis
+			local f1 = e.faces[F[1]]
+			local d1 = f1.b - f1.a
+			local e1 = d1 - nrm * d1:Dot(nrm)
+			if e1.Magnitude < 1e-6 then
+				e1 = Vector3.xAxis - nrm * Vector3.xAxis:Dot(nrm)
+				if e1.Magnitude < 1e-6 then e1 = Vector3.zAxis - nrm * Vector3.zAxis:Dot(nrm) end
+			end
+			e1 = e1.Unit
+			local e2 = nrm:Cross(e1)
+
+			-- one sample per face, at its midpoint, spaced one step apart
+			local px, py = {}, {}
+			for i, fi in ipairs(F) do
+				local f = e.faces[fi]
+				local m = (f.a + f.b) * 0.5
+				px[i] = m:Dot(e1); py[i] = m:Dot(e2)
+			end
+
+			-- never let the window reach round to the far side of the loop
+			local k = math.min(k0, math.floor((n - 1) / 2))
+			if k < k0 then stats.clamped += 1 end
+			local C = lp.corner or {}
+			local tangent, linearity = {}, {}
+			if k >= 1 then
+				for i = 1, n do
+					-- grow outward from i, stopping at the first hard corner vertex.
+					-- going left from face j crosses vertex j-1; going right from
+					-- face j crosses vertex j.
+					local idx = { i }
+					local j = i
+					for _ = 1, k do
+						local v = ((j - 2) % n) + 1
+						if C[v] then break end
+						if (not lp.closed) and j - 1 < 1 then break end
+						j = v
+						table.insert(idx, 1, j)
+					end
+					j = i
+					for _ = 1, k do
+						if C[j] then break end
+						if (not lp.closed) and j + 1 > n then break end
+						j = (j % n) + 1
+						idx[#idx + 1] = j
+						if j == i then break end
+					end
+					local m = #idx
+					if m < k * 2 + 1 then stats.truncated += 1 end
+					local sx, sy = 0, 0
+					for x = 1, m do sx += px[idx[x]]; sy += py[idx[x]] end
+					if m == 1 then
+						-- a single face between two corners: its own direction IS the
+						-- tangent, and an axis-aligned segment is exactly linear
+						local f = e.faces[F[i]]
+						local d = f.b - f.a
+						tangent[i] = math.deg(math.atan2(d:Dot(e2), d:Dot(e1))) % 180
+						linearity[i] = 1
+						stats.fitted += 1
+						stats.linSum += 1
+					elseif m == 2 then
+						-- two samples have no covariance to speak of; the chord between
+						-- them is the answer, and it reads a diagonal as 45 degrees
+						local ax = px[idx[2]] - px[idx[1]]
+						local ay = py[idx[2]] - py[idx[1]]
+						tangent[i] = math.deg(math.atan2(ay, ax)) % 180
+						linearity[i] = 1
+						stats.fitted += 1
+						stats.linSum += 1
+					else
+						local mx, my = sx / m, sy / m
+						local sxx, sxy, syy = 0, 0, 0
+						for x = 1, m do
+							local dx, dy = px[idx[x]] - mx, py[idx[x]] - my
+							sxx += dx * dx; sxy += dx * dy; syy += dy * dy
+						end
+						local tr = sxx + syy
+						local disc = math.max(0, tr * tr / 4 - (sxx * syy - sxy * sxy))
+						local l1 = tr / 2 + math.sqrt(disc)
+						local l2 = tr / 2 - math.sqrt(disc)
+						local ang
+						if math.abs(sxy) > 1e-12 then ang = math.atan2(l1 - sxx, sxy)
+						else ang = (sxx >= syy) and 0 or math.pi / 2 end
+						tangent[i] = math.deg(ang) % 180
+						linearity[i] = (l1 > 1e-12) and (1 - l2 / l1) or 0
+						stats.fitted += 1
+						stats.linSum += linearity[i]
+					end
+				end
+			else
+				stats.shortLoops += 1
+			end
+			lp.tangent = tangent
+			lp.linearity = linearity
+			lp.basis = { n = nrm, e1 = e1, e2 = e2 }
+		end
+	end
+	stats.meanLinearity = stats.linSum / math.max(1, stats.fitted)
+	return stats
+end
+
+-- Cut each loop into ARCS wherever the direction turns.
+--
+-- An arc is a contiguous run of the loop, and it knows its neighbours because
+-- arcs are stored in loop order: arc N is followed by arc N+1, and the last is
+-- followed by the first on a closed loop. Nothing downstream has to rediscover
+-- adjacency from endpoint distances.
+--
+-- Compared against the arc's ANCHOR direction, never a running mean: a running
+-- mean drifts along a curve and swallows the whole thing.
+--
+-- The walk starts at the sharpest turn in the loop, so the cut set is a property
+-- of the geometry rather than of whichever face the trace happened to seed on.
+-- Greedy segmentation from an arbitrary start is not reproducible.
+function Boundary.arcs(trace: any, cfg: any?)
+	local tol = (cfg and cfg.tol) or 20
+	local stats = { arcs = 0, loops = 0, oneArc = 0, faces = 0 }
+	for _, e in pairs(trace) do
+		for _, lp in ipairs(e.loops) do
+			local n = #lp.faces
+			local T = lp.tangent or {}
+			stats.loops += 1
+
+			local startAt, bestTurn = 1, -1
+			if lp.closed then
+				for i = 1, n do
+					local j = (i % n) + 1
+					local a, b = T[i], T[j]
+					if a and b then
+						local d = angDiff(a, b)
+						if d > bestTurn then bestTurn = d; startAt = j end
+					end
+				end
+			end
+
+			local arcs = {}
+			local cur, anchor = nil, nil
+			for x = 0, n - 1 do
+				local i = ((startAt - 1 + x) % n) + 1
+				local t = T[i]
+				local cut = (cur == nil) or (t == nil) or (anchor == nil)
+					or (angDiff(t, anchor) > tol)
+				if cut then
+					cur = { i }
+					anchor = t
+					arcs[#arcs + 1] = cur
+				else
+					cur[#cur + 1] = i
+				end
+				stats.faces += 1
+			end
+			lp.arcs = arcs
+			stats.arcs += #arcs
+			if #arcs == 1 then stats.oneArc += 1 end
+		end
+	end
+	return stats
+end
+
+-- The LINES of each loop, fitted on the NODES.
+--
+-- A loop's nodes are its vertices, in order: node i is where face i starts, and
+-- the step from node i to node i+1 IS face i. Fitting on the nodes rather than
+-- on face midpoints means a line is a run of vertices, which is what a polygon
+-- edge actually is, and the endpoints a weld needs are nodes rather than points
+-- interpolated between them.
+--
+-- Four things happen per loop, in order:
+--   1. a corner is found AT a node, from the net direction of the steps arriving
+--      against the net of those leaving. Net, not the single step either side:
+--      on a lattice every step turns 90 degrees, so a single-step test marks
+--      every vertex of a 45 degree staircase and shatters a straight run.
+--   2. the loop is cut into runs at those corners. A corner ENDS its run.
+--   3. each run is split at its worst node until no node sits further than
+--      devTol from its own line's chord, then adjacent pieces are MERGED back
+--      wherever the combined chord still fits.
+--   4. one direction per line, a total least squares fit over that line's own
+--      nodes, copied onto each node it owns.
+--
+-- DEVIATION IN STUDS, not an angle against a running anchor. An angular cut
+-- fires on the jitter of a staircase and sheds a fragment each time, and it
+-- cannot tell how far the drawn chord actually strays from the boundary, which
+-- is the only thing that matters. Splitting on deviation and merging back is
+-- also what stops a run continuing past a corner the angular detector missed: a
+-- line that overshoots a 90 degree corner has a huge deviation and is cut.
+--
+-- devTol is measured from the fit, so half a step is the natural bound: that is
+-- how far a single-step staircase of any tread length strays from its own fitted
+-- line. Anything beyond it is a bend rather than quantization.
+--
+-- Lines PARTITION the nodes, so each node carries exactly one line id and the
+-- line order round the loop is line 1, 2, 3 with the last meeting the first.
+function Boundary.nodeLines(trace: any, cfg: any?)
+	local c = cfg or {}
+	local step = c.step or 0.5
+	local devTol = c.devTol or (step * 0.6)
+	local W = c.cornerWindow or 3
+	local thr = math.cos(math.rad(c.cornerAngle or 45))
+	local suppress = c.suppress ~= false
+	local revThr = c.reversalDot or -0.7
+	-- 40, not 45: on a midpoint polyline a square corner of the region shows up
+	-- as a 45 degree chamfer rather than a 90 degree step
+	local stepAngle = c.stepAngle or 40
+	local stats = { loops = 0, nodes = 0, corners = 0, kept = 0, lines = 0, fitted = 0,
+		splits = 0, merges = 0, snapped = 0, chamfers = 0, linSum = 0, oneLine = 0 }
+
+	for _, e in pairs(trace) do
+		for _, lp in ipairs(e.loops) do
+			local n = #lp.faces
+			stats.loops += 1
+			stats.nodes += n
+
+			-- NODES SIT ON FACE MIDPOINTS, not on face corners.
+			--
+			-- A corner polyline can only step along the lattice axes, so a 45 degree
+			-- boundary comes out as a zigzag that strays half a step from the line it
+			-- is approximating, and every fit downstream has to tolerate that. Joining
+			-- face midpoints instead lets two perpendicular faces of one cell connect
+			-- diagonally, so the same boundary comes out as an exactly straight run
+			-- and its deviation collapses to nothing.
+			--
+			-- It also puts a node half a step inside the cell edge rather than on the
+			-- lattice corner, which is where the wall is, and it makes the node to
+			-- cell mapping one to one: node i belongs to face i and nothing else.
+			local node, dir = {}, {}
+			for i, fi in ipairs(lp.faces) do
+				local f = e.faces[fi]
+				node[i] = (f.a + f.b) * 0.5
+			end
+			for i = 1, n do
+				local j = (i % n) + 1
+				if (not lp.closed) and i == n then
+					dir[i] = dir[i - 1] or Vector3.zero
+				else
+					local d = node[j] - node[i]
+					dir[i] = (d.Magnitude > 1e-9) and d.Unit or Vector3.zero
+				end
+			end
+
+			-- The turn between the two steps meeting AT a node. On a lattice this is
+			-- 90 degrees or nothing, so it says exactly where a turn is available --
+			-- unlike the net-direction window, which says whether a turn is real but
+			-- can put its minimum a node to either side of one.
+			local function adjTurn(i)
+				if (not lp.closed) and i <= 1 then return -1 end
+				local a, b = dir[((i - 2) % n) + 1], dir[i]
+				if a.Magnitude < 0.5 or b.Magnitude < 0.5 then return -1 end
+				return math.deg(math.acos(math.clamp(a:Dot(b), -1, 1)))
+			end
+
+			-- plane and in-plane basis for the loop
+			local nrm = Vector3.zero
+			for _, fi in ipairs(lp.faces) do nrm += e.faces[fi].up end
+			nrm = (nrm.Magnitude > 1e-6) and nrm.Unit or Vector3.yAxis
+			local seed = (dir[1].Magnitude > 1e-6) and dir[1] or Vector3.xAxis
+			local e1 = seed - nrm * seed:Dot(nrm)
+			if e1.Magnitude < 1e-6 then
+				e1 = Vector3.xAxis - nrm * Vector3.xAxis:Dot(nrm)
+				if e1.Magnitude < 1e-6 then e1 = Vector3.zAxis - nrm * Vector3.zAxis:Dot(nrm) end
+			end
+			e1 = e1.Unit
+			local e2 = nrm:Cross(e1)
+			local px, py = {}, {}
+			for i = 1, n do px[i] = node[i]:Dot(e1); py[i] = node[i]:Dot(e2) end
+
+			-- 1. corners, at nodes
+			local corner, turnDot = {}, {}
+			for i = 1, n do
+				if (not lp.closed) and (i == 1 or i == n) then
+					corner[i] = true
+					stats.corners += 1
+				else
+					local before, after = Vector3.zero, Vector3.zero
+					for x = 1, W do
+						local j = i - x
+						if lp.closed then j = ((j - 1) % n) + 1 elseif j < 1 then j = nil end
+						if j then before += dir[j] end
+					end
+					for x = 0, W - 1 do
+						local j = i + x
+						if lp.closed then j = ((j - 1) % n) + 1 elseif j > n then j = nil end
+						if j then after += dir[j] end
+					end
+					if before.Magnitude > 1e-6 and after.Magnitude > 1e-6 then
+						local dp = before.Unit:Dot(after.Unit)
+						turnDot[i] = dp
+						-- ONLY A REVERSAL IS A HARD SPLIT.
+						--
+						-- A fixed window cannot find an ordinary corner: near the ends
+						-- of a run it reaches across the neighbouring corner into the
+						-- previous line and reports a turn that is not there, and
+						-- clipping it leaves too few steps to read the run's direction
+						-- at all. A staircase whose period exceeds the window fails
+						-- either way, so no window length works everywhere. Ordinary
+						-- corners come from the deviation split below, which is
+						-- scale-free. A reversal is different: it is a tip, it cannot be
+						-- confused with a staircase, and a fit through it is meaningless.
+						if dp < revThr and adjTurn(i) >= stepAngle then
+							corner[i] = true
+							stats.corners += 1
 						end
 					end
 				end
-				cur = nxt
 			end
-			if #loop >= 4 then loops[#loops + 1] = loop end
-		end
-	end
-	return loops
-end
 
---------------------------------------------------------------------------
--- STEP 4 — greedy line fit. THIS IS WHERE THE STAIRCASE DIES.
---
--- Walk the loop maintaining a best-fit line through the cells accepted so far.
--- While the MAXIMUM perpendicular residual stays under a cell, keep extending.
--- When it exceeds, close the segment and start fresh from that cell.
---
--- The cells of a foreign part's footprint crossing this grid at an angle all
--- sit within a cell of one straight line at the true angle, so they collapse
--- into a single segment and the fit recovers the angle without being told it.
---
--- CORNERS ARE WHERE THE FIT FAILS. They are a byproduct, not a prerequisite --
--- which is the piece that killed every attempt that tried to detect them
--- against real geometry instead.
---------------------------------------------------------------------------
+			-- Reversals need no suppression: every one of them is a real tip. On a
+			-- ribbon one cell wide the window spans its whole width and each of the
+			-- four tips reads as a reversal, which is correct.
 
-local function segmentLoop(pts: {P2}, c: any, cls: {string})
-	local n = #pts
-	local segs: {any} = {}
-	if n < 2 then return segs end
-
-	-- A LINE OWNS ONE NODE TYPE AND IGNORES THE REST.
-	--
-	-- The residual is measured against the run's OWN nodes only. A foreign node
-	-- is invisible to the fit -- not stepped over, not fitted, just not its
-	-- business -- so a single seam node sitting in the middle of a long wall no
-	-- longer closes the wall. That is what makes the classification's grit
-	-- harmless instead of fatal: 79% of class runs on this map are one or two
-	-- nodes, and previously every one of them forced a break that step 8 could
-	-- never undo.
-	--
-	-- But a line may not EXPAND INTO foreign nodes either. If it could, a wall
-	-- run would happily leap the seam nodes across a doorway and seal it, which
-	-- is the one thing that invents connectivity. So a foreign stretch longer
-	-- than `maxGap` ends the run: a speck is ignored, a real stretch is a
-	-- boundary of its own.
-	local function fitAndPush(idx: {number}, T: string)
-		if #idx < 1 then return end
-		local cen, dir = fitLine(pts, idx)
-		segs[#segs + 1] = { idx = idx, cen = cen, dir = dir, class = T }
-	end
-
-	local T = cls[1]
-	local cur = { 1 }
-	local gapAt: number? = nil
-
-	for i = 2, n do
-		if cls[i] ~= T then
-			-- foreign node: ignore it, unless the stretch has become real
-			gapAt = gapAt or i
-			if len(sub(pts[i], pts[gapAt])) > c.maxGap then
-				fitAndPush(cur, T)
-				T = cls[gapAt]
-				cur = {}
-				for k = gapAt, i do
-					if cls[k] == T then cur[#cur + 1] = k end
+			-- 2. runs between corners. A corner ENDS its run.
+			local runs = {}
+			if lp.closed then
+				local cuts = {}
+				for i = 1, n do if corner[i] then cuts[#cuts + 1] = i end end
+				if #cuts == 0 then
+					-- a closed loop with no corner at all still needs one cut, or it
+					-- is a single line biting its own tail
+					local sharp, at = math.huge, 1
+					for i = 1, n do
+						local dp = turnDot[i]
+						if dp and dp < sharp and adjTurn(i) >= stepAngle then sharp = dp; at = i end
+					end
+					corner[at] = true
+					cuts = { at }
+					stats.kept += 1
 				end
-				if #cur == 0 then cur = { i }; T = cls[i] end
-				gapAt = nil
-			end
-			continue
-		end
-		gapAt = nil
-
-		-- A reversal still ends a run, and the residual cannot see it: round the
-		-- end of a strip narrower than fitTol and every returning node is within
-		-- tolerance of the line fitted to the side just left.
-		local reversed = false
-		if #cur >= 2 then
-			local travel = sub(pts[i], pts[cur[#cur]])
-			local run = sub(pts[cur[#cur]], pts[cur[1]])
-			if dot(travel, run) < 0 then reversed = true end
-		end
-
-		local trial = table.clone(cur)
-		trial[#trial + 1] = i
-		local cen, dir = fitLine(pts, trial)
-		-- MAXIMUM residual, never the average: an average lets a shallow corner
-		-- hide inside a long run, which is precisely the corner worth keeping.
-		local fails = reversed or maxResidual(pts, trial, cen, dir) > c.fitTol
-
-		if fails then
-			-- A BREAK MUST EARN ITSELF. Ending a run here only makes sense if what
-			-- follows is actually a different edge: long enough to be one, and
-			-- turning by enough to be worth a corner. Otherwise the break yields a
-			-- two-node stub whose line is near parallel to its neighbour, which is
-			-- exactly what makes the corner intersection unstable. When it has not
-			-- earned itself, carry on and accept the residual.
-			local ok = true
-			if #cur >= 2 then
-				local ccen, cdir = fitLine(pts, cur)
-				-- how far does the same node type continue past here?
-				local last = i
-				for k = i + 1, n do
-					if cls[k] == T then last = k else break end
+				for ci = 1, #cuts do
+					local from = (cuts[ci] % n) + 1
+					local upto = cuts[(ci % #cuts) + 1]
+					local run, j, guard = {}, from, 0
+					while guard <= n do
+						run[#run + 1] = j
+						if j == upto then break end
+						j = (j % n) + 1
+						guard += 1
+					end
+					if #run > 0 then runs[#runs + 1] = run end
 				end
-				local newLen = len(sub(pts[last], pts[i - 1 >= 1 and i - 1 or i]))
-				local turn = math.deg(math.acos(math.clamp(dot(cdir, dir), -1, 1)))
-				if not reversed and (newLen < c.minSegLen or turn < c.collinearDeg) then
-					ok = false
-				end
-			end
-			if ok then
-				fitAndPush(cur, T)
-				cur = { cur[#cur], i }
 			else
-				cur = trial
+				local run = {}
+				for i = 1, n do
+					run[#run + 1] = i
+					if corner[i] and i > 1 then
+						runs[#runs + 1] = run
+						run = {}
+					end
+				end
+				if #run > 0 then runs[#runs + 1] = run end
 			end
-		else
-			cur = trial
-		end
-	end
-	fitAndPush(cur, T)
-	return segs
-end
 
-local function spanLength(pts: {P2}, idx: {number}): number
-	return len(sub(pts[idx[#idx]], pts[idx[1]]))
-end
-
--- THE FALLBACK FOR A RING THE FIT CANNOT RESOLVE.
---
--- fitTol is one cell, deliberately: DESIGN.md's rule is that anything the mask
--- can express as straight IS straight. The consequence is that a strip two
--- cells wide can never be segmented, because its cell centres form a rectangle
--- one cell deep and a one-cell-deep rectangle is within tolerance of a line.
--- That is not a bug in the fit, it is the tolerance meaning what it says -- and
--- this map's stair steps are 35x2, so it is 22 rings.
---
--- The raw lattice outline is the safe answer but a terrible one: 70 vertices
--- for a rectangle. When the ring's cells are exactly the border of their own
--- bounding box, though, the shape IS that box, and the box is four vertices.
--- Note what this does NOT do: it reads cell indices only. No part is consulted,
--- so it holds for a Union or a MeshPart exactly as it does for a Block.
-local function boxIfExact(pts: {P2}, step: number): {P2}?
-	local lu, hu, lv, hv = math.huge, -math.huge, math.huge, -math.huge
-	for _, p in ipairs(pts) do
-		lu = math.min(lu, p.x); hu = math.max(hu, p.x)
-		lv = math.min(lv, p.z); hv = math.max(hv, p.z)
-	end
-	local w = math.floor((hu - lu) / step + 0.5) + 1
-	local h = math.floor((hv - lv) / step + 0.5) + 1
-	if w < 1 or h < 1 then return nil end
-	-- how many cells the border of a w x h box holds
-	local border = (w == 1 or h == 1) and (w * h) or (2 * w + 2 * h - 4)
-	if #pts ~= border then return nil end
-	local seen: {[string]: boolean} = {}
-	for _, p in ipairs(pts) do
-		local iu = math.floor((p.x - lu) / step + 0.5)
-		local iv = math.floor((p.z - lv) / step + 0.5)
-		-- every point must actually lie ON the border, or the counts agreeing was
-		-- a coincidence and the shape is something else
-		if iu ~= 0 and iu ~= w - 1 and iv ~= 0 and iv ~= h - 1 then return nil end
-		local k = iu .. ":" .. iv
-		if seen[k] then return nil end
-		seen[k] = true
-	end
-	return {
-		{ x = lu, z = lv }, { x = hu, z = lv }, { x = hu, z = hv }, { x = lu, z = hv },
-	}
-end
-
---------------------------------------------------------------------------
--- STEP 8 — clean up, and all of it BEFORE any corner is intersected
---------------------------------------------------------------------------
-
-local function mergeSegments(pts: {P2}, segs: {any}, c: any)
-	local cosLim = math.cos(math.rad(c.collinearDeg))
-
-	local function refit(a: any, b: any, force: boolean?): any?
-		-- never across a class change: the merged run would need one push for
-		-- what is wall and another for what is ledge
-		if a.class ~= b.class then return nil end
-		-- never across a reversal, for the same reason step 4 breaks on one: the
-		-- two sides of a thin strip are within fitTol of each other, so the
-		-- residual test alone would happily weld them into one segment
-		if dot(a.dir, b.dir) < 0 then return nil end
-		local idx = table.clone(a.idx)
-		local seen: {[number]: boolean} = {}
-		for _, i in ipairs(idx) do seen[i] = true end
-		for _, i in ipairs(b.idx) do
-			if not seen[i] then idx[#idx + 1] = i; seen[i] = true end
-		end
-		local cen, dir = fitLine(pts, idx)
-		-- A merge demanded because a run is too short to be an edge, or because
-		-- the turn between two runs is not a real corner, happens whether or not
-		-- the combined residual is inside fitTol. The alternative is keeping a
-		-- stub that no downstream stage can use: its line is near parallel to its
-		-- neighbour's, so the corner between them is unstable by construction.
-		if not force and maxResidual(pts, idx, cen, dir) > c.fitTol then return nil end
-		return { idx = idx, cen = cen, dir = dir, class = a.class }
-	end
-
-	-- SEAM. The walk's start point on a closed loop is arbitrary, so a straight
-	-- run that happens to straddle it is always split in two -- a spurious
-	-- corner at exactly the place where nothing happened.
-	if #segs >= 2 then
-		local first, last = segs[1], segs[#segs]
-		if dot(first.dir, last.dir) >= cosLim then
-			local m = refit(last, first)
-			if m then
-				segs[1] = m
-				segs[#segs] = nil
+			-- 3. split each run where its nodes bow off their own chord, then merge
+			-- neighbours back wherever the combined chord still fits
+			-- Deviation is measured from the piece's own LEAST SQUARES line, not from
+			-- the chord between its end nodes, and the difference decides both of the
+			-- ways this can go wrong.
+			--
+			-- A monotone staircase lies entirely on ONE side of its endpoint chord: a
+			-- 45 degree run reaches 0.354 and a long-tread run approaches a full step,
+			-- so a chord test splits clean diagonals. The same staircase STRADDLES its
+			-- least squares line and only reaches half a step. A real bend does not
+			-- straddle anything -- the fit cannot pass through the middle of a corner
+			-- -- so its deviation stays large. Chord distance cannot tell a 0.39 stud
+			-- bend from staircase quantization; distance from the fit can.
+			local function devOf(run, a, b)
+				local m = b - a + 1
+				if m < 3 then return 0, a end
+				local sx, sy = 0, 0
+				for x = a, b do sx += px[run[x]]; sy += py[run[x]] end
+				local mx, my = sx / m, sy / m
+				local sxx, sxy, syy = 0, 0, 0
+				for x = a, b do
+					local dx, dy = px[run[x]] - mx, py[run[x]] - my
+					sxx += dx * dx; sxy += dx * dy; syy += dy * dy
+				end
+				local tr = sxx + syy
+				local disc = math.max(0, tr * tr / 4 - (sxx * syy - sxy * sxy))
+				local l1 = tr / 2 + math.sqrt(disc)
+				local ax, ay
+				if math.abs(sxy) > 1e-12 then ax, ay = sxy, l1 - sxx
+				elseif sxx >= syy then ax, ay = 1, 0
+				else ax, ay = 0, 1 end
+				local mag = math.sqrt(ax * ax + ay * ay)
+				if mag < 1e-12 then return 0, a end
+				ax, ay = ax / mag, ay / mag
+				local worst, at = 0, a
+				for x = a, b do
+					local dx, dy = px[run[x]] - mx, py[run[x]] - my
+					local off = math.abs(dx * -ay + dy * ax)
+					if off > worst then worst = off; at = x end
+				end
+				return worst, at
 			end
-		end
-	end
 
-	-- Near-collinear and too-short runs, absorbed until nothing changes.
-	--
-	-- This is also the rule that fixes a staircase built out of SEPARATE PARTS.
-	-- A flight here is nine stacked blocks whose ends are flush, so the foot of
-	-- the flight is one straight edge crossed by eight part seams. Each seam
-	-- puts a one-cell jog in the mask, the fit closes a run at each, and without
-	-- this merge the result is eight spurious corners along a straight line.
-	local changed = true
-	while changed and #segs > 3 do
-		changed = false
-		for k = 1, #segs do
-			local a, b = segs[k], segs[(k % #segs) + 1]
-			if a == b then break end
-			-- SIGNED, not abs. Directions are oriented along the walk, so an abs
-			-- test calls a 180-degree reversal "collinear" -- and the two long
-			-- sides of a thin wall's ring are exactly that, sitting within fitTol
-			-- of each other because the wall is thinner than the tolerance. They
-			-- would merge and the ring would collapse.
-			local nearly = dot(a.dir, b.dir) >= cosLim
-			local tiny = spanLength(pts, a.idx) < c.minSegLen
-				or spanLength(pts, b.idx) < c.minSegLen
-			if nearly or tiny then
-				local m = refit(a, b, true)
-				if m then
-					segs[k] = m
-					table.remove(segs, (k % #segs) + 1)
-					changed = true
-					break
+			local lines = {}
+			for _, run in ipairs(runs) do
+				local pieces = {}
+				local stack = { { 1, #run } }
+				while #stack > 0 do
+					local seg = table.remove(stack)
+					local a, b = seg[1], seg[2]
+					if b - a < 2 then
+						pieces[#pieces + 1] = { a, b }
+					else
+						local worst, at = devOf(run, a, b)
+						if worst > devTol then
+							-- Put the break on a real lattice turn when one is within reach.
+							-- The worst-deviation node is the right neighbourhood but not
+							-- always the vertex itself, and a break one node off a turn is a
+							-- line that wraps a cell around its own corner.
+							local bestAt, bestD = at, math.huge
+							for o = -2, 2 do
+								local cand = at + o
+								if cand > a and cand < b and adjTurn(run[cand]) >= stepAngle then
+									if math.abs(o) < bestD then bestD = math.abs(o); bestAt = cand end
+								end
+							end
+							at = bestAt
+						end
+						if at <= a then at = a + 1 end
+						if at >= b then at = b - 1 end
+						if worst <= devTol then
+							pieces[#pieces + 1] = { a, b }
+						else
+							-- the break node ENDS the first piece, so the pieces stay a
+							-- partition rather than sharing a vertex
+							stack[#stack + 1] = { at + 1, b }
+							stack[#stack + 1] = { a, at }
+							stats.splits += 1
+						end
+					end
+				end
+				table.sort(pieces, function(x, y) return x[1] < y[1] end)
+				local changed = true
+				while changed do
+					changed = false
+					for x = 1, #pieces - 1 do
+						local A, Bp = pieces[x], pieces[x + 1]
+						local worst = devOf(run, A[1], Bp[2])
+						if worst <= devTol then
+							pieces[x] = { A[1], Bp[2] }
+							table.remove(pieces, x + 1)
+							stats.merges += 1
+							changed = true
+							break
+						end
+					end
+				end
+				for _, p in ipairs(pieces) do
+					local ln = {}
+					for x = p[1], p[2] do ln[#ln + 1] = run[x] end
+					lines[#lines + 1] = ln
 				end
 			end
-		end
-	end
-	return segs
-end
 
-local function signed2(pts: {P2}): number
-	local a2 = 0
-	for i = 1, #pts do
-		local p, q = pts[i], pts[i % #pts + 1]
-		a2 += p.x * q.z - q.x * p.z
-	end
-	return a2 * 0.5
-end
-
---------------------------------------------------------------------------
--- One grid -> its rings, in world space
---------------------------------------------------------------------------
-
---------------------------------------------------------------------------
--- CLASSIFY A BOUNDARY EDGE — wall, dropoff, or seam
---
--- DESIGN.md offsets WALLS ONLY: an agent must not clip masonry, but walking the
--- lip of a ledge is legitimate, and standing off from every ledge removed 12.4%
--- of SmallMap's cells from exactly the places worth keeping.
---
--- Per-part grids add a third class the world raster never had. Two slabs laid
--- side by side at the same height are continuous floor, but each grid stops at
--- its own rim, so BOTH emit a boundary along the join. Measured on SmallMap,
--- 41% of every boundary edge in the bake is one of these -- not a boundary at
--- all. Offsetting them would carve a wall down the middle of a flat floor, and
--- they are where one polygon hands over to the next.
---
--- Nothing here consults a Part. A seam is "another grid has a walkable cell
--- there, within a step of our height", a wall is "the cell there was killed
--- from above, or another grid's floor stands above us", and a dropoff is the
--- rest. All three are answered out of cells.
---------------------------------------------------------------------------
-
-local SEAM, WALL, DROP = "seam", "wall", "drop"
-
-local function classifierFor(localData: any, c: any)
-	local world: {[string]: {any}} = {}
-	for part, g in pairs(localData.grids) do
-		for _, cell in ipairs(g.cells) do
-			local k = math.floor(cell.pos.X) .. ":" .. math.floor(cell.pos.Z)
-			local b = world[k]
-			if not b then b = {}; world[k] = b end
-			b[#b + 1] = { y = cell.pos.Y, part = part }
-		end
-	end
-	return function(g: any, s: any): string
-		local step = g.step
-		local d = s.dir
-		local wp
-		if not g.fallback and g.n then
-			wp = s.cell.pos + g.u * (d[1] * step) + g.v * (d[2] * step)
-		else
-			wp = s.cell.pos + Vector3.new(d[1] * step, 0, d[2] * step)
-		end
-		local bucket = world[math.floor(wp.X) .. ":" .. math.floor(wp.Z)]
-		if bucket then
-			for _, e in ipairs(bucket) do
-				if e.part ~= g.part then
-					local dy = e.y - s.cell.pos.Y
-					if math.abs(dy) <= c.stepTol then return SEAM end
-					-- another surface standing above us is masonry, same as a
-					-- neighbouring column would be
-					if dy > c.stepTol then return WALL end
+			-- A CHAMFER BELONGS TO THE LINE IT TURNS INTO.
+			--
+			-- On a midpoint polyline a square corner of the region is a single 0.354
+			-- step cutting across it. That node is the turn, not part of the run
+			-- arriving at it: its outgoing step already heads off in the new
+			-- direction, and its cell sits past the corner. Left on the earlier line
+			-- it reads as that line reaching a cell into the feature beyond.
+			if #lines > 1 then
+				local chamfer = step * 0.75
+				for li = 1, #lines do
+					local cur = lines[li]
+					local nxt = lines[(li % #lines) + 1]
+					if #cur > 1 and nxt ~= cur then
+						local last = cur[#cur]
+						local prev = cur[#cur - 1]
+						if (node[last] - node[prev]).Magnitude < chamfer then
+							table.remove(cur)
+							table.insert(nxt, 1, last)
+							stats.chamfers += 1
+						end
+					end
 				end
 			end
-		end
-		if g.deadIndex[s.nu .. ":" .. s.nv] then return WALL end
-		return DROP
-	end
-end
 
-local function ringsOfGrid(g: any, c: any, stats: any, classify: any)
-	local isBlock = not g.fallback and g.n ~= nil
-	local step = g.step
-
-	local toWorld
-	if isBlock then
-		-- A point in the host's face coordinates is a point ON the host's face
-		-- plane, so heights are exact by construction: nothing is sampled from a
-		-- neighbouring cell and a vertex cannot pick up a height from the wrong
-		-- side of a cliff.
-		toWorld = function(p: P2): Vector3
-			return g.origin + g.u * p.x + g.v * p.z
-		end
-	else
-		-- Fallback grid: coordinates are world XZ and the surface is not one
-		-- plane, so a point takes the height of the highest cell touching it.
-		toWorld = function(p: P2): Vector3
-			local iu, iv = math.floor(p.x / step), math.floor(p.z / step)
-			local bestY = nil
-			for du = -1, 1 do
-				for dv = -1, 1 do
-					local cell = g.index[(iu + du) .. ":" .. (iv + dv)]
-					if cell and (not bestY or cell.pos.Y > bestY) then bestY = cell.pos.Y end
-				end
-			end
-			return Vector3.new(p.x, bestY or 0, p.z)
-		end
-	end
-
-	-- is a point in the grid's own face coordinates on a live cell?
-	local function inMask(a: number, b: number): boolean
-		return g.index[math.floor(a / step) .. ":" .. math.floor(b / step)] ~= nil
-	end
-
-	local cliff = nil
-	if not isBlock then
-		cliff = function(a: any, b: any): boolean
-			return math.abs(a.pos.Y - b.pos.Y) > c.stepTol
-		end
-	end
-
-	-- A ring is built in the grid's 2D face coordinates and only converted to
-	-- world once outer-vs-hole is known, because a ring that could not be fitted
-	-- is treated differently depending on which it is.
-	local rings: {any} = {}
-	for _, loop in ipairs(traceMask(g.cells, g.index, cliff)) do
-		-- Ordered boundary cell CENTRES. A corner cell contributes two edges and
-		-- the duplicate carries no information, so collapse it.
-		local pts: {P2} = {}
-		local cls: {string} = {}
-		local lastCell, lastCls = nil, nil
-		for _, s in ipairs(loop) do
-			local k = classify(g, s)
-			-- Collapse the duplicate a corner cell contributes, but ONLY while the
-			-- class holds: a cell with a wall on one side and a seam on the other
-			-- has to appear twice or one of the two runs loses its start point.
-			if s.cell ~= lastCell or k ~= lastCls then
-				pts[#pts + 1] = { x = (s.cell.ui + 0.5) * step, z = (s.cell.vi + 0.5) * step }
-				cls[#cls + 1] = k
-				lastCell, lastCls = s.cell, k
-			end
-			stats.edges += 1
-			stats[k] += 1
-		end
-		if #pts < 3 then continue end
-
-		-- A RING TOO THIN TO SURVIVE THE FIT. DESIGN.md step 8 warns about this
-		-- and the old implementation hit it on 165 of 169 holes: the two long
-		-- sides of a strip narrower than fitTol sit within the tolerance of each
-		-- other, so the fit walks straight round the end without ever failing and
-		-- the whole ring collapses to one or two segments.
-		--
-		-- It is not a corner case here. This map's stair steps are 35x2 cell
-		-- strips -- 36 of them, 3.6% of every walkable cell on the map -- and
-		-- silently dropping them is the one operation in this module that can
-		-- make real ground disappear. So a ring that cannot be fitted keeps its
-		-- raw lattice outline instead. Jagged, but present.
-		local segs = mergeSegments(pts, segmentLoop(pts, c, cls), c)
-		stats.rawSegments += #segs
-		if #segs < 3 then
-			local box = boxIfExact(pts, step)
-			if box then
-				stats.boxRings += 1
-				rings[#rings + 1] = { pts2 = box, area = signed2(box) }
-			else
-				stats.rawRings += 1
-				rings[#rings + 1] = { pts2 = pts, area = signed2(pts), raw = true }
-			end
-			continue
-		end
-
-		----------------------------------------------------------------
-		-- STEP 5 — bias the fit inward
-		--
-		-- A fit can sit outward of the cells it was fitted to, which hands back
-		-- ground that is not walkable. Translate each line inward until no
-		-- accepted cell centre lies outward of it. Without this the safety
-		-- guarantee is probabilistic; with it, it is exact.
-		----------------------------------------------------------------
-		local lines: {any} = {}
-		for _, sg in ipairs(segs) do
-			local nrm = outwardOf(sg.dir)
-			local cval = -math.huge
-			for _, i in ipairs(sg.idx) do
-				local d = dot(pts[i], nrm)
-				if d > cval then cval = d end
-			end
-			lines[#lines + 1] = { n = nrm, c = cval, anchor = pts[sg.idx[#sg.idx]], class = sg.class }
-		end
-
-		----------------------------------------------------------------
-		-- STEP 7 — corners are the intersections of adjacent lines
-		----------------------------------------------------------------
-		local verts: {P2} = {}
-		local vcls: {string} = {}
-
-		local anchorNow: P2 = { x = 0, z = 0 }
-		local function footOn(L: any, p: P2): P2
-			local d = L.c - dot(p, L.n)
-			return { x = p.x + L.n.x * d, z = p.z + L.n.z * d }
-		end
-		-- THE LAST RESORT IS THE CELL CENTRE ITSELF.
-		--
-		-- Refusing an off-floor intersection is not enough on its own: the bevel
-		-- that replaces it projects the anchor onto each line, and those feet can
-		-- sit off the floor too. Fixing only the intersection moved 123 edges to
-		-- 125. The anchor is a boundary CELL CENTRE, so it is on a live cell by
-		-- construction -- fall all the way back to it and the polygon cannot
-		-- leave the mask at a corner at all.
-		local function put(p: P2, k: string)
-			if not inMask(p.x, p.z) then
-				stats.cornersClamped += 1
-				p = anchorNow
-			end
-			verts[#verts + 1] = p
-			vcls[#vcls + 1] = k
-		end
-		local nL = #lines
-		for i = 1, nL do
-			local l1, l2 = lines[i], lines[(i % nL) + 1]
-			-- the edge LEAVING this corner runs along l2, so it carries l2's class
-			local leaving = l2.class
-			anchorNow = anchor
-			local det = l1.n.x * l2.n.z - l1.n.z * l2.n.x
-			local anchor = l1.anchor
-			if math.abs(det) < 1e-6 then
-				-- near-parallel: fall back to the foot of the anchor on l1
-				stats.unstableCorners += 1
-				put(footOn(l1, anchor), leaving)
-			else
-				local px = (l1.c * l2.n.z - l2.c * l1.n.z) / det
-				local pz = (l1.n.x * l2.c - l2.n.x * l1.c) / det
-				-- A CORNER MAY NOT LAND OUTSIDE THE FLOOR. The miter limit only
-				-- catches an overshoot longer than miterLimit studs, so a two-stud
-				-- one that sits entirely off the walkable cells sailed through:
-				-- measured, 115 of 123 edges that left the mask did so at an end,
-				-- and only 8 had the fitted line itself wandering. Erosion is the
-				-- safe direction, so an intersection that is not on a live cell is
-				-- refused and bevelled across instead. Cell lookup only.
-				local outside = not inMask(px, pz)
-				if outside then stats.cornersOffMask += 1 end
-				if outside or len(sub({ x = px, z = pz }, anchor)) > c.miterLimit then
-					-- MITER LIMIT. An acute corner throws the intersection
-					-- arbitrarily far out; bevel across it instead.
-					stats.bevels += 1
-					put(footOn(l1, anchor), leaving)
-					put(footOn(l2, anchor), leaving)
+			-- 4. one direction per line, over that line's own nodes
+			local tangent, linearity = {}, {}
+			for _, ln in ipairs(lines) do
+				local m = #ln
+				local ang, lin
+				if m == 1 then
+					local d = dir[ln[1]]
+					ang = math.deg(math.atan2(d:Dot(e2), d:Dot(e1))) % 180
+					lin = 1
 				else
-					put({ x = px, z = pz }, leaving)
+					local sx, sy = 0, 0
+					for _, i in ipairs(ln) do sx += px[i]; sy += py[i] end
+					local mx, my = sx / m, sy / m
+					local sxx, sxy, syy = 0, 0, 0
+					for _, i in ipairs(ln) do
+						local dx, dy = px[i] - mx, py[i] - my
+						sxx += dx * dx; sxy += dx * dy; syy += dy * dy
+					end
+					local tr = sxx + syy
+					local disc = math.max(0, tr * tr / 4 - (sxx * syy - sxy * sxy))
+					local l1 = tr / 2 + math.sqrt(disc)
+					local l2 = tr / 2 - math.sqrt(disc)
+					if math.abs(sxy) > 1e-12 then
+						ang = math.deg(math.atan2(l1 - sxx, sxy)) % 180
+					else
+						ang = (sxx >= syy) and 0 or 90
+					end
+					lin = (l1 > 1e-12) and (1 - l2 / l1) or 0
 				end
+				for _, i in ipairs(ln) do tangent[i] = ang; linearity[i] = lin end
+				stats.fitted += m
+				stats.linSum += lin * m
 			end
-		end
-		if #verts < 3 then
-			local box = boxIfExact(pts, step)
-			if box then
-				stats.boxRings += 1
-				rings[#rings + 1] = { pts2 = box, area = signed2(box) }
-			else
-				stats.rawRings += 1
-				rings[#rings + 1] = { pts2 = pts, area = signed2(pts), raw = true }
-			end
-			continue
-		end
-		rings[#rings + 1] = { pts2 = verts, cls = vcls, area = signed2(verts) }
-	end
 
-	-- Outer is the largest by magnitude. Magnitude, never the sign: this project
-	-- has been bitten by a handedness assumption before.
-	local outer = rings[1]
-	for _, r in ipairs(rings) do
-		if math.abs(r.area) > math.abs(outer.area) then outer = r end
-	end
-
-	for _, r in ipairs(rings) do
-		-- An unfitted OUTER ring stands as it is: cell centres lie inside the
-		-- walkable cells, so the polygon is conservative already. An unfitted
-		-- HOLE is the opposite -- cell centres sit half a cell INTO the obstacle
-		-- the hole represents, so the hole would come out too small and hand
-		-- back ground that is not there. Push it out by half a cell. An obstacle
-		-- that is slightly too big is safe; one that is too small is not.
-		if r.raw and r ~= outer then
-			local cx, cz = 0, 0
-			for _, p in ipairs(r.pts2) do cx += p.x; cz += p.z end
-			cx, cz = cx / #r.pts2, cz / #r.pts2
-			for _, p in ipairs(r.pts2) do
-				local dx, dz = p.x - cx, p.z - cz
-				local m = math.sqrt(dx * dx + dz * dz)
-				if m > 1e-6 then
-					p.x += dx / m * step * 0.5
-					p.z += dz / m * step * 0.5
-				end
-			end
+			lp.node = node
+			lp.nCorner = corner
+			lp.nTurnDot = turnDot
+			lp.nTangent = tangent
+			lp.nLinearity = linearity
+			lp.basis = { n = nrm, e1 = e1, e2 = e2 }
+			lp.lines = lines
+			stats.lines += #lines
+			if #lines == 1 then stats.oneLine += 1 end
 		end
-		local world = table.create(#r.pts2)
-		for i, p in ipairs(r.pts2) do world[i] = toWorld(p) end
-		r.verts = world
-
-		r.outer = (r == outer)
-		stats.segments += #world
 	end
-	return rings
+	stats.meanLinearity = stats.linSum / math.max(1, stats.fitted)
+	return stats
 end
 
---------------------------------------------------------------------------
--- Boundary.fromLocal — the entry point
---------------------------------------------------------------------------
-
-function Boundary.fromLocal(localData: any, cfg: Config?)
-	local c = merged(cfg)
-	local t0 = os.clock()
-	local classify = classifierFor(localData, c)
-
-	local regions: {any} = {}
-	local stats = {
-		parts = 0, block = 0, fallback = 0,
-		regions = 0, holes = 0, verts = 0, emptyGrids = 0,
-		rawSegments = 0, segments = 0, bevels = 0, unstableCorners = 0,
-		-- rings the fit could not resolve, kept as their raw lattice outline
-		rawRings = 0, boxRings = 0,
-		-- boundary edges by class; seam edges are joins, not boundaries
-		edges = 0, seam = 0, wall = 0, drop = 0,
-		-- corners refused because the intersection landed off the walkable cells
-		cornersOffMask = 0, cornersClamped = 0,
-	}
-
-	for part, g in pairs(localData.grids) do
-		stats.parts += 1
-		if g.fallback then stats.fallback += 1 else stats.block += 1 end
-		local rings = ringsOfGrid(g, c, stats, classify)
-		if #rings == 0 then
-			stats.emptyGrids += 1
-			continue
-		end
-		local outer = rings[1]
-		for _, r in ipairs(rings) do
-			if r.outer then outer = r end
-		end
-		local region = {
-			part = part,
-			fallback = g.fallback,
-			verts = outer.verts,
-			cls = outer.cls,
-			area = math.abs(outer.area),
-			cells = #g.cells,
-			dead = #g.dead,
-			holes = {},
-		}
-		for _, r in ipairs(rings) do
-			if r ~= outer then
-				region.holes[#region.holes + 1] = { verts = r.verts, cls = r.cls, area = math.abs(r.area) }
-			end
-		end
-		stats.verts += #region.verts
-		for _, h in ipairs(region.holes) do stats.verts += #h.verts end
+-- Faces and loops for every region. data.boundary[r] = { loops = ..., faces = ... }
+function Boundary.trace(data: any, cfg: any?)
+	local cw = cfg and cfg.cw or false
+	local step = data.config.step
+	local byRegion, fstats = Boundary.faces(data)
+	local out = {}
+	local stats = { regions = 0, loops = 0, closed = 0, broken = 0, stitched = 0, nodes = 0,
+		faces = fstats.faces, borderCells = fstats.cells,
+		wall = fstats.wall, drop = fstats.drop, edge = fstats.edge,
+		unlabelled = fstats.none, adjacency = fstats.pairs_, asymmetric = fstats.asymmetric }
+	for r, faces in pairs(byRegion) do
+		local ids, wstats = Boundary.weld(faces, step)
+		local loops, broken = Boundary.chain(faces, ids, cw)
+		out[r] = { faces = faces, ids = ids, loops = loops }
 		stats.regions += 1
-		stats.holes += #region.holes
-		regions[#regions + 1] = region
+		stats.loops += #loops
+		stats.broken += broken
+		stats.closed += (#loops - broken)
+		stats.stitched += wstats.stitched
+		stats.nodes += wstats.nodes
 	end
-
-	stats.seconds = os.clock() - t0
-	return { regions = regions, stats = stats, config = c }
-end
-
---------------------------------------------------------------------------
-
-function Boundary.visualize(res: any, parent: Instance?)
-	local root = parent or workspace
-	local old = root:FindFirstChild("NavGen_Boundary")
-	if old then old:Destroy() end
-	local folder = Instance.new("Folder")
-	folder.Name = "NavGen_Boundary"
-	folder.Parent = root
-
-	local function bar(a: Vector3, b: Vector3, colour: Color3, thick: number, into: Instance)
-		local d = b - a
-		if d.Magnitude < 1e-4 then return end
-		local p = Instance.new("Part")
-		p.Anchored = true; p.CanCollide = false; p.CanQuery = false; p.CanTouch = false
-		p.Material = Enum.Material.Neon
-		p.Color = colour
-		p.Size = Vector3.new(thick, thick, d.Magnitude)
-		p.CFrame = CFrame.lookAt(a + d * 0.5, b) + Vector3.new(0, 0.08, 0)
-		p.Parent = into
-	end
-
-	-- COLOURED BY CLASS, because the class is the thing worth looking at: it
-	-- decides what gets offset and what becomes a join. Red is wall, blue is
-	-- dropoff, green is seam -- and a green run means two polygons meet there,
-	-- so a green ring around a flat floor is not a boundary at all. Grey is a
-	-- ring that fell back to its raw outline, where no class was resolved.
-	local COL = {
-		wall = Color3.fromRGB(255, 80, 80),
-		drop = Color3.fromRGB(80, 170, 255),
-		seam = Color3.fromRGB(90, 255, 120),
-	}
-	local GREY = Color3.fromRGB(150, 150, 150)
-	for ri, r in ipairs(res.regions) do
-		local sub = Instance.new("Folder")
-		sub.Name = string.format("R%d_%s_c%d_h%d%s", ri, r.part.Name, r.cells, #r.holes,
-			r.fallback and "_FALLBACK" or "")
-		sub.Parent = folder
-		local function drawRing(v: {Vector3}, cls: {string}?)
-			for i = 1, #v do
-				local k = cls and cls[i]
-				bar(v[i], v[i % #v + 1], (k and COL[k]) or GREY, 0.18, sub)
-			end
-		end
-		drawRing(r.verts, r.cls)
-		for _, hr in ipairs(r.holes) do drawRing(hr.verts, hr.cls) end
-	end
-	return folder
+	data.boundary = out
+	data.stats.boundaryFaces = stats.faces
+	data.stats.boundaryLoops = stats.loops
+	data.stats.boundaryBroken = stats.broken
+	return out, stats
 end
 
 return Boundary
