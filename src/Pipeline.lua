@@ -59,7 +59,12 @@ local VALIDATE = {
 }
 
 Pipeline.debugName = "NVGN_Debug"
-Pipeline.stampName = "LastBake"
+-- An ABSOLUTE location, not `script.Parent`. The module is routinely required
+-- from a throwaway clone to get past Luau's require cache, and a stamp written
+-- beside the clone dies with it, leaving the previous run's numbers in place
+-- looking current. A stale stamp is worse than none.
+Pipeline.stampParent = game:GetService("ServerScriptService")
+Pipeline.stampName = "NVGN_LastBake"
 
 local function resolve(overrides: any?): any
 	local c = {}
@@ -81,7 +86,9 @@ function Pipeline.effective(cfg: any?): any
 		if v == nil then v = (PathSimplify :: any)[k] end
 		simp[k] = v
 	end
-	snap.bake = bake      -- nil entries mean "the module default applied"
+	-- Only the overrides are known before a bake; run() replaces this with the
+	-- values LocalGrid actually resolved.
+	snap.bake = bake
 	snap.simplify = simp  -- fully resolved; PathSimplify owns every default
 	snap.validate = { rayLift = VALIDATE.rayLift, floorRise = VALIDATE.floorRise,
 		floorDrop = VALIDATE.floorDrop }
@@ -225,8 +232,17 @@ function Pipeline.run(cfg: any?): any
 	local loops, sstats = Pipeline.simplify(data, cfg)
 	local tSimplify = os.clock() - t1
 
+	local effective = Pipeline.effective(cfg)
+	-- LocalGrid resolves every bake default it was not given, so read the values
+	-- back off the bake rather than reporting the handful that were overridden.
+	local baked = {}
+	for k, v in pairs(data.config) do
+		baked[k] = typeof(v) == "Instance" and v:GetFullName() or v
+	end
+	effective.bake = baked
+
 	local result = {
-		config = Pipeline.effective(cfg),
+		config = effective,
 		data = data,
 		loops = loops,
 		stats = { boundary = bstats, simplify = sstats,
@@ -240,7 +256,7 @@ end
 -- it. A drawing in the workspace and a stamp beside the code then describe the
 -- same run, which is the thing that was missing before.
 function Pipeline.stamp(result: any): Instance
-	local parent = script.Parent
+	local parent = Pipeline.stampParent
 	local v = parent:FindFirstChild(Pipeline.stampName)
 	if not v or not v:IsA("StringValue") then
 		if v then v:Destroy() end
