@@ -606,6 +606,117 @@ function PathSimplify.collapseBevels(pts: {Vector3}, opts: any?)
 	return out, stats
 end
 
+-- CLOSE AN OPEN PATH.
+--
+-- The tracer reports an open path when the two ends of a region's boundary never
+-- met -- a seam it could not stitch. The polygon is otherwise correct, so the
+-- hole is at the ends and nowhere else, and it can be shut in one of two ways.
+--
+-- WHICH WAY DEPENDS ON THE ANGLE BETWEEN THE TWO END LINES, and that is the
+-- whole point of the split. Where they meet squarely, extending both to their
+-- crossing recovers a real corner the trace lost. Where they are near collinear
+-- the crossing is meaningless: at a few degrees its position swings wildly on
+-- the fitted directions, and chasing it is what produced spikes in the old
+-- Contour connect. There the ends are already almost on the same line, so
+-- joining them directly is both simpler and stabler.
+--
+-- REFUSING IS A VALID OUTCOME. closeMaxGap is what stops this bridging a genuine
+-- hole in the floor: past it the opening is not a seam artefact and closing it
+-- would invent walkable ground. `validate` gets the same (corner, a, b) shape as
+-- collapseBevels, so one raycast callback serves both; on a straight join the
+-- midpoint stands in for the corner, which tests the two halves of the one edge.
+PathSimplify.closeMaxGap = 3.0     -- studs between the ends; refuse beyond this
+PathSimplify.closeAngleMin = 25    -- degrees; below this, join the ends straight
+-- On a well-formed corner of at least closeAngleMin the crossing sits CLOSER to
+-- each end than the ends are to each other, so this cap only fires when the ends
+-- are badly placed. The sign test below is the guard doing the real work.
+PathSimplify.closeTravel = 2.0     -- studs the crossing may sit past either end
+
+function PathSimplify.close(pts: {Vector3}, opts: any?)
+	local o = opts or {}
+	local up = o.up or Vector3.yAxis
+	local maxGap = o.closeMaxGap or PathSimplify.closeMaxGap
+	local angleMin = o.closeAngleMin or PathSimplify.closeAngleMin
+	local maxTravel = o.closeTravel or PathSimplify.closeTravel
+	local validate = o.validate
+	local n = #pts
+	local stats = { input = n, method = "none", reason = "", gap = 0, angle = 0 }
+	if n < 2 then stats.reason = "too few points"; return pts, false, stats end
+
+	local pEnd, pStart = pts[n], pts[1]
+	local gap = (pStart - pEnd).Magnitude
+	stats.gap = gap
+	if gap < 1e-3 then
+		-- the ends already coincide; drop the duplicate and call it closed
+		local out = table.create(n - 1)
+		for i = 1, n - 1 do out[i] = pts[i] end
+		stats.method = "already closed"
+		return out, true, stats
+	end
+	if gap > maxGap then
+		stats.reason = string.format("gap %.3f over %.3f", gap, maxGap)
+		return pts, false, stats
+	end
+
+	local straightOK = (not validate) or validate((pEnd + pStart) * 0.5, pEnd, pStart)
+
+	local d1 = n >= 3 and (pEnd - pts[n - 1]) or nil
+	local d2 = n >= 3 and (pts[2] - pStart) or nil
+	if d1 and d2 and d1.Magnitude > 1e-6 and d2.Magnitude > 1e-6 then
+		local e1, e2 = d1.Unit, d2.Unit
+		stats.angle = math.deg(math.acos(math.clamp(e1:Dot(e2), -1, 1)))
+	else
+		stats.angle = 0
+	end
+
+	if stats.angle >= angleMin then
+		-- SQUARE ENOUGH TO INTERSECT. Same in-plane solve as collapseBevels: the
+		-- end line is parameterised and the start line supplies the constraint.
+		local e1 = (d1 :: Vector3).Unit
+		local perp = up:Cross(e1)
+		local X = nil
+		if perp.Magnitude > 1e-9 then
+			perp = perp.Unit
+			local dd = d2 :: Vector3
+			local a2, b2 = dd:Dot(e1), dd:Dot(perp)
+			if math.abs(b2) > 1e-7 then
+				local rr = pStart - pEnd
+				X = pEnd + e1 * ((rr:Dot(e1) * b2 - rr:Dot(perp) * a2) / b2)
+			end
+		end
+		if X then
+			-- The crossing must lie FORWARD of the end and BEHIND the start,
+			-- give or take the gap itself. An intersection sitting back along
+			-- both runs is the near-parallel blowup wearing a plausible number.
+			local t1 = (X - pEnd):Dot(e1)
+			local t2 = (pStart - X):Dot((d2 :: Vector3).Unit)
+			local back = -0.5 * gap
+			if t1 < back or t2 < back then
+				stats.reason = "crossing behind the ends"
+			elseif (X - pEnd).Magnitude > maxTravel or (X - pStart).Magnitude > maxTravel then
+				stats.reason = "crossing too far past the ends"
+			elseif validate and not validate(X, pEnd, pStart) then
+				stats.reason = "crossing blocked"
+			else
+				local out = table.clone(pts)
+				out[n + 1] = X
+				stats.method = "intersect"
+				return out, true, stats
+			end
+		else
+			stats.reason = "lines do not cross"
+		end
+	end
+
+	if straightOK then
+		stats.method = "straight"
+		if stats.reason ~= "" then stats.reason = "fell back: " .. stats.reason end
+		return pts, true, stats
+	end
+	if stats.reason == "" then stats.reason = "straight join blocked" end
+	return pts, false, stats
+end
+
 local function segment(a: Vector3, b: Vector3, thick: number, colour: Color3,
 	mat: Enum.Material, name: string, parent: Instance)
 	local d = b - a
