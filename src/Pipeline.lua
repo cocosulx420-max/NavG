@@ -28,7 +28,17 @@ local PathSimplify = require(script.Parent:WaitForChild("PathSimplify"))
 --
 -- `root` is the exception: it has no sensible default, and a bake of the wrong
 -- model is the one mistake that silently produces a plausible answer.
-Pipeline.OVERRIDES = {} :: { [string]: any }
+Pipeline.OVERRIDES = {
+	-- 30, against PathSimplify's own 12. Merging harder is free here and the
+	-- measurement says so: 12 gives 677 corners and 30 gives 621, both at the
+	-- same 0.671 stud worst deviation and the same two edges over a step. 40
+	-- gives 580 but doubles the edges over a step, so the cost starts there.
+	--
+	-- This is only safe because mergeMax bounds the drift absolutely. Loosening
+	-- the angle when the drift ceiling was 2.0 studs is exactly what let a 4 stud
+	-- link fold into a 35 stud run and stop describing the floor.
+	mergeAngle = 30,
+} :: { [string]: any }
 
 -- The parameters each stage reads. Used to snapshot what a run actually used,
 -- so a result is self-describing.
