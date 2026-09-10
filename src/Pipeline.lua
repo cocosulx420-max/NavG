@@ -125,20 +125,39 @@ function Pipeline.bake(cfg: any?): (any, any)
 	return data, bstats
 end
 
--- A loop from Boundary.chain is a list of FACE INDICES, not points. Each face
--- is a directed segment a -> b, so the polyline is every face's start; an open
--- path also needs the last face's end, which no other face supplies.
-local function polyline(entry: any, loop: any): ({Vector3}, Vector3)
+-- A loop from Boundary.chain is a list of FACE INDICES, not points. Turning it
+-- into a polyline fixes where a boundary node sits, and that choice is as much
+-- a part of the result as any tolerance.
+--
+-- MIDPOINT, THEN INSET HALF A STEP INTO THE REGION. The face's own corners
+-- zigzag by half a step at every cell, which is noise the simplifier then has to
+-- undo; the midpoint is already the smoother polyline. Inset because a node on
+-- the face sits exactly on the boundary of the floor, where a character cannot
+-- stand and a downward probe is a coin toss; half a step puts it on the centre
+-- line of the outermost cells, clear of the edge and clear of any wall.
+--
+-- Faces are wound region-on-the-left, so up x direction points INTO the region.
+--
+-- Duplicates are dropped. At a convex corner one cell contributes two faces
+-- whose midpoints both inset onto that cell's centre, so the same position would
+-- otherwise appear twice and give the simplifier a zero-length segment.
+local function polyline(entry: any, loop: any, step: number): ({Vector3}, Vector3)
 	local F = loop.faces
-	local pts = table.create(#F + 1)
+	local pts = table.create(#F)
 	local up = Vector3.yAxis
+	local inset = step * 0.5
 	for i, fi in ipairs(F) do
 		local f = entry.faces[fi]
-		pts[i] = f.a
 		if i == 1 then up = f.up end
+		local d = f.b - f.a
+		if d.Magnitude > 1e-9 then
+			local p = (f.a + f.b) * 0.5 + f.up:Cross(d.Unit) * inset
+			local prev = pts[#pts]
+			if not prev or (prev - p).Magnitude > 1e-3 then pts[#pts + 1] = p end
+		end
 	end
-	if not loop.closed and #F > 0 then
-		pts[#F + 1] = entry.faces[F[#F]].b
+	if #pts > 1 and loop.closed and (pts[1] - pts[#pts]).Magnitude < 1e-3 then
+		pts[#pts] = nil
 	end
 	return pts, up
 end
@@ -150,6 +169,7 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 	local o = {}
 	for _, k in ipairs(SIMPLIFY_KEYS) do o[k] = c[k] end
 	local debugRoot = workspace:FindFirstChild(Pipeline.debugName)
+	local step = data.config.step
 
 	local out = {}
 	local stats = { loops = 0, open = 0, raw = 0, corners = 0,
@@ -164,7 +184,7 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 	for _, r in ipairs(regions) do
 		local entry = data.boundary[r]
 		for li, L in ipairs(entry.loops) do
-			local poly, up = polyline(entry, L)
+			local poly, up = polyline(entry, L, step)
 			local opts = table.clone(o)
 			opts.closed = L.closed
 			opts.up = up
