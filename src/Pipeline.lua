@@ -38,6 +38,20 @@ Pipeline.OVERRIDES = {
 	-- the angle when the drift ceiling was 2.0 studs is exactly what let a 4 stud
 	-- link fold into a 35 stud run and stop describing the floor.
 	mergeAngle = 30,
+	-- mergeMin, NOT mergeMax, is what bounds a short span. The allowance is
+	-- clamp(mergeRel * chord, mergeMin, mergeMax), and mergeRel of a six stud
+	-- chord is 0.3, so every short span lands on the floor and mergeMax never
+	-- enters into it. That is why loosening mergeMax alone changed nothing.
+	--
+	-- A quantised diagonal steps sideways about 0.6 studs, just over one cell, so
+	-- at 0.35 all of those merges were refused and the line kept its stair
+	-- pattern: 40 drift refusals on r001 loop3 alone, none from the raycast. 0.55
+	-- clears them and leaves the worst deviation exactly where it was, at 0.671.
+	-- Above 0.7 the deviation itself starts to climb.
+	mergeMin = 0.55,
+	-- Raised only so the clamp stays coherent once mergeMin moves. Still far below
+	-- the 1.77 studs that let a 4 stud link fold into a 35 stud run.
+	mergeMax = 1.2,
 } :: { [string]: any }
 
 -- The parameters each stage reads. Used to snapshot what a run actually used,
