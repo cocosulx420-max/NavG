@@ -610,15 +610,27 @@ end
 --
 -- The tracer reports an open path when the two ends of a region's boundary never
 -- met -- a seam it could not stitch. The polygon is otherwise correct, so the
--- hole is at the ends and nowhere else, and it can be shut in one of two ways.
+-- hole is at the ends and nowhere else, and it can be shut three ways.
 --
 -- WHICH WAY DEPENDS ON THE ANGLE BETWEEN THE TWO END LINES, and that is the
 -- whole point of the split. Where they meet squarely, extending both to their
 -- crossing recovers a real corner the trace lost. Where they are near collinear
 -- the crossing is meaningless: at a few degrees its position swings wildly on
 -- the fitted directions, and chasing it is what produced spikes in the old
--- Contour connect. There the ends are already almost on the same line, so
--- joining them directly is both simpler and stabler.
+-- Contour connect.
+--
+-- WHEN THEY ARE NEAR COLLINEAR AND CLOSE, THE TWO ENDS ARE ONE CORNER, and the
+-- gap is the trace overshooting it rather than a real edge. Proof is in the
+-- decomposition: in r026 the 0.680 stud gap is 0.672 ALONG the end direction and
+-- 0.10 across it, so the ends are not beside each other, they are the same place
+-- reached from two sides. Joining them with a stub edge keeps a vertex that
+-- should not exist and leaves a sliver. Merging them into one node slides each
+-- end half the gap back along its own run, which is the short move the geometry
+-- is already asking for. The merged vertex keeps whatever shallow kink the two
+-- directions disagree by; the collinearity pass dissolves that if it is noise.
+--
+-- Only the INTERSECT case appends a vertex, because there the corner genuinely
+-- lies beyond both ends and both new edges are real.
 --
 -- REFUSING IS A VALID OUTCOME. closeMaxGap is what stops this bridging a genuine
 -- hole in the floor: past it the opening is not a seam artefact and closing it
@@ -626,11 +638,16 @@ end
 -- collapseBevels, so one raycast callback serves both; on a straight join the
 -- midpoint stands in for the corner, which tests the two halves of the one edge.
 PathSimplify.closeMaxGap = 3.0     -- studs between the ends; refuse beyond this
-PathSimplify.closeAngleMin = 25    -- degrees; below this, join the ends straight
+PathSimplify.closeAngleMin = 25    -- degrees; below this, the ends are one corner
 -- On a well-formed corner of at least closeAngleMin the crossing sits CLOSER to
 -- each end than the ends are to each other, so this cap only fires when the ends
 -- are badly placed. The sign test below is the guard doing the real work.
 PathSimplify.closeTravel = 2.0     -- studs the crossing may sit past either end
+-- Past closeMergeMax the gap is wide enough to be a real edge and gets one.
+PathSimplify.closeMergeMax = 1.0   -- studs; widest gap the ends may merge across
+-- Each end slides half the gap, so a run shorter than this would be swallowed
+-- whole and the merge would delete boundary rather than tidy it.
+PathSimplify.closeMergeRun = 2     -- each adjacent run must be this many gaps
 
 function PathSimplify.close(pts: {Vector3}, opts: any?)
 	local o = opts or {}
@@ -638,6 +655,8 @@ function PathSimplify.close(pts: {Vector3}, opts: any?)
 	local maxGap = o.closeMaxGap or PathSimplify.closeMaxGap
 	local angleMin = o.closeAngleMin or PathSimplify.closeAngleMin
 	local maxTravel = o.closeTravel or PathSimplify.closeTravel
+	local mergeMax = o.closeMergeMax or PathSimplify.closeMergeMax
+	local mergeRun = o.closeMergeRun or PathSimplify.closeMergeRun
 	local validate = o.validate
 	local n = #pts
 	local stats = { input = n, method = "none", reason = "", gap = 0, angle = 0 }
@@ -657,8 +676,6 @@ function PathSimplify.close(pts: {Vector3}, opts: any?)
 		stats.reason = string.format("gap %.3f over %.3f", gap, maxGap)
 		return pts, false, stats
 	end
-
-	local straightOK = (not validate) or validate((pEnd + pStart) * 0.5, pEnd, pStart)
 
 	local d1 = n >= 3 and (pEnd - pts[n - 1]) or nil
 	local d2 = n >= 3 and (pts[2] - pStart) or nil
@@ -708,6 +725,31 @@ function PathSimplify.close(pts: {Vector3}, opts: any?)
 		end
 	end
 
+	-- MERGE THE TWO ENDS INTO ONE NODE. The midpoint is the honest choice: with
+	-- the lines near collinear the gap is almost all along them, so the midpoint
+	-- sits on both to within half their lateral offset, and each end slides back
+	-- half a gap along its own run rather than across it.
+	--
+	-- n >= 4 so the result is still a polygon, and each adjacent run must be
+	-- several gaps long so the slide stays inside the run that defines it.
+	if gap <= mergeMax and n >= 4 and d1 and d2 then
+		local la, lb = d1.Magnitude, d2.Magnitude
+		if la >= gap * mergeRun and lb >= gap * mergeRun then
+			local M = (pEnd + pStart) * 0.5
+			if validate and not validate(M, pts[n - 1], pts[2]) then
+				stats.reason = "merged node blocked"
+			else
+				local out = table.create(n - 1)
+				out[1] = M
+				for i = 2, n - 1 do out[i] = pts[i] end
+				stats.method = "merge"
+				stats.travel = gap * 0.5
+				return out, true, stats
+			end
+		end
+	end
+
+	local straightOK = (not validate) or validate((pEnd + pStart) * 0.5, pEnd, pStart)
 	if straightOK then
 		stats.method = "straight"
 		if stats.reason ~= "" then stats.reason = "fell back: " .. stats.reason end
