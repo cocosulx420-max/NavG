@@ -30,14 +30,63 @@ local DIAG = { {1,1}, {-1,1}, {-1,-1}, {1,-1} }
 -- tracing it yields a ring of three or four nodes that describes nothing. The
 -- test is LocalGrid's own: area against minWidth squared, the agent's shoulder
 -- width, so the cutoff is the same one that already prunes narrow strips.
+-- WIDTH, NOT AREA. This used to compare the region's cell count against
+-- minWidth squared, which is an area test wearing a width test's name: it asks
+-- whether a region is BIG, and a small region that is perfectly wide enough to
+-- stand in fails it. A 2 by 2 stud crawl space needs sixteen cells at a half
+-- step and a fifteen cell one was thrown away, taking a whole traversable
+-- pocket out of the navmesh before the tracer ever saw it.
+--
+-- The real question is the one pruneNarrow asks of a cell: does a square of
+-- side traceMinWidth fit inside the region. Squares are tested per grid, on the
+-- grid's own lattice indices, because that is the only place cells are indexed;
+-- a region spanning parts is judged on the widest square any single grid holds.
+--
+-- traceMinWidth is separate from minWidth on purpose. minWidth is a standing
+-- agent's shoulders and prunes handrails at the CELL level; this gate decides
+-- whether a surviving region is worth tracing, and a crawl space is narrower
+-- than shoulders by definition.
 local function liveRegions(data: any): { [number]: boolean }
+	if data.liveCache then return data.liveCache end
 	local c = data.config
-	local minArea = (c.minWidth or 0) ^ 2
-	local cell = (c.step or 0.5) ^ 2
+	local step = c.step or 0.5
+	local minW = c.traceMinWidth or c.minWidth or 0
+	local k = math.max(1, math.ceil(minW / step))
+
 	local out = {}
-	for r, n in ipairs(data.stats.regionSizes or {}) do
-		if n * cell >= minArea then out[r] = true end
+	if k <= 1 then
+		for r in ipairs(data.stats.regionSizes or {}) do out[r] = true end
+		data.liveCache = out
+		return out
 	end
+
+	for _, g in ipairs(data.grids) do
+		-- occupancy per region on THIS grid's lattice
+		local occ: { [number]: { [string]: boolean } } = {}
+		for _, cell in ipairs(g.cells) do
+			local r = cell.region
+			if r and not out[r] then
+				local o = occ[r]
+				if not o then o = {}; occ[r] = o end
+				o[(cell.ui or 0) .. ":" .. (cell.vi or 0)] = true
+			end
+		end
+		for r, o in pairs(occ) do
+			for key in pairs(o) do
+				local u0, v0 = key:match("^(-?%d+):(-?%d+)$")
+				u0, v0 = tonumber(u0), tonumber(v0)
+				local full = true
+				for du = 0, k - 1 do
+					for dv = 0, k - 1 do
+						if not o[(u0 + du) .. ":" .. (v0 + dv)] then full = false break end
+					end
+					if not full then break end
+				end
+				if full then out[r] = true break end
+			end
+		end
+	end
+	data.liveCache = out
 	return out
 end
 Boundary.liveRegions = liveRegions
