@@ -1,34 +1,25 @@
 --!strict
--- NVGN.Contour -- Recast stage 4, part one: turn a region's cells into LINES.
+-- NVGN.Contour -- turn one region's cells into LINES.
 --
--- Input is one REGION's cells (strictly coplanar, from NodeWalk.regions), given
--- as the drawn debug Parts or as {cf=CFrame} entries. Output is:
+-- Input is one region's cells, strictly coplanar, given as drawn debug Parts or
+-- as {cf=CFrame} entries. Output is:
 --   * loops    -- the region's boundary, traced as closed rings of cells
 --   * tangent  -- a direction per border cell, fitted from its neighbours
 --   * lines    -- runs of consistent direction, one per straight stretch
 --
--- On case5 region #40 (90836 cells) this turns a 4480-step staircase boundary
--- into 91 lines, median 18 cells, longest 470.
---
--- WHY DIRECTION FITTING RATHER THAN CHORD SIMPLIFICATION.
--- The obvious approach -- greedily extend a chord while it stays inside the
--- region -- was tried and rejected. It handles convex boundaries beautifully
--- (a 400-step diagonal collapsed to one 199-stud edge) but cannot straighten a
--- CONCAVE staircase, because any chord across a notch leaves the region. On
--- region #40 that left 71% of its output edges at one stud or shorter. Fitting
--- a direction field and cutting where the direction turns has no such blind
--- spot: a staircase has a constant tangent whichever way it bends.
+-- Segmentation fits a direction field and cuts where the direction turns. It is
+-- NOT chord simplification: a chord across a concave notch leaves the region, so
+-- chord growing cannot straighten a staircase. A staircase has a constant
+-- tangent whichever way it bends.
 
 local Contour = {}
 
 local DEFAULT = {
 	leaf = 0.5,
 
-	-- PCA window for the tangent fit, in studs. Measured on region #40:
-	--   1.5 -> mean linearity 0.973, 20 low-linearity cells
-	--   3.0 -> 0.955,  99
-	--   5.0 -> 0.946, 145
-	-- Bigger windows round off corners. 1.5-3.0 is the usable band.
+	-- PCA window for the tangent fit, in studs. Wider windows round off corners:
+	-- mean linearity falls 0.973 / 0.955 / 0.946 at 1.5 / 3.0 / 5.0. Usable band
+	-- is 1.5 to 3.0.
 	window = 1.5,
 
 	-- Start a new line when the tangent leaves the line's ANCHOR direction by
@@ -40,13 +31,12 @@ local DEFAULT = {
 	mergeCap = 20,  -- never merge a fragment into a neighbour further off than this
 	thickness = 1,  -- border band depth, in cells
 
-	-- How far a short stretch must diverge from BOTH neighbours before it is
-	-- treated as a line in its own right rather than a corner fragment. This is
-	-- deliberately much larger than mergeCap: gating on mergeCap (20) keeps every
-	-- fragment the merge pass refused, which on region 40 gave 190 lines with 105
-	-- of them under 5 cells -- the exact failure the distribution pass exists to
-	-- prevent. The stubs worth keeping are near perpendicular to their neighbours
-	-- (measured: 45-79 degrees on line 69, ~50 on line 8), not merely off-axis.
+	-- How far a short stretch must diverge from BOTH neighbours before it counts
+	-- as a line in its own right rather than a corner fragment. Much larger than
+	-- mergeCap on purpose: gating on mergeCap keeps every fragment the merge pass
+	-- refused, which is the failure the distribution pass exists to prevent. The
+	-- stubs worth keeping are near perpendicular to their neighbours, not merely
+	-- off-axis.
 	keepAngle = 45,
 
 	-- A loop no wider than this (in CELLS) skips the tangent field entirely and
@@ -63,16 +53,13 @@ local DEFAULT = {
 
 	-- U-turn pairing. A U-turn is two lines running ALONGSIDE each other, so it
 	-- is identified from the pair as a whole -- near-parallel axes, a small
-	-- perpendicular separation, and a real overlap -- and then a connector is
-	-- emitted at EACH end where both lines terminate.
+	-- perpendicular separation, and a real overlap -- and a connector is emitted
+	-- at EACH end where both lines terminate.
 	--
-	-- Requiring the connector itself to be perpendicular (the first attempt) only
-	-- works when the two rows are the same length. They usually are not: on case5
-	-- the pairs were 12 vs 10 cells and 71 vs 399, so one end squares off and the
-	-- other is STAGGERED along the axis. The staggered end failed the
-	-- perpendicularity test (measured 2.0 degrees), got no connector, and
-	-- Contour.connect then welded the two parallel rows straight to each other --
-	-- reinstating the 180-degree reversal as a 5.7-degree spike.
+	-- The connector is NOT required to be perpendicular. The two rows are rarely
+	-- the same length, so one end squares off and the other is staggered along the
+	-- axis; a perpendicularity test loses the staggered end, and connect then
+	-- welds the two parallel rows to each other and reinstates the reversal.
 	sepMax = 2.5,    -- perpendicular separation, in cells, for a side-by-side pair
 	joinMax = 3.0,   -- furthest apart two ends may be and still get a connector
 	overlapMin = 2,  -- cells of overlap before a pair counts as running alongside
@@ -85,11 +72,9 @@ local DEFAULT = {
 	-- chords stay inside the region, since cutting a corner is exactly how a
 	-- boundary ends up running through a wall. Set to 0 to keep every edge.
 	--
-	-- 2.5, not 1.5. Once splitDisjoint began cutting lines into contiguous runs
-	-- the leftovers at corners came out at 1.6 to 2.4 studs -- just above the old
-	-- threshold -- so a corner that should be one vertex was described by a
-	-- little bridging segment instead, and that bridge cut the corner and clipped
-	-- the wall. Raising the threshold is only safe because the dissolve now
+	-- 2.5, not 1.5: contiguous-run splitting leaves corner leftovers at 1.6 to 2.4
+	-- studs, and a bridging segment there describes as one vertex what is really a
+	-- corner, cutting it and clipping the wall. Safe only because the dissolve
 	-- casts a ray as well as testing the lattice.
 	minEdge = 2.5,
 	-- How far off the lattice a chord may stray before it counts as having left
@@ -104,10 +89,10 @@ local DEFAULT = {
 	-- passes over cells of this region; it cannot see a wall standing between
 	-- two cells at the same height. A ray between the two corner nodes can.
 	rayLift = 0.6,     -- studs along the surface normal, to clear the floor itself
-	-- Shortest chord worth casting along. This exists to skip sub-cell noise,
-	-- NOT to protect small loops -- at 1.5 it exempted every 2-to-3 cell line,
-	-- and a 1-stud line crosses a thin wall perfectly well. Small loops are
-	-- protected by rayMinCells and by refusing to shred what cannot be walked.
+	-- Shortest chord worth casting along: skips sub-cell noise only. This is NOT
+	-- a small-loop guard -- a 1-stud line crosses a thin wall perfectly well.
+	-- Small loops are protected by rayMinCells and by refusing to shred what
+	-- cannot be walked.
 	rayMinChord = 0.75,
 	rayMinCells = 2,   -- never walk a line below this many cells
 }
@@ -120,9 +105,8 @@ local function merged(cfg)
 end
 
 -- Angles live on a 180-degree axis (a line has no head or tail), so ordinary
--- arithmetic on them is wrong. A linear max-minus-min calls 179 and 1 a spread
--- of 178 when they are 2 degrees apart -- that mistake once reported 32 broken
--- lines where there were 12. Always use these two.
+-- arithmetic on them is wrong: a linear max-minus-min calls 179 and 1 a spread
+-- of 178 when they are 2 degrees apart. Always use these two.
 local function angDiff(a: number, b: number): number
 	local d = math.abs(a - b) % 180
 	return (d > 90) and (180 - d) or d
@@ -148,15 +132,13 @@ end
 -- THE ANCHOR CELL IS CHOSEN, NOT TAKEN. Using parts[1] makes the whole lattice
 -- depend on iteration order: every coordinate is rounded relative to that cell,
 -- so a different first cell shifts the grid. The shift is usually a whole number
--- of cells and nothing downstream notices, but when the origin lands near a
--- rounding boundary a few cells fall into different (i, j) and the contour comes
--- out slightly different. Measured on region 40: shuffling the input left the
--- cell count identical at 90836 every time, yet one shuffle in six produced a
--- different set of edges. Pick the anchor from the GEOMETRY instead -- the
--- lexicographically smallest position -- so the lattice is a property of the
--- region rather than of the order its parts happened to arrive in. Exact
--- comparison, never an accumulated sum: adding coordinates in a different order
--- is itself order-dependent in floating point.
+-- of cells and nothing downstream notices, but where the origin lands near a
+-- rounding boundary a few cells fall into different (i, j) and the region comes
+-- out with a different set of edges. The anchor is taken from the GEOMETRY --
+-- the lexicographically smallest position -- so the lattice is a property of the
+-- region rather than of the order its parts arrived in. Exact comparison, never
+-- an accumulated sum: adding coordinates in a different order is itself
+-- order-dependent in floating point.
 function Contour.lattice(parts, cfg)
 	local c = merged(cfg)
 	local first = parts[1]
@@ -186,13 +168,11 @@ function Contour.lattice(parts, cfg)
 	         origin = origin, up = up, u = uAx, v = vAx, leaf = c.leaf }
 end
 
--- Border cells, 4-CONNECTED.
--- 8-connectivity was measured and rejected for this purpose: it adds the inner
--- corners of staircases (+630 cells on region #40) and makes the tangent fit
--- slightly WORSE (linearity 0.973 -> 0.959), because those cells sit off the
--- line the rest of the stretch defines. It is the right rule for erosion or for
--- catching corner-to-corner pinch points -- just not for tracing, where a loop
--- is built from cell FACES and a diagonal contact has no face to contribute.
+-- Border cells, 4-CONNECTED. 8-connectivity adds the inner corners of staircases
+-- and makes the tangent fit worse, linearity 0.959 against 0.973, because those
+-- cells sit off the line the rest of the stretch defines. It is the right rule
+-- for erosion and for corner-to-corner pinch points, but not for tracing, where
+-- a loop is built from cell FACES and a diagonal contact has no face to give.
 function Contour.border(L, cfg)
 	local c = merged(cfg)
 	local seed = {}
@@ -259,9 +239,6 @@ function Contour.loops(L)
 end
 
 -- A direction per border cell: principal axis of its neighbourhood.
--- On region #40 adjacent cells agree to within 2 degrees at the 75th percentile,
--- and the angle histogram shows clean peaks on the real edge directions rather
--- than the staircase's jitter.
 function Contour.tangents(L, seed, cfg)
 	local c = merged(cfg)
 	local R = c.window / c.leaf
@@ -311,23 +288,20 @@ end
 
 -- SMALL LOOPS DO NOT HAVE TANGENTS. When a loop is no bigger than the PCA
 -- window, every cell's neighbourhood wraps the whole ring, so the fit returns
--- the ring's DIAMETER rather than any local direction. Measured on the 8-cell
--- ring around case5's 1-stud Target (extent 1.55 studs, window 1.5): cells on
--- OPPOSITE sides of the obstacle came back with identical tangents, and the
--- segmentation duly grouped them into one line whose chord ran straight through
--- the obstacle. The fragment-distribution pass cannot rescue it either -- that
--- is guarded by #segs > 2 and such a loop only ever yields two.
+-- the ring's DIAMETER rather than any local direction: cells on opposite sides
+-- of the obstacle come back with identical tangents and the segmentation groups
+-- them into one line whose chord runs through the obstacle. The
+-- fragment-distribution pass cannot rescue it either, since it is guarded by
+-- #segs > 2 and such a loop only ever yields two.
 --
 -- The raw cell-to-cell step still carries the truth, so use it directly: walk
 -- the ring and take each MAXIMAL RUN OF EQUAL-DIRECTION STEPS as one edge.
 --
 -- The one special case is a lone DIAGONAL step between two runs: that is a
 -- corner, not an edge, so it is dropped and its two cells stay with the faces
--- either side. This distinction is what the rule turns on, and it is easy to
--- get wrong -- cutting only at diagonals looks right on the Target ring (whose
--- 8-degree rotation makes every corner a diagonal step) but returns an
--- axis-aligned ring as one single edge, because there its corners are axis
--- steps that merely turn. Both are covered here:
+-- either side. Cutting ONLY at diagonals is not equivalent -- it returns an
+-- axis-aligned ring as a single edge, because there the corners are axis steps
+-- that merely turn. All three cases are covered:
 --   * rotated ring   -- steps alternate axis/diagonal; four length-1 axis runs
 --                       become the four faces, four diagonals are dropped
 --   * axis-aligned   -- every step is an axis step; direction changes four
@@ -412,9 +386,7 @@ function Contour.lines(L, loops, tangent, cfg)
 		-- angDiff(0, 180) is 0. Where the border runs out along one row of cells
 		-- and returns along the row beside it, both runs carry the SAME tangent and
 		-- the segmentation joins them into one line whose chord covers only the
-		-- longer run. Measured on case5 line 1: 470 cells in two parallel rows 0.5
-		-- studs apart, 400 out and 70 back, every one of them tangent 0, and the
-		-- 70-cell return run left with no edge over it.
+		-- longer run, leaving the return run with no edge over it.
 		--
 		-- The loop ORDER still knows, so carry an orientation the tangent threw
 		-- away: accumulate the segment's net step and cut when a new step opposes
@@ -449,8 +421,7 @@ function Contour.lines(L, loops, tangent, cfg)
 		end
 
 		-- Absorb fragments, but ONLY into a neighbour pointing the same way.
-		-- Uncapped merging drags a line's direction off and produced 12 lines
-		-- bending past 45 degrees from their own mean.
+		-- Uncapped merging drags a line's direction off its own mean.
 		local locked, guard = {}, 0
 		while #segs > 1 and guard < 20000 do
 			guard += 1
@@ -475,16 +446,11 @@ function Contour.lines(L, loops, tangent, cfg)
 		-- Whatever is still too short gets split CELL BY CELL between its two
 		-- neighbours: each cell joins the side it actually agrees with, so a corner
 		-- becomes the boundary between two lines rather than a 2-cell line of its
-		-- own. Keeping fragments gave 193 lines of which 109 were under 5 cells;
-		-- distributing gives 91 lines with one.
-		-- ...but distribution must respect mergeCap too, which it originally did
-		-- not. A stretch under minCells that agrees with NEITHER neighbour is not a
-		-- corner fragment, it is a short LINE, and forcing it into a neighbour
-		-- silently merges two real lines into one. Measured on case5: line 69 was a
-		-- 21-cell run at tangent 45 with a 4-cell stub running perpendicular to it,
-		-- emitted as a single line whose two-piece fit is 100% better than its
-		-- one-piece fit; line 8 was the same failure at 14 + 2 cells. Both stubs
-		-- were under minCells, so the uncapped pass swallowed them.
+		-- own.
+		--
+		-- Distribution respects keepAngle. A stretch under minCells that agrees
+		-- with NEITHER neighbour is not a corner fragment, it is a short LINE, and
+		-- forcing it into a neighbour silently merges two real lines into one.
 		local keep = {}
 		local changed = true
 		while changed do
@@ -524,25 +490,22 @@ end
 -- has nowhere to go. Emit the single lattice step across the gap as its own
 -- edge, which turns one 180-degree reversal into two 90-degree turns.
 --
--- IDENTIFYING THEM WITHOUT WINDING. The obvious test -- two lines whose
--- directions are antiparallel -- cannot be used, because a line's stored
--- direction comes from a fit and carries no head or tail. Measured on the
--- case5 U-turn, the two lines' fitted directions came out exactly PARALLEL
--- (dot +1.0000), and testing for antiparallel instead produced two false hits
--- elsewhere in the region. All four conditions below are undirected:
+-- IDENTIFYING THEM WITHOUT WINDING. A line's stored direction comes from a fit
+-- and carries no head or tail, so the two rows of a U-turn read as PARALLEL,
+-- not antiparallel, and an antiparallel test cannot find them. All four
+-- conditions below are undirected:
 --   1. an endpoint of each line, within one leaf of each other
 --   2. the two line axes near parallel      (undirected, <= 20 degrees)
 --   3. the connector near perpendicular to both        (>= 70 degrees)
 --   4. the lines OVERLAP along their shared axis -- they run alongside each
 --      other rather than meeting end to end, which is what separates a U-turn
 --      from an ordinary collinear hand-off
+
 -- A LINE'S CELL LIST IS NOT IN ORDER. Both the merge and the distribution pass
 -- append a fragment's cells onto the end of a neighbouring segment, so seg[1]
 -- and seg[#seg] are whatever happened to land there, not the line's two ends.
--- That is harmless for painting, which is all lines were used for, but any
--- geometry built from the list order is wrong: taking the ends on trust left
--- only 100 of 200 endpoints joined on region 40, some of them 30+ studs adrift.
--- Always take the extremes along the line's own axis instead.
+-- Any geometry built from the list order is wrong. Always take the extremes
+-- along the line's own axis, which is what this returns.
 local function endpointsOf(L, seg)
 	local n = #seg
 	local mi, mj = 0, 0
@@ -641,12 +604,10 @@ function Contour.connectors(L, lines, cfg)
 							local ca, cb = L.coord[ka], L.coord[kb]
 							local vx, vy = cb[1]-ca[1], cb[2]-ca[2]
 							local gap = math.sqrt(vx*vx + vy*vy)
-							-- The connector must CROSS the sliver. Dropping this test (tried,
-							-- to reach the staggered end of an uneven pair) emits a stub lying
-							-- along the row instead: on region 52 it produced (0,0)->(-1,0),
-							-- both cells in the same row, parallel to the line it was meant to
-							-- turn away from. That just moves the spike from row-to-row onto
-							-- row-to-connector, at the very same angle.
+							-- The connector must CROSS the sliver. Without this test the stub
+							-- can lie along the row instead, parallel to the line it is meant
+							-- to turn away from, which moves the spike from row-to-row onto
+							-- row-to-connector at the very same angle.
 							if gap > 1e-6 and gap <= c.joinMax
 								and undirected(vx/gap, vy/gap, axis[a][1], axis[a][2]) >= 70 then
 								table.insert(cand, { gap = gap, ka = ka, kb = kb, ia = ia, ib = ib })
@@ -676,12 +637,10 @@ end
 -- CLOSING A U-TURN BY STEALING ITS CORNER.
 --
 -- Where the boundary doubles back, the two rows must be joined by a
--- perpendicular edge or the polygon cannot be walked. Building that edge BETWEEN
--- two lines' endpoints does not work, and the reason is worth keeping: at the
--- turn, ONE line usually owns BOTH corner cells. Measured on region 40, cells
--- (399,-1) and (399,0) -- the two rows' real ends -- were both in line 1, which
--- ran down one row, turned, and came back along the other. So there is no
--- cross-line pair at the true corner, and a search for one silently falls back
+-- perpendicular edge or the polygon cannot be walked. That edge cannot be built
+-- BETWEEN two lines' endpoints: at the turn, ONE line usually owns BOTH corner
+-- cells, having run down one row, turned, and come back along the other. There
+-- is then no cross-line pair at the true corner, and a search for one falls back
 -- to the nearest pair that IS split, one cell behind the turn.
 --
 -- That same wrap breaks endpointsOf, which takes the extremes along a line's
@@ -800,24 +759,21 @@ function Contour.stealUTurns(L, lines, loops, cfg)
 	return out, { links = #steal, splits = splits, firstLink = firstLink }
 end
 
--- Stage 4 part two: turn the lines into a closed polygon by EXTENDING each one
+-- Contour.connect turns the lines into a closed polygon by EXTENDING each one
 -- along its own direction until it meets its neighbour, and welding both ends to
 -- that crossing. Chords stop at cell centres, so consecutive lines end about a
 -- cell apart and the boundary is not walkable until they actually share a
--- vertex. Measured on case5: 198 endpoints, every one with a partner inside
--- 1.118 studs, 196 of them mutual nearest -- so the pairing is unambiguous and
--- needs no search radius beyond one cell diagonal.
+-- vertex.
 --
--- Two lines that are near PARALLEL have no usable crossing: it is either
--- nowhere or absurdly far outside the region. Those weld at the midpoint
--- instead, as does any pair whose crossing lands further than maxExtend away.
--- On case5 three junctions took the parallel path (down to 0.0 degrees apart)
--- and the distance cap never fired -- every real crossing was within 0.99 studs.
+-- Two lines that are near PARALLEL have no usable crossing: it is either nowhere
+-- or absurdly far outside the region. Those weld at the midpoint instead, as
+-- does any pair whose crossing lands further than maxExtend away.
 --
--- This is why U-turns had to be closed first (see Contour.connectors). At a
--- U-turn the two lines are parallel and their ends are adjacent, so extension
--- cannot join them -- there is no crossing to find. The connector supplies the
+-- U-turns must be closed before this runs (see Contour.connectors). At a U-turn
+-- the two lines are parallel and their ends are adjacent, so extension cannot
+-- join them -- there is no crossing to find. The connector supplies the
 -- perpendicular edge that gives each side something to meet at right angles.
+
 -- Where two lines cross, in the region's own plane.
 local function planeMeet(L, p1, d1, p2, d2)
 	local function planar(v) return v:Dot(L.u), v:Dot(L.v) end
@@ -831,12 +787,12 @@ end
 
 -- Does the straight run from `p` to `q` stay over the region?
 --
--- This is the test the fitted edges never had. A line is fitted to cells that
--- follow the boundary, but it is DRAWN as the chord between its endpoints, and
--- a chord across a concavity leaves the region -- which is how a boundary ends
--- up crossing a wall. Sampling at half a cell is finer than any feature the
--- lattice can hold, and `slack` cells of tolerance allow the ordinary case of a
--- chord running just outside the border band it was fitted to.
+-- A line is fitted to cells that follow the boundary but is DRAWN as the chord
+-- between its endpoints, and a chord across a concavity leaves the region --
+-- which is how a boundary ends up crossing a wall. Sampling at half a cell is
+-- finer than any feature the lattice can hold, and `slack` cells of tolerance
+-- allow the ordinary case of a chord running just outside the border band it was
+-- fitted to.
 function Contour.chordInside(L, p, q, slack)
 	slack = slack or 1
 	local d = q - p
@@ -864,14 +820,13 @@ end
 --
 -- Contour.lines groups cells by tangent direction and then distributes the
 -- leftovers cell by cell, so a "line" is a set of cells that agree on direction
--- -- NOT necessarily a connected run. Measured on case5: 304 of 711 lines
--- contain a step between cells that are not lattice neighbours.
+-- -- NOT necessarily a connected run.
 --
 -- Everything downstream assumes otherwise. A line is drawn as the chord between
 -- its two extreme cells, and if the cells in between are not actually joined,
--- that chord crosses whatever lies in the gap: three cells came out drawn 44.9
--- studs long. Splitting, walking back and dissolving all inherit the same
--- assumption. Enforce it once, here, and the rest becomes sound.
+-- that chord crosses whatever lies in the gap. Splitting, walking back and
+-- dissolving all inherit the same assumption, so it is enforced once here and
+-- every later pass may rely on it.
 function Contour.splitDisjoint(L, lines)
 	local out, stats = {}, { split = 0 }
 	for _, seg in ipairs(lines) do
@@ -972,13 +927,11 @@ function Contour.validateLines(L, lines, tangent, cfg)
 		for i, k in ipairs(seg) do work[i] = k end
 		local dropped = {}
 		local ok = false
-		-- CHOOSE THE END ONCE. Re-deciding each step looks harmless and is not:
-		-- as the near end erodes it gets further from the bad corner, the
-		-- comparison flips, and the walk starts eating the OTHER end. `dropped`
-		-- then holds cells from both ends of the original run -- not a
-		-- contiguous line at all -- and the piece it becomes is drawn as a chord
-		-- across everything between them. That is how a 3-cell line came out
-		-- drawn 44.9 studs long.
+		-- CHOOSE THE END ONCE. Re-deciding each step is wrong: as the near end
+		-- erodes it gets further from the bad corner, the comparison flips, and
+		-- the walk starts eating the OTHER end. `dropped` then holds cells from
+		-- both ends of the original run, which is not a contiguous line, and the
+		-- piece it becomes is drawn as a chord across everything between them.
 		local fromHead =
 			(world(seg[1]) - (badIsHi and b or a)).Magnitude
 			<= (world(seg[#seg]) - (badIsHi and b or a)).Magnitude
@@ -1034,7 +987,7 @@ end
 -- consumed downstream -- as the straight chord between its endpoints. Around a
 -- concavity those are different things: the cells hug the notch, the chord cuts
 -- straight across it, and the result is a boundary running over open space or
--- through a wall. Measured on case5: 5 edges, the worst of them 45 studs long.
+-- through a wall.
 --
 -- The break goes at the cell FURTHEST from the chord, not at the midpoint of the
 -- sequence. That is the corner the chord is cutting, so one split usually
@@ -1177,8 +1130,8 @@ function Contour.connect(L, lines, cfg)
 			local link = nb[i .. w]
 			local back = link and nb[link.j .. link.w]
 			-- An endpoint can have NO partner at all -- a line whose end faces
-			-- nothing in the region. `key` used to be built before this was
-			-- checked, so `link.j` threw on those. Nothing to weld: skip it.
+			-- nothing in the region. `key` is built only once a link exists,
+			-- because it reads `link.j`. Nothing to weld: skip it.
 			local key = link and (math.min(i, link.j) .. "|" .. ((i < link.j) and (w .. link.w) or (link.w .. w)))
 			if link and link.d <= pairMax and back and back.j == i and back.w == w and not done[key] then
 				done[key] = true
@@ -1218,8 +1171,7 @@ function Contour.connect(L, lines, cfg)
 	-- iteration order decides which one wins and the other is abandoned.
 	--
 	-- An open end means the loop is not closed, and an unclosed loop is not a
-	-- polygon, so nothing downstream can build portals from it. Measured on
-	-- case5: 10 of 1086 ends, in 10 separate regions.
+	-- polygon, so nothing downstream can build portals from it.
 	--
 	-- This pass only ever touches ends the first pass left alone. Every weld the
 	-- tuned pairing made is preserved exactly, including the angle tie-break
@@ -1243,9 +1195,8 @@ function Contour.connect(L, lines, cfg)
 					-- NEAR-PARALLEL IS NOT A CORNER. Two ends whose lines run at
 					-- the same angle are the two rows of a U-turn, and joining
 					-- them at a single point rebuilds the 180 degree reversal
-					-- that stealUTurns exists to remove -- as a zero degree
-					-- coincident pair. Measured: without this the pass closed 20
-					-- ends on case3 and created 4 such spikes.
+					-- that stealUTurns exists to remove, as a zero degree
+					-- coincident pair.
 					local ang = math.deg(math.acos(math.clamp(math.abs(E[i].dir:Dot(t.dir)), -1, 1)))
 					if ang >= minAngle then
 						for _, w2 in ipairs({ "a", "b" }) do
@@ -1408,19 +1359,15 @@ function Contour.dissolveShort(L, E, cfg)
 				-- CAP THE EXTENSION, exactly as connect does. Two neighbours of a
 				-- stub are often near parallel -- the two sides of a narrow notch,
 				-- or the ring around a small hole in the floor -- and near
-				-- parallel lines meet a long way off. Uncapped, a 2-cell line with
-				-- a half-stud chord came out drawn as an 8-stud spike shooting
-				-- away from the surface. A corner replacement that has to travel
-				-- further than maxExtend is not a corner.
+				-- parallel lines meet a long way off. A corner replacement that
+				-- has to travel further than maxExtend is not a corner.
 				if X and math.max((X - A[wA]).Magnitude, (X - B[wB]).Magnitude) > maxExtend then
 					X = nil
 					stats.capped += 1
 				elseif not X then
 					stats.refused += 1
 				end
-				if not X then
-					-- already counted above
-				else
+				if X then
 					-- the far end of each neighbour, which the new chord runs from
 					local farA = (wA == "a") and A.b or A.a
 					local farB = (wB == "a") and B.b or B.a
@@ -1495,7 +1442,7 @@ function Contour.paint(res, mode: string?, base: Color3?)
 	return n
 end
 
--- Convenience: pull one region's parts out of a NodeWalk region draw.
+-- Convenience: pull one region's parts out of a region draw, by attribute.
 function Contour.partsOfRegion(folder: Instance, regionId: number)
 	local out = {}
 	for _, p in ipairs(folder:GetChildren()) do

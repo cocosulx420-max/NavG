@@ -66,13 +66,11 @@ local DEFAULT = {
 	-- step up of any size is a wall now, and pathfinding deals with climbing it.
 	-- It is only slack for authoring mismatch and raycast noise.
 	--
-	-- 0.3, not 0.5. This slack is applied to the offset from where THIS surface's
-	-- plane would continue, and on a slope that plane point has already moved
-	-- most of a step: on a 45 degree ramp it drops 0.354 studs per 0.5 stud step,
-	-- so half a stud of slack was nearly a whole step height and the edge of a
-	-- clipramp merged with whatever lay 0.34 below it instead of reading as a
-	-- border. Measured on case5: 0.5 left those cells interior, 0.3 marks them,
-	-- and the whole map moved by 44 cells and 27 border nodes out of 202k.
+	-- 0.3, not 0.5. The slack is measured from where THIS surface's plane would
+	-- continue, and on a 45 degree ramp that point has already dropped 0.354 studs
+	-- per 0.5 stud step. Half a stud of slack is then nearly a whole step height,
+	-- and a clipramp edge merges with whatever lies 0.34 below it instead of
+	-- reading as a border.
 	flushTol = 0.3,
 	-- How far from the expected neighbour position a foreign grid's cell may sit
 	-- and still count as that neighbour. A neighbour on another part's grid is
@@ -96,28 +94,23 @@ local DEFAULT = {
 	-- How far a cell's normal may sit from its REGION's normal, as opposed to
 	-- from its neighbour's. regionAngle alone is a pairwise test and pairwise
 	-- tests chain: on a hill every adjacent pair agrees to a degree or two and
-	-- the whole slope becomes one region, which then gets flattened onto a
-	-- single plane by Contour and comes out quietly wrong rather than visibly
-	-- broken. Measured on case5 r2: 25954 cells, normals spread 20 degrees, 11
-	-- studs of relief, contoured as one plane.
+	-- the whole slope becomes one region, which Contour then flattens onto a
+	-- single plane. It fails quietly rather than visibly: 26k cells spread over
+	-- 20 degrees and 11 studs of relief, contoured as one plane.
 	--
-	-- Compared against an ANCHOR normal per region, never a running mean -- a
-	-- running mean drifts along a curve and swallows the whole thing, which is
-	-- the same trap the Contour segmentation had to avoid.
+	-- Compared against an ANCHOR normal per region, never a running mean. A
+	-- running mean drifts along a curve and swallows the whole thing, the same
+	-- trap the Contour segmentation avoids.
 	regionPlanarity = 5,
 	-- How far two surfels' normals may diverge and still be treated as the same
 	-- FACE of a part. One grid per part is wrong for anything presenting more
 	-- than one walkable face: averaging the normals gives a plane matching
 	-- neither, and every stage downstream inherits the tilt.
 	--
-	-- Measured on case5's small union, a box rotated -49 degrees carrying a flat
-	-- face and a 49 degree face. The averaged frame came out 18 degrees off
-	-- world up, which put a Y component of -0.317 into the in-plane axis v. The
-	-- footprint test walks along v, so the plane climbed away from a surface
-	-- with 0.00 studs of relief -- 0.00, 0.16, 0.32, 0.48 across four cells,
-	-- against a flushTol of 0.30. The last two columns of every footprint
-	-- failed, so 44 of the 66 cells on a flat 3.3 x 5.3 stud slab were pruned as
-	-- "too narrow".
+	-- A box carrying one flat face and one steep face averages to a frame tilted
+	-- between them, which puts a Y component into the in-plane axis v. The
+	-- footprint test walks along v, so the plane climbs away from a surface with
+	-- no relief at all and most of every footprint fails as "too narrow".
 	faceAngle = 15,
 	-- Tallest rise one region may cover, or 0 to never cut on height. OFF by
 	-- default: a ramp or a roof plane is one surface, and slicing it at an
@@ -209,11 +202,9 @@ end
 -- surfel plane keeps the lattice running along the part's own edges without
 -- pinning it to a box that may be tilted off that surface.
 --
--- Every BasePart has a CFrame, so this works for unions and meshes too. It used
--- to be gated on `p:IsA("Part") and p.Shape == Block`, which sent every union
--- and every mesh to a world-axis lattice that ignored their orientation
--- entirely -- the tiles staircased across the part's edges instead of running
--- along them.
+-- Every BasePart has a CFrame, so this works for unions and meshes too. A
+-- world-axis lattice would ignore their orientation and staircase the tiles
+-- across the part's edges instead of running along them.
 --
 -- Returns nil if the part has no usable in-plane axis (a degenerate Size).
 local function surfaceFrame(part: BasePart, surfels: {any}, step: number)
@@ -270,14 +261,11 @@ local function surfaceFrame(part: BasePart, surfels: {any}, step: number)
 		uMax = math.max(uMax, math.abs(r:Dot(u)))
 		vMax = math.max(vMax, math.abs(r:Dot(v)))
 	end
-	-- Grow to the outermost surfel, and NO further. An earlier version added a
-	-- whole `step` of margin here, which was wrong twice over: rounding the cell
-	-- count up already leaves up to half a step of slack on each side, and on a
-	-- part thinner than the step the margin dominated its real size -- a 0.5-stud
-	-- tread was given a 4-cell lattice whose sample points landed on and past its
-	-- edges, so whether a row survived came down to float luck. That is what made
-	-- identical stair treads come out one row deep in some places and two in
-	-- others.
+	-- Grow to the outermost surfel, and NO further. Rounding the cell count up
+	-- already leaves up to half a step of slack on each side, and on a part
+	-- thinner than the step any added margin dominates its real size: the sample
+	-- points land on and past the part's edges, and whether a row survives comes
+	-- down to float luck.
 	uExt = math.max(uExt, uMax)
 	vExt = math.max(vExt, vMax)
 	-- Cap the stray: it only sizes the probe ray, and a wild surfel should not
@@ -322,8 +310,8 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 		grid.deadIndex[string.format("%d:%d", iu, iv)] = d
 	end
 
-	-- Start above the highest stray and reach past the lowest one; on a block
-	-- dev is ~0 and this is the old 2 / 2.5.
+	-- Start above the highest stray and reach past the lowest one. On a block
+	-- dev is ~0.
 	local castH = 2 + dev
 	local castLen = castH + dev + 0.5
 
@@ -403,15 +391,13 @@ local DIR8 = {
 	{ -1, 0 }, { -1, -1 }, { 0, -1 }, { 1, -1 },
 }
 
--- 4-CONNECTED is the default, and it is not a simplification.
---
--- Measured on the other approach: 8-connectivity adds the inner corners of every
--- staircase (+630 cells on case5 region 40) and makes the tangent fit WORSE
--- (linearity 0.973 -> 0.959), because those corner cells sit off the line the
--- rest of the stretch defines. A boundary loop is built from cell FACES, and a
--- diagonal contact has no face to contribute. 8-conn remains the right rule for
--- erosion and for corner-to-corner pinch detection -- which is why pruneNarrow,
--- a filled-square test, is unaffected by this setting.
+-- 4-CONNECTED is the default, and it is not a simplification. 8-connectivity
+-- adds the inner corners of every staircase and makes the tangent fit worse,
+-- linearity 0.959 against 0.973, because those corner cells sit off the line the
+-- rest of the stretch defines: a boundary loop is built from cell FACES and a
+-- diagonal contact has no face to contribute. 8-conn is still the right rule for
+-- erosion and for corner-to-corner pinch detection, which is why pruneNarrow, a
+-- filled-square test, ignores this setting.
 local DIR4 = {
 	{ 1, 0 }, { 0, 1 }, { -1, 0 }, { 0, -1 },
 }
@@ -452,9 +438,9 @@ end
 --
 -- Slope and clearance cannot catch a handrail. The top of a 1-stud rail sits at
 -- 0 degrees with open sky above it, which on those two measurements is exactly
--- what a strip of real floor looks like. Width is the fact that separates them
--- and nothing was measuring it, so case3 grew cells along stair stringers,
--- ledges and window trim -- 25 grids and 113 cells, 4.3% of the bake.
+-- what a strip of real floor looks like. Width is the only fact that separates
+-- them, and without this pass the bake grows cells along stair stringers, ledges
+-- and window trim.
 --
 -- The test is whether the agent's square footprint fits SOMEWHERE that covers
 -- the cell. Asking for a covering footprint rather than a centred one is what
@@ -535,12 +521,12 @@ function LocalGrid.pruneNarrow(data: any, cfg: Config?)
 
 		-- A cell is standable if the agent's footprint fits ANYWHERE covering it.
 		--
-		-- Two 1-D runs through the cell -- an earlier version of this test -- ask
-		-- a weaker question, and handrails exploited the gap: a rail has a long
-		-- run along its length, and where it meets a newel post or dies into a
-		-- wall the crosswise run leaks onto that neighbour and reaches width. So
-		-- the middle of every rail was pruned and its ends survived. A filled
-		-- square closes that, because a post cap cannot complete one.
+		-- A FILLED SQUARE, not two 1-D runs through the cell. Two runs ask a
+		-- weaker question that a handrail passes: a rail has a long run along its
+		-- length, and where it meets a newel post or dies into a wall the
+		-- crosswise run leaks onto that neighbour and reaches width, so the middle
+		-- of the rail prunes and its ends survive. A post cap cannot complete a
+		-- filled square.
 		--
 		-- Asking whether a covering footprint EXISTS, rather than whether the one
 		-- centred here fits, is what keeps the edge cells of a wide floor: their
@@ -617,17 +603,15 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 			for bit, d in ipairs(dirs) do
 				local p = neighbourPos(g, cell, d)
 				local bx, bz = math.floor(p.X), math.floor(p.Z)
-				-- BELOW OUTRANKS ABOVE, and getting that backwards is what marked
-				-- the rim of every raised platform as a wall. "Any surface higher
-				-- than stepTol is a wall" cannot tell a riser you would bump into
-				-- from a balcony three storeys up: measured, the surface found
-				-- above those rim nodes was 9, 13, even 18 studs overhead, with
-				-- open air the whole way down.
+				-- BELOW OUTRANKS ABOVE. "Any surface higher than stepTol is a
+				-- wall" cannot tell a riser you would bump into from a balcony
+				-- three storeys up, so on its own it marks the rim of every
+				-- raised platform as a wall.
 				--
 				-- Live floor BELOW is the giveaway. If floor is visible down there
 				-- the space is open and you would fall through it -- a dropoff, no
 				-- matter what is overhead. A wall standing at that spot would have
-				-- killed that floor, so it would not be live. So: floor first,
+				-- killed that floor, so it would not be live. Order: floor first,
 				-- then below, then above.
 				local floor, above, below = false, false, false
 				for ox = -1, 1 do
@@ -729,7 +713,38 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 	local grids: {Grid} = {}
 	local cosFace = math.cos(math.rad(c.faceAngle))
 	local nBlock, nFallback, nCells, nDead, nParts, nFaces = 0, 0, 0, 0, 0, 0
+	-- DETERMINISTIC PART ORDER -- the seed of the whole bake.
+	--
+	-- `byPart` is keyed by BasePart, and Luau hashes an instance key by pointer,
+	-- so `pairs` walked the parts in a different order every Studio run. That
+	-- order fixes the grid array, which fixes the order `regions` unions cells
+	-- in, which fixes which side is larger at each merge, which fixes the anchor
+	-- each new member is judged against. Without a fixed order the same code on
+	-- the same map produces different regions, not merely different numbering.
+	--
+	-- Order by each part's lexicographically smallest surfel instead. A surfel
+	-- belongs to exactly one part, so the key is unique across groups and comes
+	-- from the geometry rather than from allocation.
+	local ordered = {}
 	for part, sfs in pairs(byPart) do
+		local best = nil
+		for _, s in ipairs(sfs) do
+			local p = s.pos
+			if not best
+				or p.X < best.X
+				or (p.X == best.X and (p.Z < best.Z or (p.Z == best.Z and p.Y < best.Y))) then
+				best = p
+			end
+		end
+		ordered[#ordered + 1] = { part = part, sfs = sfs, key = best }
+	end
+	table.sort(ordered, function(a, b)
+		if a.key.X ~= b.key.X then return a.key.X < b.key.X end
+		if a.key.Z ~= b.key.Z then return a.key.Z < b.key.Z end
+		return a.key.Y < b.key.Y
+	end)
+	for _, entry in ipairs(ordered) do
+		local part, sfs = entry.part, entry.sfs
 		nParts += 1
 		local faces = splitFaces(sfs, cosFace)
 		nFaces += #faces
@@ -881,7 +896,7 @@ function LocalGrid.regions(data: any, cfg: Config?)
 	end
 
 	local gridOf: { [any]: any } = {}
-	for _, g in pairs(data.grids) do
+	for _, g in ipairs(data.grids) do
 		for _, cell in ipairs(g.cells) do
 			gridOf[cell] = g
 			for _, d in ipairs(dirs) do
@@ -905,17 +920,20 @@ function LocalGrid.regions(data: any, cfg: Config?)
 		end
 	end
 
+	-- `members` is keyed by the root CELL, a table, so `pairs` over it follows
+	-- the same pointer hash and shuffled the groups even when the partition was
+	-- identical. Collect in first-seen order over the grids, which are now in a
+	-- fixed order, so the same partition always comes out in the same order.
 	local members: { [any]: {Cell} } = {}
-	for _, g in pairs(data.grids) do
+	local groups = {}
+	for _, g in ipairs(data.grids) do
 		for _, cell in ipairs(g.cells) do
 			local r = find(cell)
 			local m = members[r]
-			if not m then m = {}; members[r] = m end
+			if not m then m = {}; members[r] = m; groups[#groups + 1] = m end
 			m[#m + 1] = cell
 		end
 	end
-	local groups = {}
-	for _, m in pairs(members) do groups[#groups + 1] = m end
 
 	-- Cut regions that climb too far into bands of bandHeight.
 	--
@@ -970,20 +988,44 @@ function LocalGrid.regions(data: any, cfg: Config?)
 						end
 					end
 				end
+				-- first-seen collection, for the same reason as above
 				local parts: { [any]: {Cell} } = {}
 				for _, cell in ipairs(m) do
 					local r = bfind(cell)
 					local t = parts[r]
-					if not t then t = {}; parts[r] = t end
+					if not t then t = {}; parts[r] = t; out[#out + 1] = t end
 					t[#t + 1] = cell
 				end
-				for _, t in pairs(parts) do out[#out + 1] = t end
 			end
 		end
 		groups = out
 	end
 
-	table.sort(groups, function(a, b) return #a > #b end)
+	-- SIZE ALONE IS NOT A TOTAL ORDER. case5 has fifteen regions of exactly 144
+	-- cells, and `table.sort` is not stable, so ties alone reshuffled the ids
+	-- between bakes even when every region was identical. Break them on the
+	-- group's lexicographically smallest cell, the way Contour.lattice picks its
+	-- anchor: a property of the geometry, not of the iteration.
+	local anchorKey: { [any]: Vector3 } = {}
+	for _, m in ipairs(groups) do
+		local best = nil
+		for _, cell in ipairs(m) do
+			local p = cell.pos
+			if not best
+				or p.X < best.X
+				or (p.X == best.X and (p.Z < best.Z or (p.Z == best.Z and p.Y < best.Y))) then
+				best = p
+			end
+		end
+		anchorKey[m] = best
+	end
+	table.sort(groups, function(a, b)
+		if #a ~= #b then return #a > #b end
+		local ka, kb = anchorKey[a], anchorKey[b]
+		if ka.X ~= kb.X then return ka.X < kb.X end
+		if ka.Z ~= kb.Z then return ka.Z < kb.Z end
+		return ka.Y < kb.Y
+	end)
 	local sizes = {}
 	for i, m in ipairs(groups) do
 		sizes[i] = #m
@@ -1012,15 +1054,15 @@ function LocalGrid.regions(data: any, cfg: Config?)
 	return data
 end
 
--- Hand each region to NVGN.Contour, the boundary tracer from the other
--- approach: cells -> closed loops -> a tangent per border cell -> lines.
+-- Hand each region to Contour: cells -> closed loops -> a tangent per border
+-- cell -> lines.
 --
 -- Contour wants ONE lattice per region, and a LocalGrid region does not have
 -- one: it spans parts, each with its own origin and its own in-plane rotation.
 -- The anchor cell frame is used for the whole region, so cells from a part
 -- rotated against it land off-lattice and can share a slot. `collapsed` counts
 -- exactly that, per region, and is the number to watch before trusting any of
--- the line output -- it is the same failure the other approach hit on case3.
+-- the line output.
 function LocalGrid.contours(data: any, cfg: Config?)
 	local Contour = require(script.Parent:WaitForChild("Contour"))
 	local c = merged(cfg)
@@ -1033,9 +1075,7 @@ function LocalGrid.contours(data: any, cfg: Config?)
 	-- endpoint as origin + u*i + v*j. If those axes are tilted against the
 	-- surface the rebuild drifts LINEARLY with distance from that corner, and a
 	-- line sinks into the floor at the far end while sitting correctly at the
-	-- near one. Measured on r22: a flat region, cells spanning 0.2 studs of Y,
-	-- whose drawn endpoints ran up to 2.37 studs below them, the error growing
-	-- steadily along the region.
+	-- near one.
 	--
 	-- Cells within a region may differ by up to regionPlanarity, so no single
 	-- cell's frame speaks for the region. Averaging the normals does: the plane
@@ -1050,6 +1090,8 @@ function LocalGrid.contours(data: any, cfg: Config?)
 			local r = cell.region
 			if r then
 				sumN[r] = (sumN[r] or Vector3.zero) + cell.normal
+				-- first grid to reach the region supplies the in-plane axis, so
+				-- this depends on the grid order fromFloor fixed
 				axisU[r] = axisU[r] or u
 				local t = cellsOf[r]
 				if not t then t = {}; cellsOf[r] = t end
@@ -1466,10 +1508,8 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 	local byLine = o.by == "line"
 	local byRegion = (not byLine) and (o.by ~= "part") and data.stats.regions ~= nil
 	-- Skip the interior entirely rather than building it and deleting it after.
-	-- On case5 the interior is 187k of the 202k cells, so a border-only draw that
-	-- filters here costs a tenth of one that filters afterwards -- and it was
-	-- building-then-deleting that kept pushing a single call past the tool's
-	-- time limit.
+	-- The interior is roughly nine tenths of the cells, so filtering here rather
+	-- than afterwards is what keeps a border-only draw inside a single call.
 	local borderOnly = o.borderOnly == true
 
 	local root = parent or workspace
