@@ -478,6 +478,134 @@ function PathSimplify.dejog(pts: {Vector3}, idx: {number}, orig: {Vector3}, opts
 	return outPts, outIdx, stats
 end
 
+-- BEVEL IDENTIFICATION.
+--
+-- A bevel is a short link cutting a SQUARE corner: the two runs it joins meet at
+-- roughly 90 degrees. That is what separates it from a jog, whose runs are
+-- parallel.
+--
+-- The neighbours have to be real runs, both several times the link and long in
+-- absolute terms. Without that a knot of short segments flags every one of its
+-- own members, since each sees two short neighbours and cannot tell it is inside
+-- a cluster rather than between two lines -- which is how three bevels end up
+-- chained to each other.
+PathSimplify.bevelMax = 2.5       -- studs; longest link that counts
+PathSimplify.bevelSquare = 30     -- degrees either side of 90 for the two runs
+PathSimplify.bevelRunRatio = 2    -- each run must be this many times the link
+-- 1.2, not 1.5: a 1.414 stud run is the diagonal of two cells and is a real
+-- line, and the ratio test is what actually keeps clusters out.
+PathSimplify.bevelRunMin = 1.2    -- studs; and this long outright
+
+function PathSimplify.findBevels(pts: {Vector3}, opts: any?)
+	local o = opts or {}
+	local closed = o.closed == true
+	local maxLen = o.bevelMax or PathSimplify.bevelMax
+	local square = o.bevelSquare or PathSimplify.bevelSquare
+	local ratio = o.bevelRunRatio or PathSimplify.bevelRunRatio
+	local runMin = o.bevelRunMin or PathSimplify.bevelRunMin
+	local lo = math.cos(math.rad(90 - square))
+	local hi = math.cos(math.rad(90 + square))
+	local n = #pts
+	local out = {}
+	if n < 4 then return out end
+	for i = 1, (closed and n or n - 3) do
+		local a = ((i - 2) % n) + 1
+		local v, w = i, (i % n) + 1
+		local b = ((i + 1) % n) + 1
+		local da = pts[v] - pts[a]
+		local link = pts[w] - pts[v]
+		local db = pts[b] - pts[w]
+		local L = link.Magnitude
+		local la, lb = da.Magnitude, db.Magnitude
+		if L > 1e-6 and L <= maxLen and la > 1e-6 and lb > 1e-6
+			and la >= L * ratio and lb >= L * ratio
+			and la >= runMin and lb >= runMin then
+			local dot = da.Unit:Dot(db.Unit)
+			if dot <= lo and dot >= hi then
+				out[#out + 1] = { v = v, w = w, len = L,
+					angle = math.deg(math.acos(math.clamp(dot, -1, 1))) }
+			end
+		end
+	end
+	return out
+end
+
+-- COLLAPSE A BEVEL BACK INTO ITS CORNER.
+--
+-- The two vertices are replaced by the single point where the two runs, extended,
+-- cross. Perpendicular runs always cross somewhere close, so the spike that
+-- plagues this operation on near-parallel lines cannot arise here; maxTravel is
+-- a belt-and-braces cap and in practice never binds.
+--
+-- THE GUARD IS ONLY ABOUT GEOMETRY. Sharpening reclaims the corner, so the
+-- polygon grows by a triangle at most one cell across. At that scale it does not
+-- matter whether every square inch of it is walkable; what matters is that the
+-- two new edges do not run through a wall. `validate` is handed the proposed
+-- corner and both run ends so it can test the edges that will actually be drawn.
+--
+-- Intersections are computed from the polygon as it stands BEFORE any collapse,
+-- so two bevels sharing a run cannot chase each other's moved vertices. Bevels
+-- are non-adjacent by construction, so the removals never overlap.
+PathSimplify.bevelTravel = 1.5    -- studs the corner may travel from the link
+
+function PathSimplify.collapseBevels(pts: {Vector3}, opts: any?)
+	local o = opts or {}
+	local closed = o.closed == true
+	local up = o.up or Vector3.yAxis
+	local maxTravel = o.bevelTravel or PathSimplify.bevelTravel
+	local validate = o.validate
+	local n = #pts
+	local stats = { input = n, found = 0, collapsed = 0, refusedFloor = 0, refusedTravel = 0 }
+	-- refusedFloor counts whatever `validate` rejected, whatever it tests
+	local bevels = PathSimplify.findBevels(pts, o)
+	stats.found = #bevels
+	if #bevels == 0 then return pts, stats end
+
+	local replace = {}   -- v -> corner point, w -> false (drop)
+	for _, bv in ipairs(bevels) do
+		local v, w = bv.v, bv.w
+		local a = ((v - 2) % n) + 1
+		local b = ((w) % n) + 1
+		local p1, d1 = pts[a], pts[v] - pts[a]
+		local p2, d2 = pts[w], pts[b] - pts[w]
+		local len = d1.Magnitude
+		local X = nil
+		if len > 1e-9 then
+			local e1 = d1 / len
+			local e2 = up:Cross(e1)
+			if e2.Magnitude > 1e-9 then
+				e2 = e2.Unit
+				local a2, b2 = d2:Dot(e1), d2:Dot(e2)
+				local den = len * b2
+				if math.abs(den) > 1e-7 then
+					local rr = p2 - p1
+					X = p1 + d1 * ((rr:Dot(e1) * b2 - rr:Dot(e2) * a2) / den)
+				end
+			end
+		end
+		if X then
+			local mid = (pts[v] + pts[w]) * 0.5
+			if (X - mid).Magnitude > maxTravel then
+				stats.refusedTravel += 1
+			elseif validate and not validate(X, pts[a], pts[b]) then
+				stats.refusedFloor += 1
+			else
+				replace[v] = X
+				replace[w] = false
+				stats.collapsed += 1
+			end
+		end
+	end
+
+	local out, m = {}, 0
+	for i = 1, n do
+		local r = replace[i]
+		if r == nil then m += 1; out[m] = pts[i]
+		elseif r then m += 1; out[m] = r end
+	end
+	return out, stats
+end
+
 local function segment(a: Vector3, b: Vector3, thick: number, colour: Color3,
 	mat: Enum.Material, name: string, parent: Instance)
 	local d = b - a
