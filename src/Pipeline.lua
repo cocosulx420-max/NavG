@@ -20,6 +20,7 @@ local LocalGrid = require(script.Parent:WaitForChild("LocalGrid"))
 local Boundary = require(script.Parent:WaitForChild("Boundary"))
 local PathSimplify = require(script.Parent:WaitForChild("PathSimplify"))
 local Rings = require(script.Parent:WaitForChild("Rings"))
+local Severance = require(script.Parent:WaitForChild("Severance"))
 
 -- TUNING LIVES IN THE MODULES, NOT HERE. A number in OVERRIDES is a deliberate
 -- departure from a module's own default, and the module comment next to that
@@ -357,6 +358,19 @@ function Pipeline.measure(result: any): any
 	end
 	-- `over` counts RAW NODES beyond a step, not edges
 	return { worst = worst, where = where, overStep = over }
+end
+
+-- CONNECTIVITY OF THE WALKABLE CELLS, as a snapshot to compare against later.
+--
+-- A separate call and not part of `run`, for the same reason `measure` is: it
+-- costs about two seconds on case5 and nothing downstream needs it yet. What
+-- needs it is the offset, which has to be measured across, so the baseline has
+-- to be taken BEFORE it and kept.
+--
+-- `keep` is the filter that makes the second snapshot: given a cell, answer
+-- whether it survives. Pass nothing for the baseline.
+function Pipeline.connectivity(result: any, keep: ((any) -> boolean)?): any
+	return Severance.snapshot(result.data, keep)
 end
 
 local function segment(a: Vector3, b: Vector3, thick: number, colour: Color3,
