@@ -55,15 +55,23 @@ Offset.miterLimit = 2.5
 
 local MOVED = { wall = true, none = true }
 
--- Does the low-trust rule apply to an edge that voted SEAM.
+-- Does a close vote turn an edge into a wall.
 --
--- The rule exists because failing to offset a real wall puts an agent inside
--- geometry. That argument does not carry to a seam: a seam means LocalGrid
--- found live floor at the same height on the far side, so there is no wall
--- there to be inside of. What moving it does instead is pull two regions apart
--- and cut the graph -- measured on case3, where eight low-trust seams severed
--- the main component into 2067 + 1709 cells.
-Offset.offsetMixedSeams = false
+-- It used to, whatever the edge voted, and that was wrong for both of the kinds
+-- that hold. The rule exists because failing to offset a real WALL puts an
+-- agent inside geometry -- but a seam means live floor was found at the same
+-- height on the far side, and a dropoff means no floor at all. Neither has
+-- anything to be inside of, so moving the line cannot protect anyone; it only
+-- eats floor, and on a seam it pulls two regions apart and cuts the graph.
+--
+-- Measured on case3: as a blanket rule it severed the main component into
+-- 2067 + 1709 cells, and it pushed hand-checked dropoffs in by the full radius
+-- at places a physics probe found nothing standing at all.
+--
+-- So the fallback now applies ONLY to an edge with no verdict -- which is what
+-- "cautious" was always supposed to mean. An edge that voted, even narrowly,
+-- is believed.
+Offset.trustVotedKinds = true
 
 -- A lookup from a world point to the walkable cell under it, on a 1 stud hash.
 local function cellIndex(data: any): (Vector3, number) -> any
@@ -188,7 +196,9 @@ local function loopOffset(L: any, stats: any, lookup: any, step: number): boolea
 		local kind = L.edgeKind[i] or "none"
 		local purity = L.edgePurity and L.edgePurity[i] or 1
 		local lowTrust = purity < Offset.trustBelow
-		if kind == "edge" and not Offset.offsetMixedSeams then lowTrust = false end
+		if Offset.trustVotedKinds and (kind == "edge" or kind == "drop") then
+			lowTrust = false
+		end
 		local asWall = MOVED[kind] or lowTrust
 		local amount = 0
 		if asWall then

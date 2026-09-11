@@ -603,6 +603,17 @@ end
 -- there, and things stand along world Y whatever the ramp underneath is doing.
 local WALL_PROBE_LEAVES = { 1.5, 2.5 }
 
+-- How far OUT to look, in neighbour steps.
+--
+-- One step lands in the slot the floor would have continued into, which is
+-- where a flush wall stands. It is not where every wall stands: case3 has a
+-- pillar set back about a stud from the floor edge, so the one step probe found
+-- empty air in the gap and called a blocked edge a dropoff. Two steps finds it.
+--
+-- Not further. Past a stud or so the thing is no longer against this edge, and
+-- the gap between is ground an agent could legitimately be standing on.
+local WALL_PROBE_STEPS = { 1, 2 }
+
 function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	local c = merged(cfg)
 	if data.config then
@@ -613,7 +624,7 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	local r2 = (c.probeRadius * c.step) ^ 2
 	local tol = c.flushTol
 	local dirs = dirsFor(c)
-	local nWall, nDrop, nBoth, nEdge, nSvo = 0, 0, 0, 0, 0
+	local nWall, nDrop, nBoth, nEdge, nSvo, nVeto = 0, 0, 0, 0, 0, 0
 	local svo = data.svo
 
 	for _, g in pairs(data.grids) do
@@ -687,30 +698,48 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 							end
 						end
 					end
-					-- NOTHING IN THE CELL GRIDS KNEW, SO ASK SOLID SPACE ITSELF.
+					-- SOLID SPACE DECIDES, BOTH WAYS.
 					--
-					-- Everything above infers a wall from OTHER walkable floor
-					-- higher up, or from a dead cell recording what killed it. A
-					-- dead cell only exists where this part's own grid sampled
-					-- that slot, so where a floor part ends exactly at a wall
-					-- part the slot is outside the grid entirely and the code
-					-- falls through to dropoff. That is the common case, not a
-					-- corner one: 34% of case3's dropoff faces had a wall
-					-- standing against them.
+					-- The tests above only ever INFER a wall: from other
+					-- walkable floor higher up, or from a dead cell recording
+					-- what killed it. Both inferences were measured wrong on
+					-- case3, in opposite directions.
 					--
-					-- The SVO does not care which grid a point falls in, and it
-					-- is conservative -- a leaf geometry merely touches is
-					-- marked solid -- so it errs toward calling things walls,
-					-- which is the safe direction for the offset.
-					if not above and not below and svo then
+					-- Too few: where a floor part ends exactly at a wall part
+					-- the neighbouring slot is outside that grid, so there is
+					-- no live cell and no dead cell, and the code fell through
+					-- to dropoff. 34% of dropoff faces had a wall against them.
+					--
+					-- Too many: a platform rim with a balcony somewhere above
+					-- has "a surface higher than stepTol" and was called a wall
+					-- with nothing beside it at all, and a union lying flush at
+					-- floor level leaves a killed cell that read as masonry
+					-- overhead. Hand-checked, a physics probe found NOTHING at
+					-- any height beside several of them.
+					--
+					-- So ask the octree, and let it both add and veto. It is
+					-- conservative -- a leaf geometry merely touches is solid --
+					-- so a veto cannot remove a wall that is really there.
+					local solid = false
+					if svo then
 						local leaf = svo.leaf or 1
-						for _, mult in ipairs(WALL_PROBE_LEAVES) do
-							local h = mult * leaf
-							if svo:isSolid(p + Vector3.yAxis * h) then
-								above = true
-								nSvo += 1
-								break
+						local out = p - cell.pos
+						for _, k in ipairs(WALL_PROBE_STEPS) do
+							local q = cell.pos + out * k
+							for _, mult in ipairs(WALL_PROBE_LEAVES) do
+								if svo:isSolid(q + Vector3.yAxis * mult * leaf) then
+									solid = true
+									break
+								end
 							end
+							if solid then break end
+						end
+						if not above and not below and solid then
+							above = true
+							nSvo += 1
+						elseif above and not solid then
+							above = false
+							nVeto += 1
 						end
 					end
 					local m = bit32.lshift(1, bit - 1)
@@ -731,6 +760,8 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	data.stats.regionEdgeNodes = nEdge
 	-- how many wall directions ONLY the SVO found, so the fix stays measurable
 	data.stats.svoWalls = nSvo
+	-- and how many inferred walls it refused, which is the other half of the fix
+	data.stats.svoVetoed = nVeto
 	return data
 end
 
