@@ -74,10 +74,22 @@ end
 -- A cell whose grid has no wall or drop anywhere gets `math.huge`: the floor
 -- genuinely does not end inside this grid, and inventing a number there would
 -- be a guess the offset would then act on. Counted and reported instead.
-function Thickness.build(data: any, cfg: any?): any
+-- `o.seedWallOnly` seeds from WALL faces alone and `o.field` names where the
+-- answer is written. Distance-to-wall is a different question from ground
+-- thickness: an erosion must not pull back from a ledge or a region seam, so it
+-- needs a field that never saw them. Same transform, different seeds.
+function Thickness.build(data: any, cfg: any?, o: any?): any
+	local opt = o or {}
+	local field = opt.field or "thick"
+	local wallOnly = opt.seedWallOnly == true
+	-- Fall back to the BAKE's own config for anything the caller's config does
+	-- not carry. Pipeline hands its own resolved options down, and those hold
+	-- overrides and the root but not `step`, which LocalGrid resolves.
 	local c = cfg or data.config
-	local step = c.step
-	local dirs = (c.connectivity == 8) and DIR8 or DIR4
+	local dc = data.config or {}
+	local step = c.step or dc.step
+	local conn = c.connectivity or dc.connectivity
+	local dirs = (conn == 8) and DIR8 or DIR4
 	local nd = #dirs
 
 	local stats = { grids = 0, cells = 0, seeds = 0, unbounded = 0,
@@ -108,7 +120,8 @@ function Thickness.build(data: any, cfg: any?): any
 		local f = table.create(W * H, FAR)
 		local seeded = 0
 		for _, cell in ipairs(cells) do
-			local mask = bit32.bor(cell.wallMask or 0, cell.dropMask or 0)
+			local mask = wallOnly and (cell.wallMask or 0)
+				or bit32.bor(cell.wallMask or 0, cell.dropMask or 0)
 			if mask ~= 0 then
 				for bit = 1, nd do
 					if bit32.band(mask, bit32.lshift(1, bit - 1)) ~= 0 then
@@ -128,7 +141,7 @@ function Thickness.build(data: any, cfg: any?): any
 		if seeded == 0 then
 			-- no wall and no drop in this whole grid: the floor does not end here
 			for _, cell in ipairs(cells) do
-				cell.thick = math.huge
+				cell[field] = math.huge
 				stats.unbounded += 1
 				stats.cells += 1
 			end
@@ -162,7 +175,7 @@ function Thickness.build(data: any, cfg: any?): any
 			local y = cell.vi - vlo
 			local d2 = f[y * W + x + 1]
 			local t = math.max(math.sqrt(d2) * step - half, 0)
-			cell.thick = t
+			cell[field] = t
 			stats.cells += 1
 			stats.sum += t
 			if t < stats.min then stats.min = t end

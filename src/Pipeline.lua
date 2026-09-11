@@ -24,6 +24,7 @@ local Severance = require(script.Parent:WaitForChild("Severance"))
 local Thickness = require(script.Parent:WaitForChild("Thickness"))
 local EdgeKind = require(script.Parent:WaitForChild("EdgeKind"))
 local Offset = require(script.Parent:WaitForChild("Offset"))
+local Erode = require(script.Parent:WaitForChild("Erode"))
 
 -- TUNING LIVES IN THE MODULES, NOT HERE. A number in OVERRIDES is a deliberate
 -- departure from a module's own default, and the module comment next to that
@@ -162,7 +163,13 @@ function Pipeline.bake(cfg: any?): (any, any)
 	local c = resolve(cfg)
 	assert(c.root, "Pipeline: cfg.root is required -- name the model to bake")
 	local data = LocalGrid.build(c)
+	-- ERODE BEFORE TRACING, when asked. Taking the agent's width off the cells
+	-- here makes the traced boundary the offset boundary by construction, which
+	-- is the whole reason this option exists rather than moving lines later.
+	local estats = nil
+	if c.erode then estats = Erode.apply(data, c) end
 	local _, bstats = Boundary.trace(data, c)
+	if estats then bstats.erode = estats end
 	return data, bstats
 end
 
@@ -815,15 +822,19 @@ function Pipeline.report(result: any): string
 		if v > 0 then by[#by + 1] = ("%s %d"):format(k, v) end
 	end
 	table.sort(by)
-	return table.concat({
+	-- appended one at a time: a nil in the middle of a table constructor
+	-- silently truncates everything after it in table.concat
+	local lines = {
 		("root      %s"):format(result.config.root or "?"),
 		("bake      %d regions, %d boundary faces, %.1fs"):format(b.regions, b.faces, result.stats.bakeSeconds),
-		("trace     %d loops, %d closed, %d broken, %d seam stitches"):format(b.loops, b.closed, b.broken, b.stitched),
-		("simplify  %d raw nodes -> %d corners, %.1fs"):format(s.raw, s.corners, result.stats.simplifySeconds),
-		("closing   %s, %d still open"):format(#by > 0 and table.concat(by, ", ") or "nothing to close", s.open),
-		Rings.report(s.rings),
-		EdgeKind.report(s.edgeKind),
-	}, "\n")
+	}
+	if b.erode then lines[#lines + 1] = Erode.report(b.erode) end
+	lines[#lines + 1] = ("trace     %d loops, %d closed, %d broken, %d seam stitches"):format(b.loops, b.closed, b.broken, b.stitched)
+	lines[#lines + 1] = ("simplify  %d raw nodes -> %d corners, %.1fs"):format(s.raw, s.corners, result.stats.simplifySeconds)
+	lines[#lines + 1] = ("closing   %s, %d still open"):format(#by > 0 and table.concat(by, ", ") or "nothing to close", s.open)
+	lines[#lines + 1] = Rings.report(s.rings)
+	lines[#lines + 1] = EdgeKind.report(s.edgeKind)
+	return table.concat(lines, "\n")
 end
 
 return Pipeline
