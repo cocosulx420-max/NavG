@@ -450,6 +450,93 @@ function Pipeline.draw(result: any, opts: any?): Instance
 	return root
 end
 
+-- Draw the connectivity snapshot: one colour per connected component.
+--
+-- SAMPLED, ON PURPOSE. case5 has 202k cells and one part each would be a
+-- drawing nobody can move a camera through. The budget is spent where the
+-- answer is: a component small enough to be suspicious is drawn WHOLE, and only
+-- the mainland gets strided, because what this drawing is for is deciding
+-- whether the little islands are real ground or trace debris.
+--
+-- The stride is reported rather than hidden. A sampled component looks sparse,
+-- and sparse is exactly what a broken one would look like too.
+function Pipeline.drawConnectivity(snap: any, opts: any?): (Instance, string)
+	local o = opts or {}
+	local maxParts = o.maxParts or 12000
+	local fullUnder = o.fullUnder or 3000
+	local size = o.size or 0.4
+	local lift = o.lift or 0.25
+
+	local old = workspace:FindFirstChild(Pipeline.debugName)
+	if old then
+		local prev = old:FindFirstChild("Connectivity")
+		if prev then prev:Destroy() end
+	else
+		old = Instance.new("Folder")
+		old.Name = Pipeline.debugName
+		old.Parent = workspace
+	end
+	local root = Instance.new("Folder")
+	root.Name = "Connectivity"
+	root.Parent = old
+
+	-- cells per component, in index order so the drawing is reproducible
+	local byComp = {}
+	for i = 1, snap.cellCount do
+		local c = snap.comp[i]
+		local t = byComp[c]
+		if not t then t = {}; byComp[c] = t end
+		t[#t + 1] = i
+	end
+
+	-- Budget: the small components cost what they cost, and whatever is left is
+	-- shared among the big ones in proportion to their size.
+	local spent, bigTotal = 0, 0
+	for id = 1, snap.pieces do
+		local n = #byComp[id]
+		if n <= fullUnder then spent += n else bigTotal += n end
+	end
+	local left = math.max(maxParts - spent, 1000)
+
+	local strided = {}
+	for id = 1, snap.pieces do
+		local idxs = byComp[id]
+		local n = #idxs
+		local stride = 1
+		if n > fullUnder then
+			local share = math.max(math.floor(left * (n / bigTotal)), 1)
+			stride = math.max(math.ceil(n / share), 1)
+			if stride > 1 then strided[#strided + 1] = ("c%d 1 in %d"):format(id, stride) end
+		end
+		-- golden-ratio hue, so adjacent component ids never share a colour
+		local hue = (id * 0.6180339887) % 1
+		local colour = Color3.fromHSV(hue, 0.75, 1)
+		local f = Instance.new("Folder")
+		f.Name = ("c%03d_%dcells%s"):format(id, n, stride > 1 and ("_1in" .. stride) or "")
+		f.Parent = root
+		for k = 1, n, stride do
+			local cell = snap.cells[idxs[k]]
+			local up = cell.normal or Vector3.yAxis
+			local p = Instance.new("Part")
+			p.Anchored = true; p.CanCollide = false; p.CanQuery = false; p.CanTouch = false
+			p.Size = Vector3.new(size, size, size)
+			p.CFrame = CFrame.new(cell.pos + up * lift)
+			p.Color = colour
+			p.Material = Enum.Material.Neon
+			p.Name = "c" .. id
+			p.Parent = f
+		end
+	end
+
+	local note = ("%d components drawn"):format(snap.pieces)
+	if #strided > 0 then
+		note ..= ", SAMPLED: " .. table.concat(strided, ", ")
+	else
+		note ..= ", every cell drawn"
+	end
+	return root, note
+end
+
 -- One line per stage, for a console that has to be read at a glance.
 function Pipeline.report(result: any): string
 	local b, s = result.stats.boundary, result.stats.simplify
