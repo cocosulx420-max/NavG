@@ -161,20 +161,19 @@ function Pipeline.bake(cfg: any?): (any, any)
 	local c = resolve(cfg)
 	assert(c.root, "Pipeline: cfg.root is required -- name the model to bake")
 	local data = LocalGrid.build(c)
-	-- ERODE BEFORE TRACING. Taking the agent's width off the cells here makes
-	-- the traced boundary the offset boundary by construction, which is the whole
-	-- reason this runs before the trace rather than moving lines after it.
+	-- EROSION IS OFF BY DEFAULT. It was on until 2026-09-12, when the call was
+	-- made that the mesh should be a correct representation of the map: the
+	-- boundary is where the floor actually ends, and clearance is the runtime's
+	-- problem. Erosion shrinks the floor by a node so an agent's centre can never
+	-- touch a wall, which is a real guarantee, but it pays for it by deleting
+	-- ground -- case3 empties 17 of its regions outright at one node.
 	--
-	-- ON BY DEFAULT. One node, 0.5 studs, measured against two: the second node
-	-- doubles the cells removed on both maps and buys nothing measurable.
-	-- case5's piece count is identical at both radii, so the second node cuts no
-	-- new route and only eats floor; case3 loses 36 of its regions outright
-	-- instead of 17. The radius itself lives in Erode, not here.
-	--
-	-- `erode = false` turns the stage off, for comparing against an un-eroded
-	-- trace. `erode = <studs>` overrides the radius.
+	-- `erode = true` turns it back on at Erode.radius, `erode = <studs>` at a
+	-- radius of your choosing. Kept wired because the eroded and un-eroded traces
+	-- are worth comparing, and because a later pathfinder may want the bake-time
+	-- guarantee after all.
 	local estats = nil
-	if c.erode ~= false then
+	if c.erode then
 		estats = Erode.apply(data, typeof(c.erode) == "number" and c or nil)
 	end
 	local _, bstats = Boundary.trace(data, c)
