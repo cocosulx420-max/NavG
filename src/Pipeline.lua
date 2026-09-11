@@ -21,6 +21,7 @@ local Boundary = require(script.Parent:WaitForChild("Boundary"))
 local PathSimplify = require(script.Parent:WaitForChild("PathSimplify"))
 local Rings = require(script.Parent:WaitForChild("Rings"))
 local Severance = require(script.Parent:WaitForChild("Severance"))
+local Thickness = require(script.Parent:WaitForChild("Thickness"))
 
 -- TUNING LIVES IN THE MODULES, NOT HERE. A number in OVERRIDES is a deliberate
 -- departure from a module's own default, and the module comment next to that
@@ -358,6 +359,15 @@ function Pipeline.measure(result: any): any
 	end
 	-- `over` counts RAW NODES beyond a step, not edges
 	return { worst = worst, where = where, overStep = over }
+end
+
+-- GROUND THICKNESS per cell, written to `cell.thick`, plus a histogram.
+--
+-- A separate call for now because nothing consumes it yet. It is cheap enough
+-- to fold into `run` when the offset lands: 0.4s on case5 against a 32s bake.
+function Pipeline.thickness(result: any): (any, any)
+	local stats = Thickness.build(result.data)
+	return stats, Thickness.histogram(result.data)
 end
 
 -- CONNECTIVITY OF THE WALKABLE CELLS, as a snapshot to compare against later.
