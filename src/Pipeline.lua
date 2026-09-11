@@ -498,6 +498,69 @@ function Pipeline.draw(result: any, opts: any?): Instance
 	return root
 end
 
+-- Draw the offset polygon against the one it came from.
+--
+-- Almost every edge holds -- 9 of 530 move on case5 -- so a drawing that treats
+-- both outlines equally is two coincident lines and nothing to see. The
+-- original is drawn dim and the offset bright, and the handful of edges that
+-- actually moved get their own folder with a tie line from each original
+-- corner to where it went. That folder IS the result; the rest is context.
+function Pipeline.drawOffset(result: any, opts: any?): (Instance, string)
+	local o = opts or {}
+	local lift = o.lift or 0.3
+	local OLD = o.oldColor or Color3.fromRGB(120, 120, 130)
+	local NEW = o.newColor or Color3.fromRGB(80, 255, 180)
+	local HOT = o.movedColor or Color3.fromRGB(255, 130, 40)
+
+	local old = workspace:FindFirstChild(Pipeline.debugName)
+	if old then
+		local prev = old:FindFirstChild("Offset")
+		if prev then prev:Destroy() end
+	else
+		old = Instance.new("Folder")
+		old.Name = Pipeline.debugName
+		old.Parent = workspace
+	end
+	local root = Instance.new("Folder")
+	root.Name = "Offset"
+	root.Parent = old
+	local fOld = Instance.new("Folder"); fOld.Name = "original"; fOld.Parent = root
+	local fNew = Instance.new("Folder"); fNew.Name = "offset"; fNew.Parent = root
+	local fHot = Instance.new("Folder"); fHot.Name = "moved"; fHot.Parent = root
+
+	local moved, total = 0, 0
+	for _, L in ipairs(result.loops) do
+		local pts, off, up = L.pts, L.offset, L.up
+		local n = #pts
+		if not off then continue end
+		local rise = up * lift
+		local last = L.closed and n or n - 1
+		for i = 1, last do
+			local j = (i % n) + 1
+			local d = L.offsetDist and L.offsetDist[i] or 0
+			total += 1
+			segment(pts[i] + rise, pts[j] + rise, 0.10, OLD, "seg" .. i, fOld)
+			segment(off[i] + rise, off[j] + rise, d > 0 and 0.22 or 0.13,
+				d > 0 and HOT or NEW, "seg" .. i, fNew)
+			if d > 0 then
+				moved += 1
+				local g = Instance.new("Folder")
+				g.Name = ("r%03d_l%d_e%d_%s_%.2f"):format(L.region, L.index, i,
+					L.edgeKind and L.edgeKind[i] or "?", d)
+				g.Parent = fHot
+				segment(pts[i] + rise, pts[j] + rise, 0.14, OLD, "was", g)
+				segment(off[i] + rise, off[j] + rise, 0.24, HOT, "now", g)
+				-- tie lines, so the direction and size of the move is readable
+				segment(pts[i] + rise, off[i] + rise, 0.12, HOT, "shiftA", g)
+				segment(pts[j] + rise, off[j] + rise, 0.12, HOT, "shiftB", g)
+			end
+		end
+	end
+
+	return root, ("%d edges drawn, %d moved (orange, in the `moved` folder); original is grey, offset is green")
+		:format(total, moved)
+end
+
 -- Draw every polygon edge in the colour of its kind.
 --
 -- GROUPED BY KIND, not by loop. The question this drawing answers is "is
