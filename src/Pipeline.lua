@@ -19,6 +19,7 @@ local Pipeline = {}
 local LocalGrid = require(script.Parent:WaitForChild("LocalGrid"))
 local Boundary = require(script.Parent:WaitForChild("Boundary"))
 local PathSimplify = require(script.Parent:WaitForChild("PathSimplify"))
+local Rings = require(script.Parent:WaitForChild("Rings"))
 
 -- TUNING LIVES IN THE MODULES, NOT HERE. A number in OVERRIDES is a deliberate
 -- departure from a module's own default, and the module comment next to that
@@ -248,6 +249,12 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 			if not closed then stats.open += 1 end
 		end
 	end
+	-- Label every ring outer or hole before anything downstream sees it. This
+	-- runs here rather than as its own call because it is not a measurement:
+	-- `measure` is optional and reports on a result, this WRITES the structure
+	-- the offset and the triangulation both read.
+	stats.rings = Rings.classify(out)
+
 	return out, stats
 end
 
@@ -436,6 +443,7 @@ function Pipeline.report(result: any): string
 		("trace     %d loops, %d closed, %d broken, %d seam stitches"):format(b.loops, b.closed, b.broken, b.stitched),
 		("simplify  %d raw nodes -> %d corners, %.1fs"):format(s.raw, s.corners, result.stats.simplifySeconds),
 		("closing   %s, %d still open"):format(#by > 0 and table.concat(by, ", ") or "nothing to close", s.open),
+		Rings.report(s.rings),
 	}, "\n")
 end
 
