@@ -586,13 +586,22 @@ end
 -- case. Neither means the floor simply continues, whether or not it continues
 -- onto a different part.
 -- Heights above the neighbour slot at which the SVO is asked whether space is
--- solid. Ankle and chest: a wall standing beside the floor is solid at both, a
--- real dropoff at neither. Measured against case3, where 34% of faces labelled
--- dropoff had geometry standing next to them at exactly these heights.
+-- solid, AS MULTIPLES OF THE OCTREE'S LEAF.
+--
+-- THE PROBE MUST CLEAR THE FLOOR'S OWN LEAF. The octree is conservative: a leaf
+-- is marked solid when geometry merely touches it, so the leaf holding the
+-- floor's top face reads solid all the way to its ceiling, which can be a full
+-- leaf above the surface. A probe below that height is asking whether the floor
+-- exists, not whether a wall does, and it answers yes at the rim of every
+-- platform on the map.
+--
+-- Measured: at 0.6 studs against a 1 stud leaf, 7 of 14 hand-checked dropoffs
+-- came back solid while a physics probe at the same point found nothing. At 1.5
+-- leaves all but one cleared.
 --
 -- World up, not the surface normal. The question is whether something STANDS
 -- there, and things stand along world Y whatever the ramp underneath is doing.
-local WALL_PROBE = { 0.6, 1.5 }
+local WALL_PROBE_LEAVES = { 1.5, 2.5 }
 
 function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	local c = merged(cfg)
@@ -694,7 +703,9 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 					-- marked solid -- so it errs toward calling things walls,
 					-- which is the safe direction for the offset.
 					if not above and not below and svo then
-						for _, h in ipairs(WALL_PROBE) do
+						local leaf = svo.leaf or 1
+						for _, mult in ipairs(WALL_PROBE_LEAVES) do
+							local h = mult * leaf
 							if svo:isSolid(p + Vector3.yAxis * h) then
 								above = true
 								nSvo += 1
