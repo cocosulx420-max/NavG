@@ -559,6 +559,47 @@ function Pipeline.drawOffset(result: any, opts: any?): (Instance, string)
 		:format(total, moved)
 end
 
+-- Draw two traced boundaries against each other, in two folders and nothing
+-- else, clearing the debug root first.
+--
+-- For the eroded pipeline there is no separate offset polygon to draw: the
+-- traced boundary IS the offset boundary, which is the whole point of eroding
+-- first. So the comparison is between two TRACES of the same bake -- the raw
+-- cells and the eroded ones -- rather than between a polygon and a moved copy
+-- of itself.
+function Pipeline.drawCompare(rawLoops: {any}, cutLoops: {any}, opts: any?): (Instance, string)
+	local o = opts or {}
+	local lift = o.lift or 0.3
+	local OLD = o.oldColor or Color3.fromRGB(130, 130, 140)
+	local NEW = o.newColor or Color3.fromRGB(60, 235, 255)
+
+	local old = workspace:FindFirstChild(Pipeline.debugName)
+	if old then old:Destroy() end
+	local root = Instance.new("Folder")
+	root.Name = Pipeline.debugName
+	root.Parent = workspace
+	local fOld = Instance.new("Folder"); fOld.Name = "original"; fOld.Parent = root
+	local fNew = Instance.new("Folder"); fNew.Name = "offset"; fNew.Parent = root
+
+	local function paint(loops, colour, thick, parent)
+		local n = 0
+		for _, L in ipairs(loops) do
+			local pts, up = L.pts, L.up
+			local c = #pts
+			local rise = up * lift
+			for i = 1, (L.closed and c or c - 1) do
+				segment(pts[i] + rise, pts[(i % c) + 1] + rise, thick, colour,
+					("r%03d_l%d_e%d"):format(L.region, L.index, i), parent)
+				n += 1
+			end
+		end
+		return n
+	end
+	local a = paint(rawLoops, OLD, 0.10, fOld)
+	local b = paint(cutLoops, NEW, 0.16, fNew)
+	return root, ("original %d edges (grey), offset %d edges (cyan)"):format(a, b)
+end
+
 -- Draw the global SVO's solid space -- the voxels the wall test actually asks
 -- about when nothing in the cell grids knows.
 --
