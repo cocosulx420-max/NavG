@@ -629,6 +629,24 @@ local WALL_PROBE_STEPS = { 1, 2 }
 -- masonry.
 local STEP_UP = 1.5
 
+-- THE BOX THE WALL TEST ACTUALLY OCCUPIES, once the octree says something might
+-- be there. Reaching from the floor's own edge outward, ankle to head.
+--
+-- The octree is CONSERVATIVE -- a leaf geometry merely touches is marked solid
+-- -- and its leaves are a stud across while a cell is half that. So a wall
+-- running along one axis makes the leaf beside it solid in the OTHER axis too,
+-- and the probe for a free direction lands inside it. Measured on case3: 124 of
+-- 1033 wall directions, 12%, had no geometry in them at all, and they cluster
+-- where a run meets a corner.
+--
+-- Conservatism is only safe in one direction. "Might be solid" has to be
+-- checked; "definitely empty" can be trusted, which is why the octree still
+-- runs first and the box is only tested where it said yes. 1033 checks cost
+-- 0.01s.
+local PROBE_DEPTH = 1.0   -- studs outward from the floor edge; catches a set-back pillar
+local PROBE_HEIGHT = 2.0  -- ankle to head
+local PROBE_RISE = 1.2    -- centre height above the slot
+
 function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	local c = merged(cfg)
 	if data.config then
@@ -640,7 +658,23 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	local tol = c.flushTol
 	local dirs = dirsFor(c)
 	local nWall, nDrop, nBoth, nEdge, nSvo, nVeto = 0, 0, 0, 0, 0, 0
+	local nProbed, nRefused = 0, 0
 	local svo = data.svo
+
+	-- Included, not excluded: the probe can only ever hit the parts this bake
+	-- was built from, so a debug drawing in the workspace cannot register as a
+	-- wall however it is parented.
+	local op = OverlapParams.new()
+	op.FilterType = Enum.RaycastFilterType.Include
+	op.FilterDescendantsInstances = data.parts or {}
+	op.MaxParts = 1
+	local box = Instance.new("Part")
+	box.Name = "NVGN_WallProbe"
+	box.Size = Vector3.new(c.step * 0.9, PROBE_HEIGHT, PROBE_DEPTH)
+	box.Anchored = true
+	box.CanCollide = false; box.CanQuery = false; box.CanTouch = false
+	box.Transparency = 1
+	box.Parent = workspace
 
 	for _, g in pairs(data.grids) do
 		for _, cell in ipairs(g.cells) do
@@ -735,37 +769,35 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 					-- overhead. Hand-checked, a physics probe found NOTHING at
 					-- any height beside several of them.
 					--
-					-- So ask the octree, and let it both add and veto. It is
-					-- conservative -- a leaf geometry merely touches is solid --
-					-- so a veto cannot remove a wall that is really there.
+					-- So ask the octree first, then put a box where it said
+					-- yes and see whether anything is actually in it.
 					local solid = false
 					if svo then
 						local leaf = svo.leaf or 1
 						local out = p - cell.pos
+						local maybe = false
 						for _, k in ipairs(WALL_PROBE_STEPS) do
 							local q = cell.pos + out * k
 							for _, mult in ipairs(WALL_PROBE_LEAVES) do
 								if svo:isSolid(q + Vector3.yAxis * mult * leaf) then
-									solid = true
+									maybe = true
 									break
 								end
 							end
-							if solid then break end
+							if maybe then break end
 						end
-						-- SOLE AUTHORITY, not a tie-breaker. It used to only
-						-- fill in where the inferences had no opinion, and that
-						-- left "BELOW OUTRANKS ABOVE" in charge of the case it
-						-- gets wrong: a wall standing against a HIGH floor has
-						-- ground visible far below, so `below` wins and the
-						-- wall is never consulted. Four edges on case3 read as
-						-- dropoff at 100% agreement with a Part solid at every
-						-- height half a stud away.
-						--
-						-- That rule exists to stop a balcony three storeys up
-						-- making a rim read as masonry, which is a defect of
-						-- the ABOVE INFERENCE, not a reason to ignore geometry
-						-- that is actually there. So where the octree can
-						-- answer, it answers.
+						if maybe then
+							-- a box from the floor's edge outward, along this
+							-- direction only, so a wall on the OTHER axis of a
+							-- corner cannot register here
+							nProbed += 1
+							local dir = out.Unit
+							local mid = cell.pos + dir * (c.step * 0.5 + PROBE_DEPTH * 0.5)
+								+ Vector3.yAxis * PROBE_RISE
+							box.CFrame = CFrame.lookAt(mid, mid + dir)
+							solid = #workspace:GetPartsInPart(box, op) > 0
+							if not solid then nRefused += 1 end
+						end
 						if solid ~= above then
 							if solid then nSvo += 1 else nVeto += 1 end
 						end
@@ -791,7 +823,9 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	end
 
 	data.stats.wallNodes, data.stats.dropNodes, data.stats.bothNodes = nWall, nDrop, nBoth
+	box:Destroy()
 	data.stats.regionEdgeNodes = nEdge
+	data.stats.wallProbed, data.stats.wallRefused = nProbed, nRefused
 	-- how many wall directions ONLY the SVO found, so the fix stays measurable
 	data.stats.svoWalls = nSvo
 	-- and how many inferred walls it refused, which is the other half of the fix
