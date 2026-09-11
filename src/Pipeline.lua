@@ -492,11 +492,27 @@ function Pipeline.drawCompare(rawLoops: {any}, cutLoops: {any}, opts: any?): (In
 	local OLD = o.oldColor or Color3.fromRGB(130, 130, 140)
 	local NEW = o.newColor or Color3.fromRGB(60, 235, 255)
 
+	-- `o.name` puts this comparison in its own subfolder and clears only that
+	-- one, so two maps can be on screen at once. Without it the debug root is
+	-- wiped, which is what you want when re-running a single map.
 	local old = workspace:FindFirstChild(Pipeline.debugName)
-	if old then old:Destroy() end
-	local root = Instance.new("Folder")
-	root.Name = Pipeline.debugName
-	root.Parent = workspace
+	if not o.name then
+		if old then old:Destroy() end
+		old = nil
+	end
+	if not old then
+		old = Instance.new("Folder")
+		old.Name = Pipeline.debugName
+		old.Parent = workspace
+	end
+	local root = old
+	if o.name then
+		local prev = old:FindFirstChild(o.name)
+		if prev then prev:Destroy() end
+		root = Instance.new("Folder")
+		root.Name = o.name
+		root.Parent = old
+	end
 	local fOld = Instance.new("Folder"); fOld.Name = "original"; fOld.Parent = root
 	local fNew = Instance.new("Folder"); fNew.Name = "offset"; fNew.Parent = root
 
