@@ -163,11 +163,22 @@ function Pipeline.bake(cfg: any?): (any, any)
 	local c = resolve(cfg)
 	assert(c.root, "Pipeline: cfg.root is required -- name the model to bake")
 	local data = LocalGrid.build(c)
-	-- ERODE BEFORE TRACING, when asked. Taking the agent's width off the cells
-	-- here makes the traced boundary the offset boundary by construction, which
-	-- is the whole reason this option exists rather than moving lines later.
+	-- ERODE BEFORE TRACING. Taking the agent's width off the cells here makes
+	-- the traced boundary the offset boundary by construction, which is the whole
+	-- reason this runs before the trace rather than moving lines after it.
+	--
+	-- ON BY DEFAULT. One node, 0.5 studs, measured against two: the second node
+	-- doubles the cells removed on both maps and buys nothing measurable.
+	-- case5's piece count is identical at both radii, so the second node cuts no
+	-- new route and only eats floor; case3 loses 36 of its regions outright
+	-- instead of 17. The radius itself lives in Erode, not here.
+	--
+	-- `erode = false` turns the stage off, for comparing against an un-eroded
+	-- trace. `erode = <studs>` overrides the radius.
 	local estats = nil
-	if c.erode then estats = Erode.apply(data, c) end
+	if c.erode ~= false then
+		estats = Erode.apply(data, typeof(c.erode) == "number" and c or nil)
+	end
 	local _, bstats = Boundary.trace(data, c)
 	if estats then bstats.erode = estats end
 	return data, bstats
