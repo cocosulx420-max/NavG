@@ -97,9 +97,11 @@ local function bridge(walk: { number }, pts: { V2 }, hole: { number },
 	rings: { { number } }): { number }?
 	local bestA, bestB, bestD = nil, nil, math.huge
 	for ai = 1, #walk do
-		local A = pts[walk[ai]]
+		local ia = walk[ai]
+		local A = pts[ia]
 		for bi = 1, #hole do
-			local B = pts[hole[bi]]
+			local ib = hole[bi]
+			local B = pts[ib]
 			local dx, dy = B.x - A.x, B.y - A.y
 			local d = dx * dx + dy * dy
 			if d < bestD and d > 0 then
@@ -107,10 +109,29 @@ local function bridge(walk: { number }, pts: { V2 }, hole: { number },
 				for _, r in ipairs(rings) do
 					local n = #r
 					for i = 1, n do
-						local P, Q = pts[r[i]], pts[r[(i % n) + 1]]
-						if properCross(A, B, P, Q) then ok = false; break end
+						local ip, iq = r[i], r[(i % n) + 1]
+						-- SKIP BY INDEX, not by coordinate. A bridge starts and ends
+						-- on the boundary, so the two edges at each end touch it at a
+						-- shared vertex. A cross product cannot tell that touch from a
+						-- crossing -- one of its four determinants is exactly zero and
+						-- the sign comparison then reads true -- and every candidate
+						-- was being refused because of it.
+						if ip ~= ia and ip ~= ib and iq ~= ia and iq ~= ib
+							and properCross(A, B, pts[ip], pts[iq]) then
+							ok = false
+							break
+						end
 					end
 					if not ok then break end
+				end
+				-- Not crossing an edge leaves one case: a bridge that runs along the
+				-- boundary, or through a hole it never crosses because it grazes a
+				-- vertex. The midpoint settles both.
+				if ok then
+					local mid = { x = (A.x + B.x) * 0.5, y = (A.y + B.y) * 0.5 }
+					local ring = {}
+					for k, iv in ipairs(rings[1]) do ring[k] = pts[iv] end
+					if not inside(ring, mid) then ok = false end
 				end
 				if ok then
 					bestA, bestB, bestD = ai, bi, d
