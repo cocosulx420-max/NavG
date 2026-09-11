@@ -614,6 +614,21 @@ local WALL_PROBE_LEAVES = { 1.5, 2.5 }
 -- the gap between is ground an agent could legitimately be standing on.
 local WALL_PROBE_STEPS = { 1, 2 }
 
+-- A SURFACE THIS FAR ABOVE THE NEIGHBOURING SLOT IS A STEP, NOT A WALL.
+--
+-- A stair riser is solid, so the octree calls it a wall and it is not wrong: you
+-- would walk into it. But you would also walk UP it, and a wall you can climb
+-- must not make the floor stand back from it -- erode a node off the back of
+-- every tread and the treads survive while the LINKS between them do not. Both
+-- of case3's flights came apart that way, into pieces of 109, 52, 27 and 23
+-- cells where they had been whole.
+--
+-- 1.5 studs, matching the step gate the connectivity check uses and under the
+-- 2.0 a Roblox humanoid climbs by default. case3's treads rise 1.37 to 1.38, so
+-- 59 of flight A's 112 wall directions are risers by this test and 53 are real
+-- masonry.
+local STEP_UP = 1.5
+
 function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	local c = merged(cfg)
 	if data.config then
@@ -629,7 +644,7 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 
 	for _, g in pairs(data.grids) do
 		for _, cell in ipairs(g.cells) do
-			local wallMask, dropMask, edgeMask = 0, 0, 0
+			local wallMask, dropMask, edgeMask, stepMask = 0, 0, 0, 0
 			for bit, d in ipairs(dirs) do
 				local p = neighbourPos(g, cell, d)
 				local bx, bz = math.floor(p.X), math.floor(p.Z)
@@ -644,6 +659,8 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 				-- killed that floor, so it would not be live. Order: floor first,
 				-- then below, then above.
 				local floor, above, below = false, false, false
+				-- the LOWEST floor found above this slot, for the step test
+				local upMin = math.huge
 				for ox = -1, 1 do
 					for oz = -1, 1 do
 						for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
@@ -674,6 +691,7 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 									end
 								elseif dy > tol then
 									above = true
+									if dy < upMin then upMin = dy end
 								else
 									below = true
 								end
@@ -754,10 +772,15 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 						above = solid
 					end
 					local m = bit32.lshift(1, bit - 1)
+					-- Recorded whatever the wall verdict comes out as. A riser is
+					-- BOTH a wall and a step: you walk into it and you walk up it,
+					-- so the boundary is real and the erosion must ignore it.
+					if upMin <= STEP_UP then stepMask = bit32.bor(stepMask, m) end
 					if above then wallMask = bit32.bor(wallMask, m) else dropMask = bit32.bor(dropMask, m) end
 				end
 			end
 			cell.wallMask, cell.dropMask, cell.edgeMask = wallMask, dropMask, edgeMask
+			cell.stepMask = stepMask
 			cell.wall, cell.dropoff = wallMask ~= 0, dropMask ~= 0
 			cell.regionEdge = edgeMask ~= 0
 			if cell.wall then nWall += 1 end

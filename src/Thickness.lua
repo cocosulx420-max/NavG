@@ -120,7 +120,11 @@ function Thickness.build(data: any, cfg: any?, o: any?): any
 		local f = table.create(W * H, FAR)
 		local seeded = 0
 		for _, cell in ipairs(cells) do
-			local mask = wallOnly and (cell.wallMask or 0)
+			-- Wall-only seeding drops the STEP directions too. A stair riser is
+			-- solid and so reads as a wall, but it is one you climb, and eroding
+			-- back from it cuts every tread off from the next.
+			local mask = wallOnly
+				and bit32.band(cell.wallMask or 0, bit32.bnot(cell.stepMask or 0))
 				or bit32.bor(cell.wallMask or 0, cell.dropMask or 0)
 			if mask ~= 0 then
 				for bit = 1, nd do
