@@ -475,6 +475,88 @@ function Pipeline.draw(result: any, opts: any?): Instance
 	return root
 end
 
+-- Draw every polygon edge in the colour of its kind.
+--
+-- GROUPED BY KIND, not by loop. The question this drawing answers is "is
+-- anything labelled wrong", and that is asked one kind at a time: hide every
+-- folder but `wall` and what is left should be masonry and nothing else. A
+-- per-loop tree cannot be filtered that way.
+--
+-- Mixed edges get a marker at their midpoint. They are the ones where a merge
+-- flattened masonry and ledge into a single straight edge, so they are where a
+-- wrong answer is most likely and hardest to see from the colour alone.
+function Pipeline.drawEdgeKinds(result: any, opts: any?): (Instance, string)
+	local o = opts or {}
+	local lift = o.lift or 0.35
+	local thick = o.thick or 0.18
+	local COLOUR = {
+		wall = o.wallColor or Color3.fromRGB(255, 80, 50),
+		drop = o.dropColor or Color3.fromRGB(60, 200, 255),
+		edge = o.seamColor or Color3.fromRGB(170, 255, 70),
+		none = o.noneColor or Color3.fromRGB(210, 70, 255),
+	}
+
+	local old = workspace:FindFirstChild(Pipeline.debugName)
+	if old then
+		local prev = old:FindFirstChild("EdgeKinds")
+		if prev then prev:Destroy() end
+	else
+		old = Instance.new("Folder")
+		old.Name = Pipeline.debugName
+		old.Parent = workspace
+	end
+	local root = Instance.new("Folder")
+	root.Name = "EdgeKinds"
+	root.Parent = old
+
+	local bucket = {}
+	for _, k in ipairs({ "wall", "drop", "edge", "none" }) do
+		local f = Instance.new("Folder")
+		f.Name = k == "edge" and "seam" or k
+		f.Parent = root
+		bucket[k] = f
+	end
+	local mixedFolder = Instance.new("Folder")
+	mixedFolder.Name = "mixed"
+	mixedFolder.Parent = root
+
+	local counts = { wall = 0, drop = 0, edge = 0, none = 0 }
+	local mixed = 0
+	for _, L in ipairs(result.loops) do
+		local pts, up = L.pts, L.up
+		local off = up * lift
+		local n = #pts
+		local ek, ep = L.edgeKind, L.edgePurity
+		if not ek then continue end
+		for i = 1, #ek do
+			local kind = ek[i] or "none"
+			local a = pts[i] + off
+			local b = pts[(i % n) + 1] + off
+			segment(a, b, thick, COLOUR[kind] or COLOUR.none,
+				("r%03d_l%d_e%d_%d%%"):format(L.region, L.index, i, math.floor((ep[i] or 0) * 100)),
+				bucket[kind] or bucket.none)
+			counts[kind] = (counts[kind] or 0) + 1
+			if (ep[i] or 1) < 0.8 then
+				mixed += 1
+				local m = Instance.new("Part")
+				m.Anchored = true; m.CanCollide = false; m.CanQuery = false; m.CanTouch = false
+				m.Shape = Enum.PartType.Ball
+				m.Size = Vector3.new(0.7, 0.7, 0.7)
+				m.Color = Color3.fromRGB(255, 255, 255)
+				m.Material = Enum.Material.Neon
+				m.Transparency = 0.35
+				m.CFrame = CFrame.new((a + b) * 0.5)
+				m.Name = ("r%03d_l%d_e%d_%s_%d%%"):format(L.region, L.index, i, kind,
+					math.floor((ep[i] or 0) * 100))
+				m.Parent = mixedFolder
+			end
+		end
+	end
+
+	return root, ("wall %d (red), drop %d (blue), seam %d (green), none %d (purple); %d mixed marked white")
+		:format(counts.wall, counts.drop, counts.edge, counts.none, mixed)
+end
+
 -- Draw the connectivity snapshot: one colour per connected component.
 --
 -- SAMPLED, ON PURPOSE. case5 has 202k cells and one part each would be a
