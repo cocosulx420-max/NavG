@@ -585,6 +585,15 @@ end
 -- A cell can be both: a ledge running along the foot of a wall is the ordinary
 -- case. Neither means the floor simply continues, whether or not it continues
 -- onto a different part.
+-- Heights above the neighbour slot at which the SVO is asked whether space is
+-- solid. Ankle and chest: a wall standing beside the floor is solid at both, a
+-- real dropoff at neither. Measured against case3, where 34% of faces labelled
+-- dropoff had geometry standing next to them at exactly these heights.
+--
+-- World up, not the surface normal. The question is whether something STANDS
+-- there, and things stand along world Y whatever the ramp underneath is doing.
+local WALL_PROBE = { 0.6, 1.5 }
+
 function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	local c = merged(cfg)
 	if data.config then
@@ -595,7 +604,8 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	local r2 = (c.probeRadius * c.step) ^ 2
 	local tol = c.flushTol
 	local dirs = dirsFor(c)
-	local nWall, nDrop, nBoth, nEdge = 0, 0, 0, 0
+	local nWall, nDrop, nBoth, nEdge, nSvo = 0, 0, 0, 0, 0
+	local svo = data.svo
 
 	for _, g in pairs(data.grids) do
 		for _, cell in ipairs(g.cells) do
@@ -668,6 +678,30 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 							end
 						end
 					end
+					-- NOTHING IN THE CELL GRIDS KNEW, SO ASK SOLID SPACE ITSELF.
+					--
+					-- Everything above infers a wall from OTHER walkable floor
+					-- higher up, or from a dead cell recording what killed it. A
+					-- dead cell only exists where this part's own grid sampled
+					-- that slot, so where a floor part ends exactly at a wall
+					-- part the slot is outside the grid entirely and the code
+					-- falls through to dropoff. That is the common case, not a
+					-- corner one: 34% of case3's dropoff faces had a wall
+					-- standing against them.
+					--
+					-- The SVO does not care which grid a point falls in, and it
+					-- is conservative -- a leaf geometry merely touches is
+					-- marked solid -- so it errs toward calling things walls,
+					-- which is the safe direction for the offset.
+					if not above and not below and svo then
+						for _, h in ipairs(WALL_PROBE) do
+							if svo:isSolid(p + Vector3.yAxis * h) then
+								above = true
+								nSvo += 1
+								break
+							end
+						end
+					end
 					local m = bit32.lshift(1, bit - 1)
 					if above then wallMask = bit32.bor(wallMask, m) else dropMask = bit32.bor(dropMask, m) end
 				end
@@ -684,11 +718,13 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 
 	data.stats.wallNodes, data.stats.dropNodes, data.stats.bothNodes = nWall, nDrop, nBoth
 	data.stats.regionEdgeNodes = nEdge
+	-- how many wall directions ONLY the SVO found, so the fix stays measurable
+	data.stats.svoWalls = nSvo
 	return data
 end
 
 -- Build per-part local grids from an existing floor extraction.
-function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
+function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?, tree: any?)
 	local c = merged(cfg)
 	local filterAll = RaycastParams.new()
 	filterAll.FilterType = Enum.RaycastFilterType.Include
@@ -775,6 +811,10 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?)
 	local data = {
 		-- kept so later stages can raycast against the same set the bake used
 		grids = grids, parts = parts, config = c,
+		-- the global solid-space octree, kept so classifyNodes can ask it
+		-- whether a wall stands beside a cell. Floor builds it and it used to
+		-- be discarded here.
+		svo = tree,
 		stats = { parts = nParts, grids = nBlock + nFallback, faces = nFaces,
 			framed = nBlock, block = nBlock, fallback = nFallback, cells = nCells, dead = nDead,
 			prone = nFit[1], crouch = nFit[2], stand = nFit[3] },
@@ -840,7 +880,7 @@ end
 -- Returns localData, floorData, tree, parts.
 function LocalGrid.build(cfg: Config?)
 	local floorData, tree, parts = Floor.build(cfg)
-	local data = LocalGrid.fromFloor(floorData, parts, cfg)
+	local data = LocalGrid.fromFloor(floorData, parts, cfg, tree)
 	return data, floorData, tree, parts
 end
 

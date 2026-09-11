@@ -402,7 +402,7 @@ function Pipeline.offset(result: any): (any, any)
 	-- unmoved polygon. The polygon already excludes cells the offset never
 	-- touched; charging those to the offset reported case3 severed into nine
 	-- pieces on a bake that moved eleven edges.
-	local stats = Offset.apply(result.loops)
+	local stats = Offset.apply(result.loops, result.data)
 	local before = Severance.snapshot(result.data, Offset.keepTest(result.loops, true))
 	local after = Severance.snapshot(result.data, Offset.keepTest(result.loops))
 	return stats, Severance.compare(before, after)

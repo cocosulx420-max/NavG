@@ -65,27 +65,84 @@ local MOVED = { wall = true, none = true }
 -- the main component into 2067 + 1709 cells.
 Offset.offsetMixedSeams = false
 
+-- A lookup from a world point to the walkable cell under it, on a 1 stud hash.
+local function cellIndex(data: any): (Vector3, number) -> any
+	local hash: { [string]: {any} } = {}
+	for _, g in ipairs(data.grids) do
+		for _, cell in ipairs(g.cells) do
+			if cell.region then
+				local p = cell.pos
+				local k = ("%d:%d:%d"):format(math.floor(p.X), math.floor(p.Y), math.floor(p.Z))
+				local b = hash[k]
+				if not b then b = {}; hash[k] = b end
+				b[#b + 1] = cell
+			end
+		end
+	end
+	return function(q: Vector3, r: number): any
+		local best, bd = nil, r * r
+		local x, y, z = math.floor(q.X), math.floor(q.Y), math.floor(q.Z)
+		for ox = -1, 1 do for oy = -1, 1 do for oz = -1, 1 do
+			for _, cell in ipairs(hash[("%d:%d:%d"):format(x + ox, y + oy, z + oz)] or {}) do
+				local d = cell.pos - q
+				local dd = d:Dot(d)
+				if dd < bd then bd = dd; best = cell end
+			end
+		end end end
+		return best
+	end
+end
+
 -- How far this edge may move.
 --
--- `maxD` is the LARGEST ground thickness among the cells this edge was traced
--- from, which is half the local width of the floor behind it. A wide room
--- reports a large number and gives up the full radius; a one cell ledge reports
--- 0.25 and gives up almost nothing.
+-- MEASURED BY MARCHING INWARD, NOT BY READING THE EDGE. The first version of
+-- this read the ground thickness of the cells the edge was traced from and it
+-- was wrong in a way that made the whole pass do nothing: every cell a boundary
+-- is traced from IS a rim cell, and a rim cell's thickness is half a step by
+-- definition. 129 of case5's 138 wall edges reported exactly 0.25, so the grade
+-- came out at zero and nine edges in the map moved.
 --
--- Largest, not smallest. The thickness at a rim cell is always about half a
--- step -- that is what being at the rim means -- so a minimum would read every
--- edge as paper thin and move nothing anywhere.
-local function reach(L: any, i: number): number
-	local nodes = L.edgeNodes and L.edgeNodes[i]
-	if not nodes or #nodes == 0 then return 0 end
-	local maxD = 0
-	for _, k in ipairs(nodes) do
-		local cell = L.polyCell and L.polyCell[k]
-		local t = cell and cell.thick
-		if t == math.huge then return Offset.agentRadius end
-		if t and t > maxD then maxD = t end
+-- So walk in from the edge instead and ask how far the floor keeps going. The
+-- march stops at the first probe with no cell under it, because room on the far
+-- side of a gap is not room this edge can use.
+--
+-- MIN ALONG THE EDGE, MAX ALONG EACH INWARD RAY. The ray wants the deepest
+-- floor it can reach; the edge as a whole can only move by what its most
+-- pinched point can spare, since the whole line moves together.
+local function reach(L: any, i: number, up: Vector3, lookup: (Vector3, number) -> any,
+	step: number): number
+	local n = #L.pts
+	local a, b = L.pts[i], L.pts[(i % n) + 1]
+	local d = b - a
+	local len = d.Magnitude
+	if len < 1e-6 then return 0 end
+	local u = d / len
+	local inward = up:Cross(u)
+	local limit = Offset.agentRadius + Offset.margin
+	local probe = step * 0.5
+	local grab = step * 0.75
+
+	-- sample across the edge, ends pulled in so a corner does not dominate
+	local samples = math.max(2, math.min(8, math.floor(len / step) + 1))
+	local room = math.huge
+	for si = 0, samples - 1 do
+		local f = samples == 1 and 0.5 or (si / (samples - 1))
+		f = 0.15 + f * 0.7
+		local origin = a + d * f
+		local here = 0
+		local t = probe
+		while t <= limit do
+			local cell = lookup(origin + inward * t, grab)
+			if not cell then break end
+			local th = cell.thick
+			if th == math.huge then here = limit; break end
+			if th and th > here then here = th end
+			t += probe
+		end
+		if here < room then room = here end
 	end
-	return math.clamp(maxD - Offset.margin, 0, Offset.agentRadius)
+	if room == math.huge then room = 0 end
+	return math.clamp(room - Offset.margin, 0, Offset.agentRadius)
 end
 
 -- Intersect two offset lines, each given as a point and a direction.
@@ -105,7 +162,7 @@ end
 -- The edges are moved FIRST and the corners recomputed from them. Moving the
 -- corners directly would be wrong wherever two adjacent edges move by different
 -- amounts, which after grading is most of them.
-local function loopOffset(L: any, stats: any): boolean
+local function loopOffset(L: any, stats: any, lookup: any, step: number): boolean
 	local pts, up = L.pts, L.regionUp or L.up
 	local n = #pts
 	if n < 3 or not L.closed or not L.edgeKind then return false end
@@ -135,7 +192,7 @@ local function loopOffset(L: any, stats: any): boolean
 		local asWall = MOVED[kind] or lowTrust
 		local amount = 0
 		if asWall then
-			amount = reach(L, i)
+			amount = reach(L, i, up, lookup, step)
 			if amount > 0 then moved += 1 end
 			if not MOVED[kind] then stats.lowTrust += 1 end
 		end
@@ -197,12 +254,14 @@ local function loopOffset(L: any, stats: any): boolean
 end
 
 -- Offset every closed loop. Ground thickness must already be on the cells.
-function Offset.apply(loops: {any}): any
+function Offset.apply(loops: {any}, data: any): any
 	local stats = { loops = 0, loopsMoved = 0, edges = 0, movedEdges = 0,
 		heldEdges = 0, lowTrust = 0, mitered = 0, fallback = 0, degenerate = 0,
 		skipped = 0, moveSum = 0, moveMax = 0 }
+	local lookup = cellIndex(data)
+	local step = data.config.step
 	for _, L in ipairs(loops) do
-		if not loopOffset(L, stats) then
+		if not loopOffset(L, stats, lookup, step) then
 			L.offset = nil
 			stats.skipped += 1
 		end
