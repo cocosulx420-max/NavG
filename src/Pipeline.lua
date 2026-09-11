@@ -383,6 +383,11 @@ function Pipeline.draw(result: any, opts: any?): Instance
 	local LINE = o.lineColor or Color3.fromRGB(60, 230, 255)
 	local CORN = o.cornerColor or Color3.fromRGB(255, 200, 40)
 	local MARK = o.closureColor or Color3.fromRGB(60, 255, 120)
+	-- A hole is drawn in its own colour rather than annotated in the folder
+	-- name alone. Outer and hole is the one distinction that has to be readable
+	-- from the camera, because a hole drawn like a rim looks like a second
+	-- floor sitting inside the first.
+	local HOLE = o.holeColor or Color3.fromRGB(255, 80, 160)
 
 	local old = workspace:FindFirstChild(Pipeline.debugName)
 	if old then old:Destroy() end
@@ -397,8 +402,10 @@ function Pipeline.draw(result: any, opts: any?): Instance
 		local pts, up = L.pts, L.up
 		local off = up * lift
 		local n = #pts
+		local base = (L.kind == "hole") and HOLE or LINE
 		local f = Instance.new("Folder")
-		f.Name = ("r%03d_loop%d_%dto%d%s"):format(L.region, L.index, #L.poly, n,
+		f.Name = ("r%03d_loop%d_%s_%dto%d%s"):format(L.region, L.index,
+			L.kind or "unlabelled", #L.poly, n,
 			L.closedBy and ("_CLOSED_" .. L.closedBy) or (L.closed and "" or "_OPEN"))
 		f.Parent = simp
 		local lines = Instance.new("Folder"); lines.Name = "line"; lines.Parent = f
@@ -409,7 +416,7 @@ function Pipeline.draw(result: any, opts: any?): Instance
 			local made = (L.closedBy == "merge" and (i == n or i == 1))
 				or (L.closedBy ~= nil and L.closedBy ~= "merge" and i == n)
 			segment(pts[i] + off, pts[(i % n) + 1] + off, made and 0.2 or 0.14,
-				made and MARK or LINE, made and "closure" or ("seg" .. i), lines)
+				made and MARK or base, made and "closure" or ("seg" .. i), lines)
 		end
 		local balls = Instance.new("Folder"); balls.Name = "corners"; balls.Parent = f
 		for i = 1, n do
