@@ -84,11 +84,18 @@ function EdgeKind.assign(loops: {any}): any
 			totals[i] = 0
 		end
 
+		-- which raw nodes landed on each edge, kept so the offset can read the
+		-- ground thickness behind the edge without repeating this search
+		local en = table.create(last)
+		for i = 1, last do en[i] = {} end
+
 		for k, q in ipairs(poly) do
 			local kind = kinds[k] or "none"
 			local i = nearestEdge(q, pts, last, n)
 			votes[i][kind] = (votes[i][kind] or 0) + 1
 			totals[i] += 1
+			local t = en[i]
+			t[#t + 1] = k
 		end
 
 		local ek = table.create(last)
@@ -125,6 +132,7 @@ function EdgeKind.assign(loops: {any}): any
 
 		L.edgeKind = ek
 		L.edgePurity = ep
+		L.edgeNodes = en
 	end
 
 	return stats

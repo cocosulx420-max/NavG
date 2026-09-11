@@ -23,6 +23,7 @@ local Rings = require(script.Parent:WaitForChild("Rings"))
 local Severance = require(script.Parent:WaitForChild("Severance"))
 local Thickness = require(script.Parent:WaitForChild("Thickness"))
 local EdgeKind = require(script.Parent:WaitForChild("EdgeKind"))
+local Offset = require(script.Parent:WaitForChild("Offset"))
 
 -- TUNING LIVES IN THE MODULES, NOT HERE. A number in OVERRIDES is a deliberate
 -- departure from a module's own default, and the module comment next to that
@@ -186,10 +187,12 @@ end
 -- carried: the simplifier takes an array of Vector3 and gives corners back.
 -- The offset needs it per edge, because a wall is pushed inward and a ledge is
 -- not, so losing it means treating every ledge as masonry.
-local function polyline(entry: any, loop: any, step: number): ({Vector3}, Vector3, {string})
+local function polyline(entry: any, loop: any, step: number): ({Vector3}, Vector3, {string}, {any})
 	local F = loop.faces
 	local pts = table.create(#F)
 	local kinds = table.create(#F)
+	-- the CELL behind each node, so the offset can read its ground thickness
+	local cells = table.create(#F)
 	local up = Vector3.yAxis
 	local inset = step * 0.5
 	for i, fi in ipairs(F) do
@@ -202,14 +205,16 @@ local function polyline(entry: any, loop: any, step: number): ({Vector3}, Vector
 			if not prev or (prev - p).Magnitude > 1e-3 then
 				pts[#pts + 1] = p
 				kinds[#kinds + 1] = f.kind or "none"
+				cells[#cells + 1] = f.cell
 			end
 		end
 	end
 	if #pts > 1 and loop.closed and (pts[1] - pts[#pts]).Magnitude < 1e-3 then
 		pts[#pts] = nil
 		kinds[#kinds] = nil
+		cells[#cells] = nil
 	end
-	return pts, up, kinds
+	return pts, up, kinds, cells
 end
 
 -- Every traced loop, simplified to corners. One loop in, one entry out; a loop
@@ -234,7 +239,7 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 	for _, r in ipairs(regions) do
 		local entry = data.boundary[r]
 		for li, L in ipairs(entry.loops) do
-			local poly, up, polyKind = polyline(entry, L, step)
+			local poly, up, polyKind, polyCell = polyline(entry, L, step)
 			local opts = table.clone(o)
 			opts.closed = L.closed
 			opts.up = up
@@ -255,7 +260,7 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 			end
 
 			out[#out + 1] = { region = r, index = li, up = up,
-				poly = poly, polyKind = polyKind,
+				poly = poly, polyKind = polyKind, polyCell = polyCell,
 				pts = pts, closed = closed, closedBy = method }
 			stats.loops += 1
 			stats.raw += #poly
@@ -383,6 +388,24 @@ end
 function Pipeline.thickness(result: any): (any, any)
 	local stats = Thickness.build(result.data)
 	return stats, Thickness.histogram(result.data)
+end
+
+-- THE OFFSET, and what it cost.
+--
+-- Runs the ground thickness first because the grading reads it, takes a
+-- connectivity snapshot on each side, and hands back the severance verdict
+-- alongside the offset statistics. The two belong together: "the lines moved"
+-- is not a result until it is paired with "and nothing was cut off".
+function Pipeline.offset(result: any): (any, any)
+	Thickness.build(result.data)
+	-- BOTH snapshots go through the containment test, the baseline against the
+	-- unmoved polygon. The polygon already excludes cells the offset never
+	-- touched; charging those to the offset reported case3 severed into nine
+	-- pieces on a bake that moved eleven edges.
+	local stats = Offset.apply(result.loops)
+	local before = Severance.snapshot(result.data, Offset.keepTest(result.loops, true))
+	local after = Severance.snapshot(result.data, Offset.keepTest(result.loops))
+	return stats, Severance.compare(before, after)
 end
 
 -- CONNECTIVITY OF THE WALKABLE CELLS, as a snapshot to compare against later.
