@@ -552,6 +552,92 @@ function Pipeline.drawOffset(result: any, opts: any?): (Instance, string)
 		:format(total, moved)
 end
 
+-- Draw the global SVO's solid space -- the voxels the wall test actually asks
+-- about when nothing in the cell grids knows.
+--
+-- EACH LEAF AT ITS OWN SIZE. The octree collapses a fully solid region into one
+-- big node, and expanding those back down to leaf size is how a single baseplate
+-- node becomes 32768 parts. Drawn as they are stored, case5 is 52439 boxes
+-- instead.
+--
+-- Semi-transparent, and added ALONGSIDE the offset drawing rather than clearing
+-- it, because the question being asked is where solid space sits relative to the
+-- boundary lines -- which needs both visible at once.
+function Pipeline.drawSolid(result: any, opts: any?): (Instance, string)
+	local o = opts or {}
+	local maxParts = o.maxParts or 20000
+	local svo = result.data and result.data.svo
+	if not svo then return workspace, "no SVO on this bake" end
+
+	local old = workspace:FindFirstChild(Pipeline.debugName)
+	if not old then
+		old = Instance.new("Folder")
+		old.Name = Pipeline.debugName
+		old.Parent = workspace
+	end
+	local prev = old:FindFirstChild("solid")
+	if prev then prev:Destroy() end
+	local root = Instance.new("Folder")
+	root.Name = "solid"
+	root.Parent = old
+
+	-- Optionally keep only what sits in the band the wall probe reads, which is
+	-- the band that decides wall against dropoff. Everything else is scenery.
+	local band = o.nearFloor
+	local lookup
+	if band then
+		local hash = {}
+		for _, g in ipairs(result.data.grids) do
+			for _, cell in ipairs(g.cells) do
+				if cell.region then
+					local p = cell.pos
+					local k = ("%d:%d"):format(math.floor(p.X / 4), math.floor(p.Z / 4))
+					local t = hash[k]
+					if not t then t = {}; hash[k] = t end
+					t[#t + 1] = p
+				end
+			end
+		end
+		lookup = function(c: Vector3): boolean
+			local x, z = math.floor(c.X / 4), math.floor(c.Z / 4)
+			for ox = -1, 1 do for oz = -1, 1 do
+				for _, p in ipairs(hash[("%d:%d"):format(x + ox, z + oz)] or {}) do
+					if (Vector3.new(p.X - c.X, 0, p.Z - c.Z)).Magnitude <= band
+						and c.Y > p.Y - 1 and c.Y < p.Y + 4 then return true end
+				end
+			end end
+			return false
+		end
+	end
+
+	local kept, skipped = 0, 0
+	local leaves = {}
+	svo:forEachSolidLeaf(function(c, h)
+		if lookup and not lookup(c) then skipped += 1; return end
+		leaves[#leaves + 1] = { c, h }
+	end)
+	local stride = math.max(1, math.ceil(#leaves / maxParts))
+	for i = 1, #leaves, stride do
+		local c, h = leaves[i][1], leaves[i][2]
+		local e = h * 2
+		local p = Instance.new("Part")
+		p.Anchored = true; p.CanCollide = false; p.CanQuery = false; p.CanTouch = false
+		p.Size = Vector3.new(e, e, e)
+		p.CFrame = CFrame.new(c)
+		p.Transparency = o.transparency or 0.65
+		p.Material = Enum.Material.SmoothPlastic
+		-- bigger nodes are lighter, so the collapse structure reads at a glance
+		p.Color = Color3.fromHSV(0.08, 0.55, math.clamp(0.35 + math.log(e, 2) * 0.18, 0, 1))
+		p.Name = ("s%d"):format(e)
+		p.Parent = root
+		kept += 1
+	end
+
+	return root, ("%d solid leaves drawn%s%s"):format(kept,
+		stride > 1 and (" (1 in " .. stride .. ")") or "",
+		skipped > 0 and (", " .. skipped .. " outside the floor band") or "")
+end
+
 -- Draw every polygon edge in the colour of its kind.
 --
 -- GROUPED BY KIND, not by loop. The question this drawing answers is "is
