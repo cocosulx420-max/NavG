@@ -22,6 +22,7 @@ local PathSimplify = require(script.Parent:WaitForChild("PathSimplify"))
 local Rings = require(script.Parent:WaitForChild("Rings"))
 local Severance = require(script.Parent:WaitForChild("Severance"))
 local Thickness = require(script.Parent:WaitForChild("Thickness"))
+local EdgeKind = require(script.Parent:WaitForChild("EdgeKind"))
 
 -- TUNING LIVES IN THE MODULES, NOT HERE. A number in OVERRIDES is a deliberate
 -- departure from a module's own default, and the module comment next to that
@@ -180,9 +181,15 @@ end
 -- Duplicates are dropped. At a convex corner one cell contributes two faces
 -- whose midpoints both inset onto that cell's centre, so the same position would
 -- otherwise appear twice and give the simplifier a zero-length segment.
-local function polyline(entry: any, loop: any, step: number): ({Vector3}, Vector3)
+-- The face's KIND travels with its node. Boundary already knows whether a face
+-- is a wall, a dropoff or a region seam, and that verdict dies here unless it is
+-- carried: the simplifier takes an array of Vector3 and gives corners back.
+-- The offset needs it per edge, because a wall is pushed inward and a ledge is
+-- not, so losing it means treating every ledge as masonry.
+local function polyline(entry: any, loop: any, step: number): ({Vector3}, Vector3, {string})
 	local F = loop.faces
 	local pts = table.create(#F)
+	local kinds = table.create(#F)
 	local up = Vector3.yAxis
 	local inset = step * 0.5
 	for i, fi in ipairs(F) do
@@ -192,13 +199,17 @@ local function polyline(entry: any, loop: any, step: number): ({Vector3}, Vector
 		if d.Magnitude > 1e-9 then
 			local p = (f.a + f.b) * 0.5 + f.up:Cross(d.Unit) * inset
 			local prev = pts[#pts]
-			if not prev or (prev - p).Magnitude > 1e-3 then pts[#pts + 1] = p end
+			if not prev or (prev - p).Magnitude > 1e-3 then
+				pts[#pts + 1] = p
+				kinds[#kinds + 1] = f.kind or "none"
+			end
 		end
 	end
 	if #pts > 1 and loop.closed and (pts[1] - pts[#pts]).Magnitude < 1e-3 then
 		pts[#pts] = nil
+		kinds[#kinds] = nil
 	end
-	return pts, up
+	return pts, up, kinds
 end
 
 -- Every traced loop, simplified to corners. One loop in, one entry out; a loop
@@ -223,7 +234,7 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 	for _, r in ipairs(regions) do
 		local entry = data.boundary[r]
 		for li, L in ipairs(entry.loops) do
-			local poly, up = polyline(entry, L, step)
+			local poly, up, polyKind = polyline(entry, L, step)
 			local opts = table.clone(o)
 			opts.closed = L.closed
 			opts.up = up
@@ -244,7 +255,8 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 			end
 
 			out[#out + 1] = { region = r, index = li, up = up,
-				poly = poly, pts = pts, closed = closed, closedBy = method }
+				poly = poly, polyKind = polyKind,
+				pts = pts, closed = closed, closedBy = method }
 			stats.loops += 1
 			stats.raw += #poly
 			stats.corners += #pts
@@ -256,6 +268,9 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 	-- `measure` is optional and reports on a result, this WRITES the structure
 	-- the offset and the triangulation both read.
 	stats.rings = Rings.classify(out)
+	-- Boundary's wall/drop/seam verdict, carried onto the simplified edges. The
+	-- offset reads it per edge: a wall moves inward, a ledge does not.
+	stats.edgeKind = EdgeKind.assign(out)
 
 	return out, stats
 end
@@ -562,6 +577,7 @@ function Pipeline.report(result: any): string
 		("simplify  %d raw nodes -> %d corners, %.1fs"):format(s.raw, s.corners, result.stats.simplifySeconds),
 		("closing   %s, %d still open"):format(#by > 0 and table.concat(by, ", ") or "nothing to close", s.open),
 		Rings.report(s.rings),
+		EdgeKind.report(s.edgeKind),
 	}, "\n")
 end
 
