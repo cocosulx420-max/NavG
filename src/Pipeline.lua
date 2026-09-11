@@ -22,8 +22,6 @@ local PathSimplify = require(script.Parent:WaitForChild("PathSimplify"))
 local Rings = require(script.Parent:WaitForChild("Rings"))
 local Severance = require(script.Parent:WaitForChild("Severance"))
 local Thickness = require(script.Parent:WaitForChild("Thickness"))
-local EdgeKind = require(script.Parent:WaitForChild("EdgeKind"))
-local Offset = require(script.Parent:WaitForChild("Offset"))
 local Erode = require(script.Parent:WaitForChild("Erode"))
 
 -- TUNING LIVES IN THE MODULES, NOT HERE. A number in OVERRIDES is a deliberate
@@ -200,17 +198,9 @@ end
 -- Duplicates are dropped. At a convex corner one cell contributes two faces
 -- whose midpoints both inset onto that cell's centre, so the same position would
 -- otherwise appear twice and give the simplifier a zero-length segment.
--- The face's KIND travels with its node. Boundary already knows whether a face
--- is a wall, a dropoff or a region seam, and that verdict dies here unless it is
--- carried: the simplifier takes an array of Vector3 and gives corners back.
--- The offset needs it per edge, because a wall is pushed inward and a ledge is
--- not, so losing it means treating every ledge as masonry.
-local function polyline(entry: any, loop: any, step: number): ({Vector3}, Vector3, {string}, {any})
+local function polyline(entry: any, loop: any, step: number): ({Vector3}, Vector3)
 	local F = loop.faces
 	local pts = table.create(#F)
-	local kinds = table.create(#F)
-	-- the CELL behind each node, so the offset can read its ground thickness
-	local cells = table.create(#F)
 	local up = Vector3.yAxis
 	local inset = step * 0.5
 	for i, fi in ipairs(F) do
@@ -220,19 +210,13 @@ local function polyline(entry: any, loop: any, step: number): ({Vector3}, Vector
 		if d.Magnitude > 1e-9 then
 			local p = (f.a + f.b) * 0.5 + f.up:Cross(d.Unit) * inset
 			local prev = pts[#pts]
-			if not prev or (prev - p).Magnitude > 1e-3 then
-				pts[#pts + 1] = p
-				kinds[#kinds + 1] = f.kind or "none"
-				cells[#cells + 1] = f.cell
-			end
+			if not prev or (prev - p).Magnitude > 1e-3 then pts[#pts + 1] = p end
 		end
 	end
 	if #pts > 1 and loop.closed and (pts[1] - pts[#pts]).Magnitude < 1e-3 then
 		pts[#pts] = nil
-		kinds[#kinds] = nil
-		cells[#cells] = nil
 	end
-	return pts, up, kinds, cells
+	return pts, up
 end
 
 -- Every traced loop, simplified to corners. One loop in, one entry out; a loop
@@ -257,7 +241,7 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 	for _, r in ipairs(regions) do
 		local entry = data.boundary[r]
 		for li, L in ipairs(entry.loops) do
-			local poly, up, polyKind, polyCell = polyline(entry, L, step)
+			local poly, up = polyline(entry, L, step)
 			local opts = table.clone(o)
 			opts.closed = L.closed
 			opts.up = up
@@ -278,8 +262,7 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 			end
 
 			out[#out + 1] = { region = r, index = li, up = up,
-				poly = poly, polyKind = polyKind, polyCell = polyCell,
-				pts = pts, closed = closed, closedBy = method }
+				poly = poly, pts = pts, closed = closed, closedBy = method }
 			stats.loops += 1
 			stats.raw += #poly
 			stats.corners += #pts
@@ -291,9 +274,6 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 	-- `measure` is optional and reports on a result, this WRITES the structure
 	-- the offset and the triangulation both read.
 	stats.rings = Rings.classify(out)
-	-- Boundary's wall/drop/seam verdict, carried onto the simplified edges. The
-	-- offset reads it per edge: a wall moves inward, a ledge does not.
-	stats.edgeKind = EdgeKind.assign(out)
 
 	return out, stats
 end
@@ -408,24 +388,6 @@ function Pipeline.thickness(result: any): (any, any)
 	return stats, Thickness.histogram(result.data)
 end
 
--- THE OFFSET, and what it cost.
---
--- Runs the ground thickness first because the grading reads it, takes a
--- connectivity snapshot on each side, and hands back the severance verdict
--- alongside the offset statistics. The two belong together: "the lines moved"
--- is not a result until it is paired with "and nothing was cut off".
-function Pipeline.offset(result: any): (any, any)
-	Thickness.build(result.data)
-	-- BOTH snapshots go through the containment test, the baseline against the
-	-- unmoved polygon. The polygon already excludes cells the offset never
-	-- touched; charging those to the offset reported case3 severed into nine
-	-- pieces on a bake that moved eleven edges.
-	local stats = Offset.apply(result.loops, result.data)
-	local before = Severance.snapshot(result.data, Offset.keepTest(result.loops, true))
-	local after = Severance.snapshot(result.data, Offset.keepTest(result.loops))
-	return stats, Severance.compare(before, after)
-end
-
 -- CONNECTIVITY OF THE WALKABLE CELLS, as a snapshot to compare against later.
 --
 -- A separate call and not part of `run`, for the same reason `measure` is: it
@@ -514,60 +476,6 @@ function Pipeline.draw(result: any, opts: any?): Instance
 		end
 	end
 	return root
-end
-
--- Draw the offset polygon against the one it came from. TWO folders, nothing
--- else, and the rest of the debug drawing cleared first.
---
--- Every other drawing in this module leaves its own folder behind, and with
--- four of them up at once the workspace is unreadable. This one wipes the debug
--- root before it starts, on the principle that a comparison you cannot see is
--- not a comparison.
---
--- `original` is the traced boundary, dim grey and thin. `offset` is where an
--- agent's centre may go, bright cyan and thicker, with the edges that actually
--- moved in orange so the difference reads without opening the tree.
-function Pipeline.drawOffset(result: any, opts: any?): (Instance, string)
-	local o = opts or {}
-	local lift = o.lift or 0.3
-	local OLD = o.oldColor or Color3.fromRGB(130, 130, 140)
-	local NEW = o.newColor or Color3.fromRGB(60, 235, 255)
-	local HOT = o.movedColor or Color3.fromRGB(255, 120, 30)
-
-	-- clear EVERYTHING, not just this drawing's folder
-	local old = workspace:FindFirstChild(Pipeline.debugName)
-	if old then old:Destroy() end
-	local root = Instance.new("Folder")
-	root.Name = Pipeline.debugName
-	root.Parent = workspace
-
-	local fOld = Instance.new("Folder"); fOld.Name = "original"; fOld.Parent = root
-	local fNew = Instance.new("Folder"); fNew.Name = "offset"; fNew.Parent = root
-
-	local moved, total = 0, 0
-	for _, L in ipairs(result.loops) do
-		local pts, off, up = L.pts, L.offset, L.up
-		local n = #pts
-		local rise = up * lift
-		local last = L.closed and n or n - 1
-		for i = 1, last do
-			local j = (i % n) + 1
-			total += 1
-			segment(pts[i] + rise, pts[j] + rise, 0.10, OLD,
-				("r%03d_l%d_e%d"):format(L.region, L.index, i), fOld)
-			if off then
-				local d = L.offsetDist and L.offsetDist[i] or 0
-				if d > 0 then moved += 1 end
-				segment(off[i] + rise, off[j] + rise, d > 0 and 0.20 or 0.13,
-					d > 0 and HOT or NEW,
-					("r%03d_l%d_e%d_%s_%.2f"):format(L.region, L.index, i,
-						L.edgeKind and L.edgeKind[i] or "?", d), fNew)
-			end
-		end
-	end
-
-	return root, ("%d edges: original grey, offset cyan, %d moved edges orange")
-		:format(total, moved)
 end
 
 -- Draw two traced boundaries against each other, in two folders and nothing
@@ -697,88 +605,6 @@ function Pipeline.drawSolid(result: any, opts: any?): (Instance, string)
 		skipped > 0 and (", " .. skipped .. " outside the floor band") or "")
 end
 
--- Draw every polygon edge in the colour of its kind.
---
--- GROUPED BY KIND, not by loop. The question this drawing answers is "is
--- anything labelled wrong", and that is asked one kind at a time: hide every
--- folder but `wall` and what is left should be masonry and nothing else. A
--- per-loop tree cannot be filtered that way.
---
--- Mixed edges get a marker at their midpoint. They are the ones where a merge
--- flattened masonry and ledge into a single straight edge, so they are where a
--- wrong answer is most likely and hardest to see from the colour alone.
-function Pipeline.drawEdgeKinds(result: any, opts: any?): (Instance, string)
-	local o = opts or {}
-	local lift = o.lift or 0.35
-	local thick = o.thick or 0.18
-	local COLOUR = {
-		wall = o.wallColor or Color3.fromRGB(255, 80, 50),
-		drop = o.dropColor or Color3.fromRGB(60, 200, 255),
-		edge = o.seamColor or Color3.fromRGB(170, 255, 70),
-		none = o.noneColor or Color3.fromRGB(210, 70, 255),
-	}
-
-	local old = workspace:FindFirstChild(Pipeline.debugName)
-	if old then
-		local prev = old:FindFirstChild("EdgeKinds")
-		if prev then prev:Destroy() end
-	else
-		old = Instance.new("Folder")
-		old.Name = Pipeline.debugName
-		old.Parent = workspace
-	end
-	local root = Instance.new("Folder")
-	root.Name = "EdgeKinds"
-	root.Parent = old
-
-	local bucket = {}
-	for _, k in ipairs({ "wall", "drop", "edge", "none" }) do
-		local f = Instance.new("Folder")
-		f.Name = k == "edge" and "seam" or k
-		f.Parent = root
-		bucket[k] = f
-	end
-	local mixedFolder = Instance.new("Folder")
-	mixedFolder.Name = "mixed"
-	mixedFolder.Parent = root
-
-	local counts = { wall = 0, drop = 0, edge = 0, none = 0 }
-	local mixed = 0
-	for _, L in ipairs(result.loops) do
-		local pts, up = L.pts, L.up
-		local off = up * lift
-		local n = #pts
-		local ek, ep = L.edgeKind, L.edgePurity
-		if not ek then continue end
-		for i = 1, #ek do
-			local kind = ek[i] or "none"
-			local a = pts[i] + off
-			local b = pts[(i % n) + 1] + off
-			segment(a, b, thick, COLOUR[kind] or COLOUR.none,
-				("r%03d_l%d_e%d_%d%%"):format(L.region, L.index, i, math.floor((ep[i] or 0) * 100)),
-				bucket[kind] or bucket.none)
-			counts[kind] = (counts[kind] or 0) + 1
-			if (ep[i] or 1) < 0.8 then
-				mixed += 1
-				local m = Instance.new("Part")
-				m.Anchored = true; m.CanCollide = false; m.CanQuery = false; m.CanTouch = false
-				m.Shape = Enum.PartType.Ball
-				m.Size = Vector3.new(0.7, 0.7, 0.7)
-				m.Color = Color3.fromRGB(255, 255, 255)
-				m.Material = Enum.Material.Neon
-				m.Transparency = 0.35
-				m.CFrame = CFrame.new((a + b) * 0.5)
-				m.Name = ("r%03d_l%d_e%d_%s_%d%%"):format(L.region, L.index, i, kind,
-					math.floor((ep[i] or 0) * 100))
-				m.Parent = mixedFolder
-			end
-		end
-	end
-
-	return root, ("wall %d (red), drop %d (blue), seam %d (green), none %d (purple); %d mixed marked white")
-		:format(counts.wall, counts.drop, counts.edge, counts.none, mixed)
-end
-
 -- Draw the connectivity snapshot: one colour per connected component.
 --
 -- SAMPLED, ON PURPOSE. case5 has 202k cells and one part each would be a
@@ -885,7 +711,6 @@ function Pipeline.report(result: any): string
 	lines[#lines + 1] = ("simplify  %d raw nodes -> %d corners, %.1fs"):format(s.raw, s.corners, result.stats.simplifySeconds)
 	lines[#lines + 1] = ("closing   %s, %d still open"):format(#by > 0 and table.concat(by, ", ") or "nothing to close", s.open)
 	lines[#lines + 1] = Rings.report(s.rings)
-	lines[#lines + 1] = EdgeKind.report(s.edgeKind)
 	return table.concat(lines, "\n")
 end
 
