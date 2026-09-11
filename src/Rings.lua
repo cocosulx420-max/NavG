@@ -52,6 +52,11 @@ local function basis(up: Vector3): (Vector3, Vector3)
 	return e1, up:Cross(e1)
 end
 
+-- Exported so Triangulate measures in the SAME frame Rings classified in. Two
+-- copies of this could disagree on handedness, and a flipped basis silently
+-- turns every outer rim into a hole.
+Rings.basis = basis
+
 -- Shoelace, in the plane of `up`. POSITIVE means counter-clockwise about up,
 -- which by the region-on-the-left winding means an OUTER rim.
 --

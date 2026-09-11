@@ -23,6 +23,7 @@ local Rings = require(script.Parent:WaitForChild("Rings"))
 local Severance = require(script.Parent:WaitForChild("Severance"))
 local Thickness = require(script.Parent:WaitForChild("Thickness"))
 local Erode = require(script.Parent:WaitForChild("Erode"))
+local Triangulate = require(script.Parent:WaitForChild("Triangulate"))
 
 -- TUNING LIVES IN THE MODULES, NOT HERE. A number in OVERRIDES is a deliberate
 -- departure from a module's own default, and the module comment next to that
@@ -477,6 +478,69 @@ function Pipeline.draw(result: any, opts: any?): Instance
 	return root
 end
 
+-- Rings to triangles. Cached on the result so a draw and a report see the same
+-- mesh, and so re-running the triangulator is a deliberate act.
+function Pipeline.triangulate(result: any): any
+	if not result.tri then
+		result.tri = Triangulate.build(result.loops)
+	end
+	return result.tri
+end
+
+-- Draw the triangles as wireframe plus a ball at each centroid.
+--
+-- THE CENTROID IS DRAWN BECAUSE IT IS THE SEARCH NODE. Everything downstream
+-- treats a triangle as one node at its centre, so a drawing that shows only the
+-- edges hides the thing the pathfinder actually walks on. A region's triangles
+-- share a colour, picked from the region id, so a surface that came out as two
+-- surfaces is visible without opening a single folder.
+function Pipeline.drawTriangles(result: any, opts: any?): (Instance, string)
+	local o = opts or {}
+	local lift = o.lift or 0.35
+	local tri = Pipeline.triangulate(result)
+
+	local old = workspace:FindFirstChild(Pipeline.debugName)
+	if old then old:Destroy() end
+	local root = Instance.new("Folder")
+	root.Name = Pipeline.debugName
+	root.Parent = workspace
+	local folders = {}
+
+	local function hue(r: number): Color3
+		-- golden-ratio stride, so consecutive regions are never near-neighbours
+		return Color3.fromHSV((r * 0.618034) % 1, 0.65, 1)
+	end
+
+	for i, t in ipairs(tri.tris) do
+		local f = folders[t.region]
+		if not f then
+			f = Instance.new("Folder")
+			f.Name = ("r%03d"):format(t.region)
+			f.Parent = root
+			folders[t.region] = f
+		end
+		local c = hue(t.region)
+		local off = t.up * lift
+		local g = Instance.new("Folder")
+		g.Name = ("t%04d_%.1fsq"):format(i, t.area)
+		g.Parent = f
+		segment(t.a + off, t.b + off, 0.1, c, "e1", g)
+		segment(t.b + off, t.c + off, 0.1, c, "e2", g)
+		segment(t.c + off, t.a + off, 0.1, c, "e3", g)
+		local n = Instance.new("Part")
+		n.Anchored = true; n.CanCollide = false; n.CanQuery = false; n.CanTouch = false
+		n.Shape = Enum.PartType.Ball
+		n.Size = Vector3.new(0.35, 0.35, 0.35)
+		n.Color = Color3.fromRGB(255, 255, 255)
+		n.Material = Enum.Material.Neon
+		n.CFrame = CFrame.new(t.centre + off)
+		n.Name = "node"
+		n.Parent = g
+	end
+
+	return root, Triangulate.report(tri, result.loops)
+end
+
 -- Draw two traced boundaries against each other, in two folders and nothing
 -- else, clearing the debug root first.
 --
@@ -726,6 +790,9 @@ function Pipeline.report(result: any): string
 	lines[#lines + 1] = ("simplify  %d raw nodes -> %d corners, %.1fs"):format(s.raw, s.corners, result.stats.simplifySeconds)
 	lines[#lines + 1] = ("closing   %s, %d still open"):format(#by > 0 and table.concat(by, ", ") or "nothing to close", s.open)
 	lines[#lines + 1] = Rings.report(s.rings)
+	if result.tri then
+		lines[#lines + 1] = Triangulate.report(result.tri, result.loops)
+	end
 	return table.concat(lines, "\n")
 end
 
