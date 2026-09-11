@@ -734,13 +734,24 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 							end
 							if solid then break end
 						end
-						if not above and not below and solid then
-							above = true
-							nSvo += 1
-						elseif above and not solid then
-							above = false
-							nVeto += 1
+						-- SOLE AUTHORITY, not a tie-breaker. It used to only
+						-- fill in where the inferences had no opinion, and that
+						-- left "BELOW OUTRANKS ABOVE" in charge of the case it
+						-- gets wrong: a wall standing against a HIGH floor has
+						-- ground visible far below, so `below` wins and the
+						-- wall is never consulted. Four edges on case3 read as
+						-- dropoff at 100% agreement with a Part solid at every
+						-- height half a stud away.
+						--
+						-- That rule exists to stop a balcony three storeys up
+						-- making a rim read as masonry, which is a defect of
+						-- the ABOVE INFERENCE, not a reason to ignore geometry
+						-- that is actually there. So where the octree can
+						-- answer, it answers.
+						if solid ~= above then
+							if solid then nSvo += 1 else nVeto += 1 end
 						end
+						above = solid
 					end
 					local m = bit32.lshift(1, bit - 1)
 					if above then wallMask = bit32.bor(wallMask, m) else dropMask = bit32.bor(dropMask, m) end
