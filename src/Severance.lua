@@ -27,14 +27,23 @@ local Severance = {}
 -- walked straight from one to the other. In-plane separation is the reach, and
 -- the along-normal term is a step up or down.
 --
--- These are the numbers purge uses to make a staircase read as ONE component
--- instead of one component per tread, and RegionLink repeats them for the same
--- reason. RegionLink is not required here because it takes the old pipeline's
--- `walk` array and `regionOf` map rather than LocalGrid's grids, so there is no
--- shared function to call -- but the two are the same physical constant, and
--- moving one without the other is a bug.
+-- 0.75 in plane is purge's reach, and case3's stair treads clear it at 0.25.
+--
+-- 1.5 along the normal is NOT purge's 0.6, and the difference is deliberate.
+-- Measured on case3: every consecutive tread of both flights sits 1.38 studs
+-- apart along the normal, so at 0.6 a six-tread flight came back as six
+-- separate islands and the whole staircase was unreachable in the graph. 1.5
+-- clears 1.38 with margin and stays under the 2.0 stud step height a Roblox
+-- humanoid has by default, so nothing is joined that could not be walked.
+--
+-- RegionLink still carries 0.6 for the old pipeline's data shape. The two now
+-- genuinely disagree; this one is the measured value.
+--
+-- SYMMETRIC, on purpose: `math.abs` means a climb and a drop of the same size
+-- are the same link. A drop is the easier of the two in reality, so this is the
+-- conservative side of that asymmetry rather than the convenient one.
 Severance.stepPlane = 0.75
-Severance.stepNormal = 0.6
+Severance.stepNormal = 1.5
 
 -- Bucket edge for the spatial hash. Must be at least the gate reach, or a
 -- neighbour could sit outside the 3x3x3 block that gets scanned.
