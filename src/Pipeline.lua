@@ -24,6 +24,7 @@ local Severance = require(script.Parent:WaitForChild("Severance"))
 local Thickness = require(script.Parent:WaitForChild("Thickness"))
 local Erode = require(script.Parent:WaitForChild("Erode"))
 local Triangulate = require(script.Parent:WaitForChild("Triangulate"))
+local Nodes = require(script.Parent:WaitForChild("Nodes"))
 
 -- TUNING LIVES IN THE MODULES, NOT HERE. A number in OVERRIDES is a deliberate
 -- departure from a module's own default, and the module comment next to that
@@ -476,6 +477,92 @@ function Pipeline.draw(result: any, opts: any?): Instance
 		end
 	end
 	return root
+end
+
+-- Cells to rectangle nodes. Cached, like the triangulation, so a draw and a
+-- report describe the same graph.
+function Pipeline.nodes(result: any, cfg: any?): any
+	if not result.nodes then
+		result.nodes = Nodes.build(result.data, cfg)
+	end
+	return result.nodes
+end
+
+-- Draw the node graph: a plate over each rectangle, a ball at each centre, and
+-- a line along every link.
+--
+-- THE PLATE IS THE POINT. A ball on its own says where a node is and hides how
+-- much floor it speaks for, which is the only thing worth looking at in a
+-- decomposition. Plates are sized to the rectangle and tinted by node id, so two
+-- nodes that should have been one are visible as a seam.
+--
+-- Links are drawn white when flat and orange when they climb, so a staircase
+-- reads as a chain of orange rungs and a mistaken link across a wall does too.
+function Pipeline.drawNodes(result: any, opts: any?): (Instance, string)
+	local o = opts or {}
+	local lift = o.lift or 0.25
+	local res = Pipeline.nodes(result, o.cfg)
+	local step = (result.data.config and result.data.config.step) or 0.5
+
+	local old = workspace:FindFirstChild(Pipeline.debugName)
+	if old then old:Destroy() end
+	local root = Instance.new("Folder")
+	root.Name = Pipeline.debugName
+	root.Parent = workspace
+	local plates = Instance.new("Folder"); plates.Name = "plates"; plates.Parent = root
+	local balls = Instance.new("Folder"); balls.Name = "centres"; balls.Parent = root
+	local wires = Instance.new("Folder"); wires.Name = "links"; wires.Parent = root
+
+	for _, n in ipairs(res.nodes) do
+		local up = n.normal or Vector3.yAxis
+		-- The rectangle's own axes, recovered from the grid rather than guessed:
+		-- a plate built on a world-aligned frame sits crooked on a rotated slab.
+		local g = result.data.grids[n.grid]
+		local e1 = g.u or g.e1 or Vector3.xAxis
+		local e2 = g.v or g.e2 or up:Cross(e1)
+		local centre = n.pos + up * lift
+		-- The BALL sits on a real cell, so the plate has to be shifted off it to
+		-- the rectangle's geometric middle. On an even-sided rectangle no cell is
+		-- at the middle, and drawing the plate around the nearest one leaves it
+		-- half a cell out of line with the floor it covers.
+		local plateAt = centre
+			+ e1 * ((n.midU - n.ui) * step)
+			+ e2 * ((n.midV - n.vi) * step)
+		local p = Instance.new("Part")
+		p.Anchored = true; p.CanCollide = false; p.CanQuery = false; p.CanTouch = false
+		p.Size = Vector3.new(n.width, 0.08, n.height)
+		p.CFrame = CFrame.fromMatrix(plateAt, e1, up)
+		p.Color = Color3.fromHSV((n.id * 0.618034) % 1, 0.55, 1)
+		p.Transparency = 0.45
+		p.Material = Enum.Material.SmoothPlastic
+		p.Name = ("n%04d_r%03d_%dx%d_deg%d")
+			:format(n.id, n.region, n.u1 - n.u0 + 1, n.v1 - n.v0 + 1, n.degree)
+		p.Parent = plates
+
+		local b = Instance.new("Part")
+		b.Anchored = true; b.CanCollide = false; b.CanQuery = false; b.CanTouch = false
+		b.Shape = Enum.PartType.Ball
+		b.Size = Vector3.new(0.4, 0.4, 0.4)
+		b.Color = (n.degree == 0) and Color3.fromRGB(255, 40, 40)
+			or Color3.fromRGB(255, 255, 255)
+		b.Material = Enum.Material.Neon
+		b.CFrame = CFrame.new(centre)
+		b.Name = ("n%04d"):format(n.id)
+		b.Parent = balls
+	end
+
+	local FLAT = Color3.fromRGB(240, 240, 240)
+	local RISE = Color3.fromRGB(255, 150, 40)
+	for i, L in ipairs(res.links) do
+		local a, b = res.nodes[L.a], res.nodes[L.b]
+		local ua = (a.normal or Vector3.yAxis) * lift
+		local ub = (b.normal or Vector3.yAxis) * lift
+		segment(a.pos + ua, b.pos + ub, L.rise > step and 0.14 or 0.09,
+			L.rise > step and RISE or FLAT,
+			("l%04d_%d_%d_x%d"):format(i, L.a, L.b, L.pairs), wires)
+	end
+
+	return root, Nodes.report(res)
 end
 
 -- Rings to triangles. Cached on the result so a draw and a report see the same
