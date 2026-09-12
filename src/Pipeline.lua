@@ -609,11 +609,13 @@ function Pipeline.drawTriangles(result: any, opts: any?): (Instance, string)
 		local c = hue(t.region)
 		local off = t.up * lift
 		local g = Instance.new("Folder")
-		g.Name = ("t%04d_%.1fsq"):format(i, t.area)
+		local verts = t.verts or { t.a, t.b, t.c }
+		g.Name = ("f%04d_%dgon_%.1fsq"):format(i, #verts, t.area)
 		g.Parent = f
-		segment(t.a + off, t.b + off, 0.1, c, "e1", g)
-		segment(t.b + off, t.c + off, 0.1, c, "e2", g)
-		segment(t.c + off, t.a + off, 0.1, c, "e3", g)
+		for k = 1, #verts do
+			segment(verts[k] + off, verts[(k % #verts) + 1] + off,
+				0.1, c, "e" .. k, g)
+		end
 		local n = Instance.new("Part")
 		n.Anchored = true; n.CanCollide = false; n.CanQuery = false; n.CanTouch = false
 		n.Shape = Enum.PartType.Ball

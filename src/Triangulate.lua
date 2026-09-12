@@ -65,6 +65,28 @@ Triangulate.flip = true
 -- exactly what was traced and only the mesh is cleaned.
 Triangulate.collinear = 0.1
 
+-- Glue neighbouring faces back together wherever the result is still convex.
+--
+-- A SLIVER DOES NOT GET RESHAPED, IT GETS ABSORBED. Flipping to Delaunay is the
+-- best any triangulation of a fixed corner set can do, and it still leaves thin
+-- triangles wherever the boundary itself is thin or jagged. Merging removes them
+-- instead: a sliver beside a fat neighbour stops being a face at all. A fan of
+-- thin triangles radiating across a big room merges back into the room.
+--
+-- Convexity is the only thing that must survive, and it is the thing everything
+-- downstream depends on. A centroid is inside a convex polygon by definition, so
+-- a straight hop between the centres of two touching faces stays on the floor.
+-- Merge into a dented shape and that guarantee is gone.
+--
+-- This is Hertel and Mehlhorn's method, which comes with a bound: at most four
+-- times the fewest convex pieces the surface could possibly be cut into.
+Triangulate.merge = true
+
+-- Most corners a merged face may have. 4 keeps them quads, which is what
+-- Cocosulx asked for; Recast uses 6. Higher gives fewer faces and lets a face
+-- grow into a long ribbon whose centre sits nowhere useful.
+Triangulate.maxVerts = 4
+
 type V2 = { x: number, y: number }
 
 local function cross(o: V2, a: V2, b: V2): number
@@ -291,6 +313,84 @@ local function delaunay(tris: { { number } }, pts: { V2 },
 	return flips
 end
 
+-- Splice two convex faces along the edge they share, then keep it only if the
+-- result is still convex and still small enough.
+--
+-- `A` runs u -> v and `B` runs v -> u, because both are counter-clockwise and
+-- they lie on opposite sides of the edge. So the union is A walked from v all
+-- the way round to u, then B walked on from just past u to just before v. The
+-- shared edge is the one thing that does not appear.
+local function spliceFaces(A: { number }, B: { number }, u: number, v: number,
+	pts: { V2 }, maxVerts: number): { number }?
+	local ia, ib = nil, nil
+	for i = 1, #A do
+		if A[i] == u and A[(i % #A) + 1] == v then ia = i; break end
+	end
+	for j = 1, #B do
+		if B[j] == v and B[(j % #B) + 1] == u then ib = j; break end
+	end
+	if not ia or not ib then return nil end
+	if #A + #B - 2 > maxVerts then return nil end
+
+	local out = {}
+	for k = 0, #A - 1 do out[#out + 1] = A[((ia + k) % #A) + 1] end
+	for k = 1, #B - 2 do out[#out + 1] = B[((ib + k) % #B) + 1] end
+
+	-- convex, and counter-clockwise throughout. Collinear is allowed: three
+	-- points in a line are a harmless extra corner, not a dent.
+	local n = #out
+	for i = 1, n do
+		local a = pts[out[((i - 2) % n) + 1]]
+		local b = pts[out[i]]
+		local c = pts[out[(i % n) + 1]]
+		if cross(a, b, c) < 0 then return nil end
+	end
+	return out
+end
+
+-- Merge faces until no internal edge can go. Ring edges and bridges are held,
+-- the same ones the flip pass refuses to move.
+local function mergeConvex(faces: { { number } }, pts: { V2 },
+	fixed: { [number]: boolean }, maxVerts: number): number
+	local function key(u: number, v: number): number
+		if u > v then u, v = v, u end
+		return u * 1000000 + v
+	end
+	local merges = 0
+	for _ = 1, 500 do
+		local owner: { [number]: { number } } = {}
+		for i, f in ipairs(faces) do
+			for j = 1, #f do
+				local k = key(f[j], f[(j % #f) + 1])
+				local e = owner[k]
+				if not e then e = {}; owner[k] = e end
+				e[#e + 1] = i
+			end
+		end
+		local did = false
+		for k, e in pairs(owner) do
+			if #e == 2 and not fixed[k] and e[1] ~= e[2] then
+				local v = k % 1000000
+				local u = (k - v) / 1000000
+				local A, B = faces[e[1]], faces[e[2]]
+				local m = spliceFaces(A, B, u, v, pts, maxVerts)
+					or spliceFaces(A, B, v, u, pts, maxVerts)
+					or spliceFaces(B, A, u, v, pts, maxVerts)
+					or spliceFaces(B, A, v, u, pts, maxVerts)
+				if m then
+					faces[e[1]] = m
+					table.remove(faces, e[2])
+					merges += 1
+					did = true
+					break
+				end
+			end
+		end
+		if not did then break end
+	end
+	return merges
+end
+
 -- Ear clip a counter-clockwise walk. Returns index triples into `pts`.
 local function earClip(walk: { number }, pts: { V2 }): ({ { number } }, string?)
 	local V = table.clone(walk)
@@ -353,6 +453,7 @@ end
 function Triangulate.build(loops: { any }): any
 	local stats = { regions = 0, done = 0, skipped = 0, tris = 0,
 		holes = 0, unbridged = 0, dropped = 0, area = 0, flips = 0, straightened = 0,
+		merges = 0, byN = {},
 		minAngle = 180, slivers = 0 }
 	local complaints = {}
 	local tris = {}
@@ -464,32 +565,57 @@ function Triangulate.build(loops: { any }): any
 		if Triangulate.flip then
 			stats.flips += delaunay(out, pts, fixed)
 		end
+		if Triangulate.merge then
+			stats.merges += mergeConvex(out, pts, fixed, Triangulate.maxVerts)
+		end
+
 		local made = 0
-		for _, t in ipairs(out) do
-			local A, B, C = world[t[1]], world[t[2]], world[t[3]]
-			local a = 0.5 * (B - A):Cross(C - A).Magnitude
-			if a < Triangulate.minArea then
+		for _, f in ipairs(out) do
+			local n = #f
+			local verts = table.create(n)
+			for i = 1, n do verts[i] = world[f[i]] end
+
+			-- Area and centroid by fanning from the first corner. For a CONVEX
+			-- face the fan stays inside, so the area-weighted centroid is the real
+			-- one. Averaging the corners instead would drag the node toward
+			-- whichever side has more of them, and the node is the whole point.
+			local area, cx = 0, Vector3.zero
+			for i = 2, n - 1 do
+				local A, B, C = verts[1], verts[i], verts[i + 1]
+				local a = 0.5 * (B - A):Cross(C - A).Magnitude
+				area += a
+				cx += (A + B + C) / 3 * a
+			end
+			if area < Triangulate.minArea then
 				stats.dropped += 1
 				continue
 			end
-			-- The SMALLEST ANGLE is the honest shape measure. Area says nothing
-			-- about a sliver: a long thin triangle can have plenty of it.
-			local ab, bc, ca = (B - A).Magnitude, (C - B).Magnitude, (A - C).Magnitude
+			local centre = cx / area
+
+			-- THE SMALLEST INTERIOR ANGLE is the honest shape measure. Area says
+			-- nothing about a sliver: a long thin face can have plenty of it.
 			local worst = 180
-			for _, t3 in ipairs({ { ab, ca, bc }, { bc, ab, ca }, { ca, bc, ab } }) do
-				local x, y, z = t3[1], t3[2], t3[3]
-				if x > 1e-9 and y > 1e-9 then
-					local cosang = math.clamp((x * x + y * y - z * z) / (2 * x * y), -1, 1)
-					local deg = math.deg(math.acos(cosang))
+			for i = 1, n do
+				local a = verts[((i - 2) % n) + 1]
+				local b = verts[i]
+				local c = verts[(i % n) + 1]
+				local u1, u2 = a - b, c - b
+				local m1, m2 = u1.Magnitude, u2.Magnitude
+				if m1 > 1e-9 and m2 > 1e-9 then
+					local deg = math.deg(math.acos(
+						math.clamp(u1:Dot(u2) / (m1 * m2), -1, 1)))
 					if deg < worst then worst = deg end
 				end
 			end
 			if worst < stats.minAngle then stats.minAngle = worst end
 			if worst < 15 then stats.slivers += 1 end
+			stats.byN[n] = (stats.byN[n] or 0) + 1
 
-			tris[#tris + 1] = { a = A, b = B, c = C, region = r, up = up,
-				area = a, centre = (A + B + C) / 3, minAngle = worst }
-			stats.area += a
+			tris[#tris + 1] = { verts = verts, n = n, region = r, up = up,
+				area = area, centre = centre, minAngle = worst,
+				-- kept so anything still expecting a triangle keeps working
+				a = verts[1], b = verts[2], c = verts[3] }
+			stats.area += area
 			made += 1
 		end
 		stats.tris += made
@@ -515,7 +641,7 @@ end
 function Triangulate.report(res: any, loops: { any }?): string
 	local s = res.stats
 	local lines = {
-		("tri       %d regions, %d triangulated, %d skipped, %d triangles, %d holes")
+		("tri       %d regions, %d meshed, %d skipped, %d faces, %d holes")
 			:format(s.regions, s.done, s.skipped, s.tris, s.holes),
 	}
 	if loops then
@@ -523,8 +649,13 @@ function Triangulate.report(res: any, loops: { any }?): string
 		lines[#lines + 1] = ("  area %.1f of %.1f sq studs (%.2f%%)")
 			:format(got, want, want > 0 and (got / want * 100) or 0)
 	end
-	lines[#lines + 1] = ("  smallest angle %.1f deg, %d triangles under 15 deg, %d flips, %d flat corners dropped")
-		:format(s.minAngle, s.slivers, s.flips, s.straightened)
+	lines[#lines + 1] = ("  smallest angle %.1f deg, %d faces under 15 deg, %d flips, %d merges")
+		:format(s.minAngle, s.slivers, s.flips, s.merges)
+	local shape = {}
+	for n = 3, 16 do
+		if s.byN[n] then shape[#shape + 1] = ("%d-gon:%d"):format(n, s.byN[n]) end
+	end
+	if #shape > 0 then lines[#lines + 1] = "  " .. table.concat(shape, "  ") end
 	if s.dropped > 0 then
 		lines[#lines + 1] = ("  %d slivers under %.0e dropped"):format(s.dropped, Triangulate.minArea)
 	end
