@@ -101,6 +101,32 @@ local function thinPass(m: { { boolean } }, W: number, H: number, phase: number)
 	return #kill
 end
 
+-- How many separate arms leave this cell: the number of times the ring of
+-- neighbours goes from empty to filled.
+--
+-- NOT THE NEIGHBOUR COUNT. Counting set neighbours reads a plain diagonal bend
+-- as a branch, because in 8-connectivity the two cells either side of a bend are
+-- also diagonal to each other, so a cell in the middle of a perfectly ordinary
+-- corner has three neighbours and no branch. That was measured: case3 reported
+-- 93 junctions and the number did not move however hard the spurs were pruned,
+-- because almost none of them were spurs. The transition count is the standard
+-- branch test and it reads that same bend as 2.
+local function crossings(m: { { boolean } }, W: number, H: number,
+	x: number, y: number): number
+	local n = table.create(8, false)
+	for i = 1, 8 do
+		local yy = y + P[i][2]
+		local xx = x + P[i][1]
+		n[i] = yy >= 1 and yy <= H and xx >= 1 and xx <= W and m[yy][xx]
+	end
+	local a = 0
+	for i = 1, 8 do
+		local j = (i % 8) + 1
+		if not n[i] and n[j] then a += 1 end
+	end
+	return a
+end
+
 local function neighbours(m: { { boolean } }, W: number, H: number,
 	x: number, y: number): number
 	local k = 0
@@ -266,8 +292,8 @@ function Skeleton.build(data: any, cfg: any?): any
 		local isNode = {}
 		local anyMarked = false
 		for _, q in ipairs(live) do
-			local d = neighbours(m, W, H, q[1], q[2])
-			if d ~= 2 then
+			local a = crossings(m, W, H, q[1], q[2])
+			if a ~= 2 then
 				isNode[q[2] * 100000 + q[1]] = true
 				anyMarked = true
 			end
@@ -296,8 +322,8 @@ function Skeleton.build(data: any, cfg: any?): any
 			if isNode[kk] then
 				local cell = at[kk]
 				if cell then
-					local d = neighbours(m, W, H, q[1], q[2])
-					local kind = (d <= 1) and "tip" or (d >= 3) and "junction" or "run"
+					local a = crossings(m, W, H, q[1], q[2])
+					local kind = (a <= 1) and "tip" or (a >= 3) and "junction" or "run"
 					local id = #nodes + 1
 					nodes[id] = { id = id, pos = cell.pos, normal = cell.normal,
 						region = grp.region, grid = grp.grid, kind = kind,
