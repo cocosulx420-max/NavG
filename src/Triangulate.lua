@@ -294,9 +294,26 @@ local function delaunay(tris: { { number } }, pts: { V2 },
 		local did = false
 		for k, e in pairs(edge) do
 			if #e == 2 and not fixed[k] then
-				local t1, t2 = tris[e[1]], tris[e[2]]
 				local v = k % 1000000
 				local u = (k - v) / 1000000
+				-- WHICH TRIANGLE HOLDS u -> v DECIDES THE OUTPUT WINDING. Both
+				-- are counter-clockwise, so exactly one of them walks the shared
+				-- edge as u -> v and the other as v -> u. Guessing leaves the two
+				-- replacements wound backwards, and a backwards face is invisible
+				-- here -- area is a magnitude, so nothing complains -- but the
+				-- merge pass then cannot splice it to anything and silently gives
+				-- up. That cost 27 merges on case3, which Cocosulx spotted as two
+				-- triangles sitting side by side that plainly should have been
+				-- one quad.
+				local i1, i2 = e[1], e[2]
+				local function walksUV(t: { number }): boolean
+					for j = 1, 3 do
+						if t[j] == u and t[(j % 3) + 1] == v then return true end
+					end
+					return false
+				end
+				if not walksUV(tris[i1]) then i1, i2 = i2, i1 end
+				local t1, t2 = tris[i1], tris[i2]
 				local p2, p3 = nil, nil
 				for _, x in ipairs(t1) do if x ~= u and x ~= v then p2 = x end end
 				for _, x in ipairs(t2) do if x ~= u and x ~= v then p3 = x end end
@@ -311,8 +328,8 @@ local function delaunay(tris: { { number } }, pts: { V2 },
 						local a, b, c = A, B, C
 						if cross(a, b, c) < 0 then a, b = b, a end
 						if inCircle(a, b, c, D) then
-							tris[e[1]] = { u, p3, p2 }
-							tris[e[2]] = { v, p2, p3 }
+							tris[i1] = { u, p3, p2 }
+							tris[i2] = { v, p2, p3 }
 							flips += 1
 							did = true
 							break
