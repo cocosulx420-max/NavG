@@ -87,6 +87,19 @@ Triangulate.merge = true
 -- grow into a long ribbon whose centre sits nowhere useful.
 Triangulate.maxVerts = 4
 
+-- Let a merge dissolve a BRIDGE, the zero-width channel cut into a hole.
+--
+-- The flip pass must not touch a bridge, because a flip swaps one diagonal for
+-- another and can put the new one across the hole. A MERGE cannot: the union of
+-- two faces sharing an edge is exactly those two faces when it is convex, so it
+-- covers no ground they did not already cover between them. Holding bridges here
+-- as well was over-cautious, and Cocosulx found it by pointing at two triangles
+-- either side of one and asking why they had not merged.
+--
+-- The area check is what proves it: if a merge ever did swallow a hole, total
+-- face area would exceed the summed ring area and `report` would say so.
+Triangulate.mergeBridges = true
+
 type V2 = { x: number, y: number }
 
 local function cross(o: V2, a: V2, b: V2): number
@@ -576,7 +589,21 @@ function Triangulate.build(loops: { any }): any
 			stats.flips += delaunay(out, pts, fixed)
 		end
 		if Triangulate.merge then
-			stats.merges += mergeConvex(out, pts, fixed, Triangulate.maxVerts)
+			local hold = fixed
+			if Triangulate.mergeBridges then
+				-- ring edges only. A ring edge borders one face, so this set is
+				-- belt and braces; what it drops is the bridges.
+				hold = {}
+				for _, ring in ipairs(ringIdx) do
+					local n = #ring
+					for i = 1, n do
+						local u, v = ring[i], ring[(i % n) + 1]
+						if u > v then u, v = v, u end
+						hold[u * 1000000 + v] = true
+					end
+				end
+			end
+			stats.merges += mergeConvex(out, pts, hold, Triangulate.maxVerts)
 		end
 
 		local made = 0
