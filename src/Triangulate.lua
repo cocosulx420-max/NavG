@@ -49,6 +49,22 @@ Triangulate.maxStalls = 2
 -- raw ear-clip output; the flip pass has no downside worth a switch.
 Triangulate.flip = true
 
+-- Drop a corner sitting closer than this to the straight line through its two
+-- neighbours, in studs, before triangulating.
+--
+-- THIS IS WHERE THE SLIVERS COME FROM. Flipping to Delaunay halved them and
+-- still left case3 with a 0.33 degree triangle, which no honest shape produces.
+-- Its sides were 0.50, 7.40 and 7.90 studs: a corner four hundredths of a stud
+-- off a straight edge, left behind by quantising the boundary onto a half stud
+-- lattice. No triangulation can make that pair of corners into a decent
+-- triangle, because the problem is the corners.
+--
+-- 0.1 is well under the 0.633 stud worst deviation the simplifier already
+-- reports, so this cannot move the boundary further than the pipeline already
+-- accepts. Applied HERE and not in PathSimplify, so the drawn boundary is
+-- exactly what was traced and only the mesh is cleaned.
+Triangulate.collinear = 0.1
+
 type V2 = { x: number, y: number }
 
 local function cross(o: V2, a: V2, b: V2): number
@@ -156,6 +172,40 @@ local function bridge(walk: { number }, pts: { V2 }, hole: { number },
 	out[#out + 1] = walk[bestA]
 	for i = bestA + 1, #walk do out[#out + 1] = walk[i] end
 	return out, bridgeA, bridgeB
+end
+
+-- Remove corners that are not really corners.
+--
+-- Iterated, because taking one out can leave its neighbour flat. Never goes
+-- below 3 points: a ring that collapses that far was degenerate already and
+-- Rings has said so.
+local function straighten(pts: { Vector3 }, eps: number): { Vector3 }
+	local out = table.clone(pts)
+	local changed = true
+	while changed and #out > 3 do
+		changed = false
+		local i = 1
+		while i <= #out and #out > 3 do
+			local a = out[((i - 2) % #out) + 1]
+			local b = out[i]
+			local c = out[(i % #out) + 1]
+			local ac = c - a
+			local len = ac.Magnitude
+			local dev
+			if len < 1e-9 then
+				dev = (b - a).Magnitude
+			else
+				dev = (b - a):Cross(ac).Magnitude / len
+			end
+			if dev < eps then
+				table.remove(out, i)
+				changed = true
+			else
+				i += 1
+			end
+		end
+	end
+	return out
 end
 
 -- Is `d` inside the circle through a, b and c. `abc` must be counter-clockwise.
@@ -302,7 +352,7 @@ end
 -- a search node needs and everything a drawing needs.
 function Triangulate.build(loops: { any }): any
 	local stats = { regions = 0, done = 0, skipped = 0, tris = 0,
-		holes = 0, unbridged = 0, dropped = 0, area = 0, flips = 0,
+		holes = 0, unbridged = 0, dropped = 0, area = 0, flips = 0, straightened = 0,
 		minAngle = 180, slivers = 0 }
 	local complaints = {}
 	local tris = {}
@@ -353,9 +403,12 @@ function Triangulate.build(loops: { any }): any
 		-- bridge can name a hole vertex and a rim vertex with the same index.
 		local pts, world = {}, {}
 		local ringIdx = {}
+		local eps = Triangulate.collinear
 		local function flatten(L: any): { number }
 			local out = {}
-			for _, p in ipairs(L.pts) do
+			local src = (eps > 0) and straighten(L.pts, eps) or L.pts
+			stats.straightened += #L.pts - #src
+			for _, p in ipairs(src) do
 				local d = p - origin
 				pts[#pts + 1] = { x = d:Dot(e1), y = d:Dot(e2) }
 				world[#world + 1] = p
@@ -470,8 +523,8 @@ function Triangulate.report(res: any, loops: { any }?): string
 		lines[#lines + 1] = ("  area %.1f of %.1f sq studs (%.2f%%)")
 			:format(got, want, want > 0 and (got / want * 100) or 0)
 	end
-	lines[#lines + 1] = ("  smallest angle %.1f deg, %d triangles under 15 deg, %d flips")
-		:format(s.minAngle, s.slivers, s.flips)
+	lines[#lines + 1] = ("  smallest angle %.1f deg, %d triangles under 15 deg, %d flips, %d flat corners dropped")
+		:format(s.minAngle, s.slivers, s.flips, s.straightened)
 	if s.dropped > 0 then
 		lines[#lines + 1] = ("  %d slivers under %.0e dropped"):format(s.dropped, Triangulate.minArea)
 	end
