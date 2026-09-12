@@ -50,6 +50,16 @@ Nodes.mode = "largest"
 -- rectangle grows back over the middle and becomes a real node.
 Nodes.overlap = true
 
+-- How thick a grown rectangle is allowed to get, in CELLS. Unbounded growth
+-- was measured and it is the wrong trade: every fringe strip on case5 grew
+-- across the whole open floor, the cover reached 6.94x redundant, links went
+-- from 2586 to 14486 and the build took 81 seconds, all to remove 586 slivers.
+--
+-- 4 cells is 2 studs, which is the agent's width. A node thinner than the agent
+-- is not somewhere the agent fits, so that is exactly the point where growing
+-- stops paying. A rectangle that is already this thick is left alone.
+Nodes.growTo = 4
+
 -- 8 gives the graph diagonal links between rectangles that only touch at a
 -- corner. Off by default: a corner touch is not somewhere an agent fits.
 Nodes.diagonalLinks = false
@@ -180,13 +190,16 @@ local function coverLargest(rows: { [number]: { number } }): { any }
 
 		if Nodes.overlap then
 			-- Grow over ground that is already covered, never over ground that is
-			-- not floor. Each direction is taken as far as it goes before the next
-			-- is tried, which is enough: the point is to reabsorb a fringe into the
-			-- open area beside it, not to find the single best growth.
-			while rowClear(y0 - 1, x0, x1) do y0 -= 1 end
-			while rowClear(y1 + 1, x0, x1) do y1 += 1 end
-			while colClear(x0 - 1, y0, y1) do x0 -= 1 end
-			while colClear(x1 + 1, y0, y1) do x1 += 1 end
+			-- not floor, and only up to `growTo` thick. A rectangle that already
+			-- clears that in both directions is left exactly as it was, so the
+			-- big interior nodes never overlap anything and only the thin fringe
+			-- reaches back over its neighbour.
+			local wantH = math.max(y1 - y0 + 1, Nodes.growTo)
+			local wantW = math.max(x1 - x0 + 1, Nodes.growTo)
+			while (y1 - y0 + 1) < wantH and rowClear(y0 - 1, x0, x1) do y0 -= 1 end
+			while (y1 - y0 + 1) < wantH and rowClear(y1 + 1, x0, x1) do y1 += 1 end
+			while (x1 - x0 + 1) < wantW and colClear(x0 - 1, y0, y1) do x0 -= 1 end
+			while (x1 - x0 + 1) < wantW and colClear(x1 + 1, y0, y1) do x1 += 1 end
 		end
 
 		local claimed = 0
