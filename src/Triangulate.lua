@@ -367,7 +367,13 @@ local function mergeConvex(faces: { { number } }, pts: { V2 },
 				e[#e + 1] = i
 			end
 		end
-		local did = false
+		-- BEST MERGE PER SWEEP, NOT THE FIRST ONE FOUND. Hertel-Mehlhorn is
+		-- greedy and the answer depends on the order, because one merge can
+		-- make a neighbouring one non-convex and block it. Taking the longest
+		-- shared edge first is Recast's heuristic: it dissolves the longest
+		-- internal wall available, which leaves the squarest face behind and
+		-- the squarest face has the most ways to merge again.
+		local bestM, bestI, bestJ, bestLen = nil, nil, nil, -1
 		for k, e in pairs(owner) do
 			if #e == 2 and not fixed[k] and e[1] ~= e[2] then
 				local v = k % 1000000
@@ -378,15 +384,19 @@ local function mergeConvex(faces: { { number } }, pts: { V2 },
 					or spliceFaces(B, A, u, v, pts, maxVerts)
 					or spliceFaces(B, A, v, u, pts, maxVerts)
 				if m then
-					faces[e[1]] = m
-					table.remove(faces, e[2])
-					merges += 1
-					did = true
-					break
+					local du = pts[u].x - pts[v].x
+					local dv = pts[u].y - pts[v].y
+					local len = du * du + dv * dv
+					if len > bestLen then
+						bestM, bestI, bestJ, bestLen = m, e[1], e[2], len
+					end
 				end
 			end
 		end
-		if not did then break end
+		if not bestM then break end
+		faces[bestI] = bestM
+		table.remove(faces, bestJ)
+		merges += 1
 	end
 	return merges
 end
