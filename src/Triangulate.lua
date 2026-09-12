@@ -45,6 +45,10 @@ Triangulate.minArea = 1e-3
 -- retrying fixes. Bail after this many failed sweeps and report the ring.
 Triangulate.maxStalls = 2
 
+-- Flip diagonals to Delaunay after clipping. Off only to compare against the
+-- raw ear-clip output; the flip pass has no downside worth a switch.
+Triangulate.flip = true
+
 type V2 = { x: number, y: number }
 
 local function cross(o: V2, a: V2, b: V2): number
@@ -140,6 +144,7 @@ local function bridge(walk: { number }, pts: { V2 }, hole: { number },
 		end
 	end
 	if not bestA then return nil end
+	local bridgeA, bridgeB = walk[bestA], hole[bestB]
 
 	-- outer[1..a], then the hole from b all the way round back to b, then
 	-- outer[a] again. The hole keeps its own winding, which is opposite to the
@@ -150,7 +155,90 @@ local function bridge(walk: { number }, pts: { V2 }, hole: { number },
 	for k = 0, m do out[#out + 1] = hole[((bestB - 1 + k) % m) + 1] end
 	out[#out + 1] = walk[bestA]
 	for i = bestA + 1, #walk do out[#out + 1] = walk[i] end
-	return out
+	return out, bridgeA, bridgeB
+end
+
+-- Is `d` inside the circle through a, b and c. `abc` must be counter-clockwise.
+local function inCircle(a: V2, b: V2, c: V2, d: V2): boolean
+	local ax, ay = a.x - d.x, a.y - d.y
+	local bx, by = b.x - d.x, b.y - d.y
+	local cx, cy = c.x - d.x, c.y - d.y
+	return (ax * ax + ay * ay) * (bx * cy - cx * by)
+		- (bx * bx + by * by) * (ax * cy - cx * ay)
+		+ (cx * cx + cy * cy) * (ax * by - bx * ay) > 0
+end
+
+-- Flip diagonals until the triangulation is Delaunay.
+--
+-- WHY THIS AND NOT A BETTER CLIPPER. Ear clipping takes whichever ear it meets
+-- first, so the shape of what it produces is an accident of scan order, and long
+-- thin triangles are the usual result. Flipping fixes it after the fact and
+-- comes with a guarantee no clipper can offer: among every triangulation of the
+-- same corners, the Delaunay one maximises the SMALLEST angle. So there is no
+-- arrangement of these vertices with fewer slivers than what this converges to.
+--
+-- It cannot invent quality that the corner set does not allow. Two corners half
+-- a stud apart at the end of a twenty stud edge will always make a sliver, and
+-- the only cure for that is adding vertices, which is a different algorithm and
+-- a lot more of it.
+--
+-- CONSTRAINED. A ring edge is the floor's own boundary and a bridge is the
+-- channel cut into a hole; flipping either one puts a triangle outside the
+-- surface or straight across the hole. Both are refused by index.
+local function delaunay(tris: { { number } }, pts: { V2 },
+	fixed: { [number]: boolean }): number
+	local function key(u: number, v: number): number
+		if u > v then u, v = v, u end
+		return u * 1000000 + v
+	end
+	local flips = 0
+	for _ = 1, 200 do
+		-- rebuilt every flip rather than patched. Two triangles change and the
+		-- edges around them all move; patching that in place is where this kind
+		-- of loop goes wrong, and there are only a handful of triangles here.
+		local edge: { [number]: { number } } = {}
+		for i, t in ipairs(tris) do
+			for j = 1, 3 do
+				local u, v = t[j], t[(j % 3) + 1]
+				local k = key(u, v)
+				local e = edge[k]
+				if not e then e = {}; edge[k] = e end
+				e[#e + 1] = i
+			end
+		end
+		local did = false
+		for k, e in pairs(edge) do
+			if #e == 2 and not fixed[k] then
+				local t1, t2 = tris[e[1]], tris[e[2]]
+				local v = k % 1000000
+				local u = (k - v) / 1000000
+				local p2, p3 = nil, nil
+				for _, x in ipairs(t1) do if x ~= u and x ~= v then p2 = x end end
+				for _, x in ipairs(t2) do if x ~= u and x ~= v then p3 = x end end
+				if p2 and p3 and p2 ~= p3 then
+					local A, B = pts[u], pts[v]
+					local C, D = pts[p2], pts[p3]
+					-- the quad must be convex or the flip leaves the surface: u and v
+					-- have to sit on opposite sides of the new diagonal
+					local s1 = cross(C, D, A)
+					local s2 = cross(C, D, B)
+					if (s1 > 0) ~= (s2 > 0) and s1 ~= 0 and s2 ~= 0 then
+						local a, b, c = A, B, C
+						if cross(a, b, c) < 0 then a, b = b, a end
+						if inCircle(a, b, c, D) then
+							tris[e[1]] = { u, p3, p2 }
+							tris[e[2]] = { v, p2, p3 }
+							flips += 1
+							did = true
+							break
+						end
+					end
+				end
+			end
+		end
+		if not did then break end
+	end
+	return flips
 end
 
 -- Ear clip a counter-clockwise walk. Returns index triples into `pts`.
@@ -214,7 +302,8 @@ end
 -- a search node needs and everything a drawing needs.
 function Triangulate.build(loops: { any }): any
 	local stats = { regions = 0, done = 0, skipped = 0, tris = 0,
-		holes = 0, unbridged = 0, dropped = 0, area = 0 }
+		holes = 0, unbridged = 0, dropped = 0, area = 0, flips = 0,
+		minAngle = 180, slivers = 0 }
 	local complaints = {}
 	local tris = {}
 
@@ -289,11 +378,25 @@ function Triangulate.build(loops: { any }): any
 		-- bridging it while the walk is still simple is the easy case.
 		table.sort(holeRings, function(a, b) return #a > #b end)
 
+		-- Edges the flip pass must not touch: every ring edge, because that is
+		-- the floor's own boundary, and every bridge, because it is the channel
+		-- cut into a hole.
+		local fixed: { [number]: boolean } = {}
+		local function hold(u: number, v: number)
+			if u > v then u, v = v, u end
+			fixed[u * 1000000 + v] = true
+		end
+		for _, ring in ipairs(ringIdx) do
+			local n = #ring
+			for i = 1, n do hold(ring[i], ring[(i % n) + 1]) end
+		end
+
 		local walk = rim
 		for _, h in ipairs(holeRings) do
-			local merged = bridge(walk, pts, h, ringIdx)
+			local merged, ba, bb = bridge(walk, pts, h, ringIdx)
 			if merged then
 				walk = merged
+				hold(ba :: number, bb :: number)
 			else
 				stats.unbridged += 1
 				complaints[#complaints + 1] =
@@ -305,6 +408,9 @@ function Triangulate.build(loops: { any }): any
 		if err then
 			complaints[#complaints + 1] = ("r%03d: %s"):format(r, err)
 		end
+		if Triangulate.flip then
+			stats.flips += delaunay(out, pts, fixed)
+		end
 		local made = 0
 		for _, t in ipairs(out) do
 			local A, B, C = world[t[1]], world[t[2]], world[t[3]]
@@ -313,8 +419,23 @@ function Triangulate.build(loops: { any }): any
 				stats.dropped += 1
 				continue
 			end
+			-- The SMALLEST ANGLE is the honest shape measure. Area says nothing
+			-- about a sliver: a long thin triangle can have plenty of it.
+			local ab, bc, ca = (B - A).Magnitude, (C - B).Magnitude, (A - C).Magnitude
+			local worst = 180
+			for _, t3 in ipairs({ { ab, ca, bc }, { bc, ab, ca }, { ca, bc, ab } }) do
+				local x, y, z = t3[1], t3[2], t3[3]
+				if x > 1e-9 and y > 1e-9 then
+					local cosang = math.clamp((x * x + y * y - z * z) / (2 * x * y), -1, 1)
+					local deg = math.deg(math.acos(cosang))
+					if deg < worst then worst = deg end
+				end
+			end
+			if worst < stats.minAngle then stats.minAngle = worst end
+			if worst < 15 then stats.slivers += 1 end
+
 			tris[#tris + 1] = { a = A, b = B, c = C, region = r, up = up,
-				area = a, centre = (A + B + C) / 3 }
+				area = a, centre = (A + B + C) / 3, minAngle = worst }
 			stats.area += a
 			made += 1
 		end
@@ -349,6 +470,8 @@ function Triangulate.report(res: any, loops: { any }?): string
 		lines[#lines + 1] = ("  area %.1f of %.1f sq studs (%.2f%%)")
 			:format(got, want, want > 0 and (got / want * 100) or 0)
 	end
+	lines[#lines + 1] = ("  smallest angle %.1f deg, %d triangles under 15 deg, %d flips")
+		:format(s.minAngle, s.slivers, s.flips)
 	if s.dropped > 0 then
 		lines[#lines + 1] = ("  %d slivers under %.0e dropped"):format(s.dropped, Triangulate.minArea)
 	end
