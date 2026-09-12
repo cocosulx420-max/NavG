@@ -21,6 +21,7 @@ local Boundary = require(script.Parent:WaitForChild("Boundary"))
 local PathSimplify = require(script.Parent:WaitForChild("PathSimplify"))
 local Rings = require(script.Parent:WaitForChild("Rings"))
 local Severance = require(script.Parent:WaitForChild("Severance"))
+local Cull = require(script.Parent:WaitForChild("Cull"))
 
 -- TUNING LIVES IN THE MODULES, NOT HERE. A number in OVERRIDES is a deliberate
 -- departure from a module's own default, and the module comment next to that
@@ -369,6 +370,79 @@ end
 --
 -- `keep` is the filter that makes the second snapshot: given a cell, answer
 -- whether it survives. Pass nothing for the baseline.
+-- Drop the regions not worth pathing through. Cached on the result, and NOT run
+-- by `bake`: it changes what the map contains, so it is asked for explicitly.
+function Pipeline.cull(result: any, cfg: any?): any
+	if not result.cull then
+		result.cull = Cull.apply(result.data, cfg)
+	end
+	return result.cull
+end
+
+-- Draw the cells, one colour per region, one folder per region.
+--
+-- THIS IS THE VIEW THE CULL IS JUDGED IN. A boundary drawing shows the outline
+-- of a region and says nothing about how much floor is inside it, and the whole
+-- question here is whether a region is worth having at all. Folder names carry
+-- the region id and its cell count so a suspect one can be found in the
+-- explorer and renamed.
+--
+-- `opts.culled` set to true draws the dropped regions instead of the kept ones,
+-- which is how you check what a cull actually took.
+function Pipeline.drawRegions(result: any, opts: any?): (Instance, string)
+	local o = opts or {}
+	local lift = o.lift or 0.2
+	local showCulled = o.culled == true
+	local step = (result.data.config and result.data.config.step) or 0.5
+
+	local old = workspace:FindFirstChild(Pipeline.debugName)
+	if old then old:Destroy() end
+	local root = Instance.new("Folder")
+	root.Name = Pipeline.debugName
+	root.Parent = workspace
+	local reg = Instance.new("Folder")
+	reg.Name = showCulled and "Culled" or "Regions"
+	reg.Parent = root
+
+	local folders, counts = {}, {}
+	local drawn = 0
+	for _, g in ipairs(result.data.grids) do
+		local u = g.u or Vector3.xAxis
+		for _, cell in ipairs(g.cells) do
+			local r = cell.region or (showCulled and cell.regionWas or nil)
+			local want = showCulled and (cell.culled == true) or (cell.region ~= nil)
+			if r and want then
+				local f = folders[r]
+				if not f then
+					f = Instance.new("Folder")
+					f.Parent = reg
+					folders[r] = f
+					counts[r] = 0
+				end
+				counts[r] += 1
+				drawn += 1
+				local up = cell.normal or Vector3.yAxis
+				local p = Instance.new("Part")
+				p.Anchored = true; p.CanCollide = false
+				p.CanQuery = false; p.CanTouch = false
+				p.Size = Vector3.new(step * 0.9, 0.06, step * 0.9)
+				p.CFrame = CFrame.fromMatrix(cell.pos + up * lift, u, up)
+				-- golden-ratio stride, so consecutive regions never look alike
+				p.Color = Color3.fromHSV((r * 0.618034) % 1, 0.7, 1)
+				p.Material = Enum.Material.Neon
+				p.Name = "c"
+				p.Parent = f
+			end
+		end
+	end
+	local n = 0
+	for r, k in pairs(counts) do
+		n += 1
+		folders[r].Name = ("r%03d_%dcells"):format(r, k)
+	end
+	return root, ("%d regions, %d cells drawn"):format(n, drawn)
+end
+
 function Pipeline.connectivity(result: any, keep: ((any) -> boolean)?): any
 	return Severance.snapshot(result.data, keep)
 end
