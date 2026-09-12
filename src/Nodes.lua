@@ -36,6 +36,12 @@ local Severance = require(script.Parent:WaitForChild("Severance"))
 -- the lattice and the decomposition is not buying much.
 Nodes.sliverWidth = 1
 
+-- "largest" takes the biggest rectangle that fits, over and over, until the
+-- cells run out. "runs" stacks equal-width row runs and glues the results
+-- sideways. Runs is linear and largest is a full scan per rectangle emitted, and
+-- on ragged edges runs fragments badly -- case3 came out half one-cell slivers.
+Nodes.mode = "largest"
+
 -- 8 gives the graph diagonal links between rectangles that only touch at a
 -- corner. Off by default: a corner touch is not somewhere an agent fits.
 Nodes.diagonalLinks = false
@@ -54,6 +60,99 @@ local function runs(us: { number }): { { number } }
 		end
 		out[#out + 1] = { a, b }
 		i += 1
+	end
+	return out
+end
+
+-- The biggest rectangle of set cells in a binary grid, by the histogram method:
+-- for each row, treat the column of set cells above it as a bar, and find the
+-- largest rectangle in that histogram with a monotonic stack. Linear per row, so
+-- linear in the grid.
+--
+-- Returns x0, x1, y0, y1 in 0-based grid coordinates, or nil when empty.
+local function largestRect(occ: { { boolean } }, W: number, H: number)
+	local heights = table.create(W, 0)
+	local stackX = table.create(W + 1, 0)
+	local stackH = table.create(W + 1, 0)
+	local bestA, bx0, bx1, by0, by1 = 0, nil, nil, nil, nil
+
+	for y = 1, H do
+		local row = occ[y]
+		for x = 1, W do
+			heights[x] = row[x] and (heights[x] + 1) or 0
+		end
+		-- one sentinel pass past the end flushes the stack
+		local top = 0
+		for x = 1, W + 1 do
+			local h = (x <= W) and heights[x] or 0
+			local start = x
+			while top > 0 and stackH[top] > h do
+				local ph = stackH[top]
+				local px = stackX[top]
+				top -= 1
+				local area = ph * (x - px)
+				if area > bestA then
+					bestA = area
+					bx0, bx1 = px, x - 1
+					by0, by1 = y - ph + 1, y
+				end
+				start = px
+			end
+			if h > 0 and (top == 0 or stackH[top] < h) then
+				top += 1
+				stackX[top] = start
+				stackH[top] = h
+			end
+		end
+	end
+	if not bx0 then return nil end
+	return bx0, bx1, by0, by1, bestA
+end
+
+-- Largest-rectangle-first cover. Take the biggest rectangle that fits, claim its
+-- cells, repeat.
+--
+-- WORTH THE EXTRA SCANS. The linear alternative below stacks row runs of equal
+-- width, which is exact on a shape that really is a rectangle and falls apart on
+-- one whose edges are ragged in the lattice: a boundary that steps in and out by
+-- a cell breaks every run and case3 came out 123 slivers of 242 nodes. Taking
+-- the biggest rectangle first puts the large nodes in the open middle and leaves
+-- the raggedness to be mopped up at the edges, where it belongs.
+local function coverLargest(rows: { [number]: { number } }): { any }
+	local ulo, uhi, vlo, vhi = math.huge, -math.huge, math.huge, -math.huge
+	local total = 0
+	for v, us in pairs(rows) do
+		if v < vlo then vlo = v end
+		if v > vhi then vhi = v end
+		for _, u in ipairs(us) do
+			if u < ulo then ulo = u end
+			if u > uhi then uhi = u end
+			total += 1
+		end
+	end
+	if total == 0 then return {} end
+	local W, H = uhi - ulo + 1, vhi - vlo + 1
+
+	local occ = table.create(H)
+	for y = 1, H do occ[y] = table.create(W, false) end
+	for v, us in pairs(rows) do
+		local row = occ[v - vlo + 1]
+		for _, u in ipairs(us) do row[u - ulo + 1] = true end
+	end
+
+	local out = {}
+	while total > 0 do
+		local x0, x1, y0, y1, area = largestRect(occ, W, H)
+		if not x0 then break end
+		for y = y0, y1 do
+			local row = occ[y]
+			for x = x0, x1 do row[x] = false end
+		end
+		total -= area
+		out[#out + 1] = {
+			u0 = x0 + ulo - 1, u1 = x1 + ulo - 1,
+			v0 = y0 + vlo - 1, v1 = y1 + vlo - 1,
+		}
 	end
 	return out
 end
@@ -153,7 +252,9 @@ function Nodes.build(data: any, cfg: any?): any
 	for _, k in ipairs(order) do
 		local grp = groups[k]
 		stats.groups += 1
-		for _, r in ipairs(cover(grp.rows)) do
+		local rects = (Nodes.mode == "runs") and cover(grp.rows)
+			or coverLargest(grp.rows)
+		for _, r in ipairs(rects) do
 			local w, h = r.u1 - r.u0 + 1, r.v1 - r.v0 + 1
 
 			-- The node sits on the cell nearest the rectangle's middle, not on
