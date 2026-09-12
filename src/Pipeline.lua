@@ -22,6 +22,7 @@ local PathSimplify = require(script.Parent:WaitForChild("PathSimplify"))
 local Rings = require(script.Parent:WaitForChild("Rings"))
 local Severance = require(script.Parent:WaitForChild("Severance"))
 local Cull = require(script.Parent:WaitForChild("Cull"))
+local Skeleton = require(script.Parent:WaitForChild("Skeleton"))
 
 -- TUNING LIVES IN THE MODULES, NOT HERE. A number in OVERRIDES is a deliberate
 -- departure from a module's own default, and the module comment next to that
@@ -460,6 +461,79 @@ local function segment(a: Vector3, b: Vector3, thick: number, colour: Color3,
 	p.Material = Enum.Material.Neon
 	p.Name = name
 	p.Parent = parent
+end
+
+-- Thin every region to its middle and take the nodes from what is left.
+function Pipeline.skeleton(result: any, cfg: any?): any
+	if not result.skeleton then
+		result.skeleton = Skeleton.build(result.data, cfg)
+	end
+	return result.skeleton
+end
+
+-- Draw the spine, the nodes on it, and the links between them.
+--
+-- THE SPINE IS DRAWN AS WELL AS THE NODES. A node on its own says where the
+-- middle of a region was judged to be and nothing about why, and the whole
+-- question with a skeleton is whether the shape it found is the shape you
+-- expected. Faint grey cells are the spine, colour is by kind: a tip is the end
+-- of an arm, a junction is where arms meet, and a plain marker is spacing along
+-- a long run.
+function Pipeline.drawSkeleton(result: any, opts: any?): (Instance, string)
+	local o = opts or {}
+	local lift = o.lift or 0.3
+	local res = Pipeline.skeleton(result, o.cfg)
+	local step = (result.data.config and result.data.config.step) or 0.5
+
+	local old = workspace:FindFirstChild(Pipeline.debugName)
+	if old then old:Destroy() end
+	local root = Instance.new("Folder")
+	root.Name = Pipeline.debugName
+	root.Parent = workspace
+	local sf = Instance.new("Folder"); sf.Name = "spine"; sf.Parent = root
+	local nf = Instance.new("Folder"); nf.Name = "nodes"; nf.Parent = root
+	local lf = Instance.new("Folder"); lf.Name = "links"; lf.Parent = root
+
+	for _, cell in ipairs(res.spine) do
+		local up = cell.normal or Vector3.yAxis
+		local p = Instance.new("Part")
+		p.Anchored = true; p.CanCollide = false; p.CanQuery = false; p.CanTouch = false
+		p.Size = Vector3.new(step * 0.7, 0.05, step * 0.7)
+		p.CFrame = CFrame.new(cell.pos + up * (lift * 0.5))
+		p.Color = Color3.fromRGB(150, 150, 160)
+		p.Transparency = 0.4
+		p.Material = Enum.Material.SmoothPlastic
+		p.Name = "s"
+		p.Parent = sf
+	end
+
+	local TIP = Color3.fromRGB(255, 90, 90)
+	local JUN = Color3.fromRGB(90, 255, 130)
+	local RUN = Color3.fromRGB(255, 230, 60)
+	for _, n in ipairs(res.nodes) do
+		local up = n.normal or Vector3.yAxis
+		local b = Instance.new("Part")
+		b.Anchored = true; b.CanCollide = false; b.CanQuery = false; b.CanTouch = false
+		b.Shape = Enum.PartType.Ball
+		local sz = (n.kind == "junction") and 0.8 or 0.55
+		b.Size = Vector3.new(sz, sz, sz)
+		b.Color = (n.degree == 0) and Color3.fromRGB(255, 0, 220)
+			or (n.kind == "tip") and TIP
+			or (n.kind == "junction") and JUN or RUN
+		b.Material = Enum.Material.Neon
+		b.CFrame = CFrame.new(n.pos + up * lift)
+		b.Name = ("n%04d_r%03d_%s_deg%d"):format(n.id, n.region, n.kind, n.degree)
+		b.Parent = nf
+	end
+
+	for i, L in ipairs(res.links) do
+		local a, b = res.nodes[L.a], res.nodes[L.b]
+		segment(a.pos + (a.normal or Vector3.yAxis) * lift,
+			b.pos + (b.normal or Vector3.yAxis) * lift,
+			0.12, Color3.fromRGB(80, 200, 255), ("l%04d_%d_%d"):format(i, L.a, L.b), lf)
+	end
+
+	return root, Skeleton.report(res)
 end
 
 -- Draw the simplified polygons. Folder names carry region, loop, raw node count
