@@ -42,6 +42,14 @@ Nodes.sliverWidth = 1
 -- on ragged edges runs fragments badly -- case3 came out half one-cell slivers.
 Nodes.mode = "largest"
 
+-- Let rectangles OVERLAP. A cover does not have to be a partition: a node is a
+-- claim that some rectangle of floor is convex and walkable, and two nodes
+-- claiming the same cell costs nothing. Partitioning is what produces the
+-- slivers -- carve the big rectangle out of the middle and the fringe left
+-- behind is one cell wide with nowhere to grow. Allowed to overlap, that fringe
+-- rectangle grows back over the middle and becomes a real node.
+Nodes.overlap = true
+
 -- 8 gives the graph diagonal links between rectangles that only touch at a
 -- corner. Off by default: a corner touch is not somewhere an agent fits.
 Nodes.diagonalLinks = false
@@ -133,22 +141,64 @@ local function coverLargest(rows: { [number]: { number } }): { any }
 	if total == 0 then return {} end
 	local W, H = uhi - ulo + 1, vhi - vlo + 1
 
-	local occ = table.create(H)
-	for y = 1, H do occ[y] = table.create(W, false) end
+	-- Two masks: what is floor, and what is not yet spoken for. Without overlap
+	-- they stay identical and this is a straight partition.
+	local walk = table.create(H)
+	local uncov = table.create(H)
+	for y = 1, H do
+		walk[y] = table.create(W, false)
+		uncov[y] = table.create(W, false)
+	end
 	for v, us in pairs(rows) do
-		local row = occ[v - vlo + 1]
-		for _, u in ipairs(us) do row[u - ulo + 1] = true end
+		local a, b = walk[v - vlo + 1], uncov[v - vlo + 1]
+		for _, u in ipairs(us) do
+			a[u - ulo + 1] = true
+			b[u - ulo + 1] = true
+		end
+	end
+
+	local function rowClear(y: number, x0: number, x1: number): boolean
+		if y < 1 or y > H then return false end
+		local row = walk[y]
+		for x = x0, x1 do
+			if not row[x] then return false end
+		end
+		return true
+	end
+	local function colClear(x: number, y0: number, y1: number): boolean
+		if x < 1 or x > W then return false end
+		for y = y0, y1 do
+			if not walk[y][x] then return false end
+		end
+		return true
 	end
 
 	local out = {}
 	while total > 0 do
-		local x0, x1, y0, y1, area = largestRect(occ, W, H)
+		local x0, x1, y0, y1 = largestRect(uncov, W, H)
 		if not x0 then break end
-		for y = y0, y1 do
-			local row = occ[y]
-			for x = x0, x1 do row[x] = false end
+
+		if Nodes.overlap then
+			-- Grow over ground that is already covered, never over ground that is
+			-- not floor. Each direction is taken as far as it goes before the next
+			-- is tried, which is enough: the point is to reabsorb a fringe into the
+			-- open area beside it, not to find the single best growth.
+			while rowClear(y0 - 1, x0, x1) do y0 -= 1 end
+			while rowClear(y1 + 1, x0, x1) do y1 += 1 end
+			while colClear(x0 - 1, y0, y1) do x0 -= 1 end
+			while colClear(x1 + 1, y0, y1) do x1 += 1 end
 		end
-		total -= area
+
+		local claimed = 0
+		for y = y0, y1 do
+			local row = uncov[y]
+			for x = x0, x1 do
+				if row[x] then row[x] = false; claimed += 1 end
+			end
+		end
+		-- A grown rectangle always claims the seed rectangle, so this cannot
+		-- fail to make progress and the loop always ends.
+		total -= claimed
 		out[#out + 1] = {
 			u0 = x0 + ulo - 1, u1 = x1 + ulo - 1,
 			v0 = y0 + vlo - 1, v1 = y1 + vlo - 1,
@@ -245,8 +295,12 @@ function Nodes.build(data: any, cfg: any?): any
 	end
 
 	local nodes = {}
-	local nodeOf: { [any]: number } = {}
-	local stats = { groups = 0, nodes = 0, cells = 0, slivers = 0,
+	-- A CELL MAY BELONG TO SEVERAL NODES once rectangles are allowed to overlap,
+	-- so this is a list and not a single id. Writing one id and letting the last
+	-- rectangle win would silently strip the overlap out of the graph and leave
+	-- the earlier node with nothing to link through.
+	local nodesOf: { [any]: { number } } = {}
+	local stats = { groups = 0, nodes = 0, cells = 0, covered = 0, slivers = 0,
 		single = 0, biggest = 0, links = 0 }
 
 	for _, k in ipairs(order) do
@@ -294,9 +348,14 @@ function Nodes.build(data: any, cfg: any?): any
 				cells = cells,
 				cellCount = #cells,
 			}
-			for _, cell in ipairs(cells) do nodeOf[cell] = id end
+			for _, cell in ipairs(cells) do
+				local t = nodesOf[cell]
+				if not t then t = {}; nodesOf[cell] = t end
+				t[#t + 1] = id
+			end
 			stats.nodes += 1
-			stats.cells += #cells
+			-- summed over nodes, so overlap counts twice; `cells` below is distinct
+			stats.covered += #cells
 			if #cells > stats.biggest then stats.biggest = #cells end
 			if w <= Nodes.sliverWidth or h <= Nodes.sliverWidth then
 				stats.slivers += 1
@@ -312,10 +371,12 @@ function Nodes.build(data: any, cfg: any?): any
 	local normTol = Severance.stepNormal
 	local G = math.max(Severance.stepPlane, Severance.stepNormal)
 
+	-- DISTINCT cells, not the union of the node cell lists: with overlap on, a
+	-- shared cell appears in each node that covers it and would be hashed and
+	-- tested once per copy.
 	local all = {}
-	for _, n in ipairs(nodes) do
-		for _, cell in ipairs(n.cells) do all[#all + 1] = cell end
-	end
+	for cell in pairs(nodesOf) do all[#all + 1] = cell end
+	stats.cells = #all
 
 	local hash: { [string]: { any } } = {}
 	local function bucket(p: Vector3): string
@@ -331,34 +392,52 @@ function Nodes.build(data: any, cfg: any?): any
 
 	local links = {}
 	local seen: { [number]: any } = {}
+	-- Two nodes covering the same cell are trivially reachable from each other,
+	-- and no cell-to-cell test will ever say so because it is one cell. Link
+	-- them here or an overlapping pair looks disconnected.
+	local links = {}
+	local seen: { [number]: any } = {}
+	local function join(ia: number, ib: number, rise: number)
+		if ia == ib then return end
+		if ia > ib then ia, ib = ib, ia end
+		local kk = ia * 1000000 + ib
+		local L = seen[kk]
+		if not L then
+			L = { a = ia, b = ib, pairs = 0, rise = 0 }
+			seen[kk] = L
+			links[#links + 1] = L
+		end
+		L.pairs += 1
+		if rise > L.rise then L.rise = rise end
+	end
+	for _, t in pairs(nodesOf) do
+		for i = 1, #t do
+			for j = i + 1, #t do join(t[i], t[j], 0) end
+		end
+	end
+
 	for _, a in ipairs(all) do
-		local ia = nodeOf[a]
+		local ta = nodesOf[a]
 		local p = a.pos
 		local up = a.normal or Vector3.yAxis
 		local bx, by, bz = math.floor(p.X / G), math.floor(p.Y / G), math.floor(p.Z / G)
 		for ox = -1, 1 do
 			for oy = -1, 1 do
 				for oz = -1, 1 do
-					local t = hash[("%d,%d,%d"):format(bx + ox, by + oy, bz + oz)]
-					if t then
-						for _, b in ipairs(t) do
-							local ib = nodeOf[b]
-							if ib > ia then
+					local bucketCells = hash[("%d,%d,%d"):format(bx + ox, by + oy, bz + oz)]
+					if bucketCells then
+						for _, b in ipairs(bucketCells) do
+							if b ~= a then
 								local dv = b.pos - p
 								local dn = dv:Dot(up)
 								local flat = dv - up * dn
 								if flat:Dot(flat) <= plane2 and math.abs(dn) <= normTol then
-									local kk = ia * 1000000 + ib
-									local L = seen[kk]
-									if not L then
-										L = { a = ia, b = ib, pairs = 0,
-											rise = 0 }
-										seen[kk] = L
-										links[#links + 1] = L
-									end
-									L.pairs += 1
 									local r = math.abs(dn)
-									if r > L.rise then L.rise = r end
+									for _, ia in ipairs(ta) do
+										for _, ib in ipairs(nodesOf[b]) do
+											join(ia, ib, r)
+										end
+									end
 								end
 							end
 						end
@@ -381,7 +460,7 @@ function Nodes.build(data: any, cfg: any?): any
 		if deg[i] == 0 then stats.orphans += 1 end
 	end
 
-	return { nodes = nodes, links = links, stats = stats, nodeOf = nodeOf }
+	return { nodes = nodes, links = links, stats = stats, nodesOf = nodesOf }
 end
 
 function Nodes.report(res: any): string
@@ -390,8 +469,10 @@ function Nodes.report(res: any): string
 		("nodes     %d nodes over %d groups, %d cells, %d links")
 			:format(s.nodes, s.groups, s.cells, s.links),
 		("  mean %.1f cells per node, biggest %d, %d single-cell, %d slivers")
-			:format(s.nodes > 0 and (s.cells / s.nodes) or 0, s.biggest,
+			:format(s.nodes > 0 and (s.covered / s.nodes) or 0, s.biggest,
 				s.single, s.slivers),
+		("  overlap %.2fx -- %d cell slots over %d distinct cells")
+			:format(s.cells > 0 and (s.covered / s.cells) or 0, s.covered, s.cells),
 	}
 	if s.orphans > 0 then
 		lines[#lines + 1] = ("  ! %d nodes with no link at all"):format(s.orphans)
