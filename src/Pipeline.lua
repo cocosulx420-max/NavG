@@ -25,6 +25,7 @@ local Thickness = require(script.Parent:WaitForChild("Thickness"))
 local Erode = require(script.Parent:WaitForChild("Erode"))
 local Triangulate = require(script.Parent:WaitForChild("Triangulate"))
 local Nodes = require(script.Parent:WaitForChild("Nodes"))
+local NodeGraph = require(script.Parent:WaitForChild("NodeGraph"))
 
 -- TUNING LIVES IN THE MODULES, NOT HERE. A number in OVERRIDES is a deliberate
 -- departure from a module's own default, and the module comment next to that
@@ -547,6 +548,88 @@ function Pipeline.draw(result: any, opts: any?): Instance
 	return root
 end
 
+-- Faces to a node graph. Cached on the result.
+function Pipeline.nodeGraph(result: any, cfg: any?): any
+	if not result.graph then
+		result.graph = NodeGraph.build(result.data, Pipeline.triangulate(result), cfg)
+	end
+	return result.graph
+end
+
+-- Draw the node graph over the faces it came from.
+--
+-- COLOUR IS POSTURE, not region: white stands, blue crouches, amber crawls, and
+-- a magenta ball has no link at all. That is the one distinction a person has to
+-- read from the camera, because a link an agent can only crawl through looks
+-- exactly like a corridor otherwise. Links bridged through a culled face are
+-- green and sit in their own folder, and culled faces are outlined dark red so
+-- what became wire is visible.
+function Pipeline.drawNodeGraph(result: any, opts: any?): (Instance, string)
+	local o = opts or {}
+	local lift = o.lift or 0.6
+	local res = Pipeline.nodeGraph(result, o.cfg)
+	local tri = Pipeline.triangulate(result)
+
+	local old = workspace:FindFirstChild(Pipeline.debugName)
+	if old then old:Destroy() end
+	local root = Instance.new("Folder")
+	root.Name = Pipeline.debugName
+	root.Parent = workspace
+	local ff = Instance.new("Folder"); ff.Name = "faces"; ff.Parent = root
+	local nf = Instance.new("Folder"); nf.Name = "nodes"; nf.Parent = root
+	local lf = Instance.new("Folder"); lf.Name = "links"; lf.Parent = root
+	local bf = Instance.new("Folder"); bf.Name = "links_bridged"; bf.Parent = root
+
+	local kept = {}
+	for _, n in ipairs(res.nodes) do
+		for _, fi in ipairs(n.faces) do kept[fi] = true end
+	end
+	for i, t in ipairs(tri.tris) do
+		local alive = kept[i] == true
+		local col = alive and Color3.fromHSV((t.region * 0.618034) % 1, 0.5, 0.85)
+			or Color3.fromRGB(120, 60, 60)
+		local off = t.up * 0.15
+		local v = t.verts
+		local g = Instance.new("Folder")
+		g.Name = ("f%04d_%dgon_r%03d_%.1fsq%s")
+			:format(i, #v, t.region, t.area, alive and "" or "_CULLED")
+		g.Parent = ff
+		for k = 1, #v do
+			segment(v[k] + off, v[(k % #v) + 1] + off,
+				alive and 0.08 or 0.05, col, "e" .. k, g)
+		end
+	end
+
+	local TINT = {
+		Color3.fromRGB(255, 120, 40), Color3.fromRGB(120, 210, 255),
+		Color3.fromRGB(255, 255, 255),
+	}
+	local at = {}
+	for _, n in ipairs(res.nodes) do
+		local p = n.centre + n.up * lift
+		at[n.id] = p
+		local b = Instance.new("Part")
+		b.Anchored = true; b.CanCollide = false; b.CanQuery = false; b.CanTouch = false
+		b.Shape = Enum.PartType.Ball
+		b.Size = Vector3.new(0.9, 0.9, 0.9)
+		b.Color = (n.degree == 0) and Color3.fromRGB(255, 0, 200) or TINT[n.fit]
+		b.Material = Enum.Material.Neon
+		b.CFrame = CFrame.new(p)
+		b.Name = ("n%03d_r%03d_%s_deg%d_%.1fsq")
+			:format(n.id, n.region, n.posture, n.degree, n.area)
+		b.Parent = nf
+	end
+	for i, L in ipairs(res.links) do
+		local col = L.bridged and Color3.fromRGB(80, 255, 160) or TINT[L.fit]
+		segment(at[L.a], at[L.b], L.fit == 3 and 0.13 or 0.2, col,
+			("l%03d_%d_%d_%s_x%d%s"):format(i, L.a, L.b, L.posture, L.openings,
+				L.bridged and "_BRIDGED" or ""),
+			L.bridged and bf or lf)
+	end
+
+	return root, NodeGraph.report(res)
+end
+
 -- Cells to rectangle nodes. Cached, like the triangulation, so a draw and a
 -- report describe the same graph.
 function Pipeline.nodes(result: any, cfg: any?): any
@@ -953,6 +1036,9 @@ function Pipeline.report(result: any): string
 	lines[#lines + 1] = Rings.report(s.rings)
 	if result.tri then
 		lines[#lines + 1] = Triangulate.report(result.tri, result.loops)
+	end
+	if result.graph then
+		lines[#lines + 1] = NodeGraph.report(result.graph)
 	end
 	return table.concat(lines, "\n")
 end
