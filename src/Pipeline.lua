@@ -222,15 +222,56 @@ end
 
 -- Every traced loop, simplified to corners. One loop in, one entry out; a loop
 -- the closing pass could not shut keeps `closed = false` and stays a path.
+-- Enclosed area of a ring, signed, in the plane of `up`.
+--
+-- Boundary winds every loop with the floor on the LEFT, so the sign says which
+-- kind of ring this is before anything has classified it: positive is an outer
+-- rim and negative is a hole. Rings computes the same thing later and in more
+-- detail, but it runs AFTER simplification, and simplification is exactly where
+-- the difference has to be known.
+local function ringArea(pts: { Vector3 }, up: Vector3): number
+	if #pts < 3 then return 0 end
+	local e1, e2 = Rings.basis(up)
+	local o = pts[1]
+	local a = 0
+	for i = 2, #pts - 1 do
+		local p, q = pts[i] - o, pts[i + 1] - o
+		a += (p:Dot(e1) * q:Dot(e2)) - (q:Dot(e1) * p:Dot(e2))
+	end
+	return a * 0.5
+end
+
+-- A HOLE IS NOT SIMPLIFIED AS HARD AS A RIM. Cocosulx's call, after watching a
+-- pillar disappear: at 195 corners case3 lost three of its five holes outright,
+-- and a hole that collapses is not a cosmetic loss, it is a pillar turning into
+-- walkable floor. A rim that simplifies badly costs a sliver of ground; a hole
+-- that simplifies badly puts an NPC inside a column. Holes therefore ignore the
+-- run's overrides and use the tight baseline.
+Pipeline.holeTight = true
+
+-- A ring must keep this much of the area it enclosed before simplification, or
+-- the simplification is thrown away and redone tight.
+--
+-- This is the other half of the same failure. Aggressive settings collapsed six
+-- of case3's rings to degenerate and three whole regions went untriangulated
+-- for want of an outer rim -- small steps, mostly. Losing 30% of a ring's area
+-- is not a simplification, it is a deletion, and it gets refused.
+Pipeline.keepArea = 0.7
+
 function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 	local c = resolve(cfg)
 	local o = {}
 	for _, k in ipairs(SIMPLIFY_KEYS) do o[k] = c[k] end
+	-- the same options WITHOUT this run's overrides, for holes and for any ring
+	-- that the run's settings would have destroyed
+	local tight = {}
+	for _, k in ipairs(SIMPLIFY_KEYS) do tight[k] = Pipeline.OVERRIDES[k] end
 	local debugRoot = workspace:FindFirstChild(Pipeline.debugName)
 	local step = data.config.step
 
 	local out = {}
 	local stats = { loops = 0, open = 0, raw = 0, corners = 0,
+		holesHeld = 0, rescued = 0, collapsed = 0,
 		closedBy = { merge = 0, intersect = 0, straight = 0, ["already closed"] = 0 } }
 
 	-- Region order follows Boundary's table, which LocalGrid numbers largest
@@ -243,15 +284,42 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 		local entry = data.boundary[r]
 		for li, L in ipairs(entry.loops) do
 			local poly, up = polyline(entry, L, step)
-			local opts = table.clone(o)
-			opts.closed = L.closed
-			opts.up = up
-			opts.validate = Pipeline.validator(up, debugRoot)
+			local rawArea = ringArea(poly, up)
+			local isHole = L.closed and rawArea < 0
 
-			local pts, idx = PathSimplify.simplify(poly, opts)
-			pts, idx = PathSimplify.merge(pts, idx, poly, opts)
-			pts, idx = PathSimplify.dejog(pts, idx, poly, opts)
-			pts = PathSimplify.collapseBevels(pts, opts)
+			local function run(base: any): { Vector3 }
+				local opts = table.clone(base)
+				opts.closed = L.closed
+				opts.up = up
+				opts.validate = Pipeline.validator(up, debugRoot)
+				local p, i = PathSimplify.simplify(poly, opts)
+				p, i = PathSimplify.merge(p, i, poly, opts)
+				p, i = PathSimplify.dejog(p, i, poly, opts)
+				return PathSimplify.collapseBevels(p, opts), opts
+			end
+
+			local opts
+			local pts
+			pts, opts = run((isHole and Pipeline.holeTight) and tight or o)
+			if isHole and Pipeline.holeTight then stats.holesHeld += 1 end
+
+			-- Refuse a simplification that deleted the ring rather than
+			-- simplifying it, and try again with the tight settings. Checked on
+			-- CLOSED rings only: an open path encloses nothing, so it has no
+			-- area to lose and the test would fire on every one of them.
+			if L.closed and math.abs(rawArea) > 1e-6 then
+				local kept = math.abs(ringArea(pts, up)) / math.abs(rawArea)
+				if #pts < 3 or kept < Pipeline.keepArea then
+					local retry, ropts = run(tight)
+					local rkept = math.abs(ringArea(retry, up)) / math.abs(rawArea)
+					if #retry >= 3 and rkept > kept then
+						pts, opts = retry, ropts
+						stats.rescued += 1
+					else
+						stats.collapsed += 1
+					end
+				end
+			end
 
 			local closed, method = L.closed, nil
 			if not closed then
@@ -877,6 +945,10 @@ function Pipeline.report(result: any): string
 	if b.erode then lines[#lines + 1] = Erode.report(b.erode) end
 	lines[#lines + 1] = ("trace     %d loops, %d closed, %d broken, %d seam stitches"):format(b.loops, b.closed, b.broken, b.stitched)
 	lines[#lines + 1] = ("simplify  %d raw nodes -> %d corners, %.1fs"):format(s.raw, s.corners, result.stats.simplifySeconds)
+	if s.rescued > 0 or s.collapsed > 0 or s.holesHeld > 0 then
+		lines[#lines + 1] = ("  %d holes held tight, %d rings rescued, %d still collapsed")
+			:format(s.holesHeld, s.rescued, s.collapsed)
+	end
 	lines[#lines + 1] = ("closing   %s, %d still open"):format(#by > 0 and table.concat(by, ", ") or "nothing to close", s.open)
 	lines[#lines + 1] = Rings.report(s.rings)
 	if result.tri then
