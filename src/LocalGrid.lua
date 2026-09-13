@@ -148,6 +148,26 @@ LocalGrid.FIT_NAME = FIT_NAME
 -- Parts between yields in fromFloor when a caller opts into progress.
 LocalGrid.partBudget = 25
 
+-- Lattice positions between yields INSIDE buildGrid, same opt-in.
+--
+-- partBudget alone is not enough on a dense map. A part is not a unit of work:
+-- case6's cost per cell runs 40x case5's because the kill test probes whatever
+-- geometry is packed around it, so one large face in a crowded street can hold
+-- a minute of work with no yield point in it. buildGrid is 78% of fromFloor and
+-- was the only stage still able to wedge Studio by itself.
+--
+-- SAFE TO PAUSE HERE, despite the warning on partBudget, because the grid is
+-- local to buildGrid until it is returned: fromFloor appends it to `grids` only
+-- after the call, and `data` does not exist yet, so nothing can observe a
+-- half-built lattice.
+--
+-- IDENTICAL OUTPUT IS THE WHOLE REQUIREMENT. A chunk is a contiguous run of
+-- lattice positions in the EXISTING scan order, so cells append in exactly the
+-- order they did before and every cell's own answer depends only on its own
+-- position -- no neighbour is read here. Yielding cannot reorder or change
+-- anything; it only decides where the pauses fall.
+LocalGrid.cellBudget = 4000
+
 local function fitOf(clearance: number, c: any): number
 	if clearance >= c.standHeight then return 3 end
 	if clearance >= c.crouchHeight then return 2 end
@@ -455,8 +475,19 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 	local castH = 2 + dev
 	local castLen = castH + dev + 0.5
 
+	-- See LocalGrid.cellBudget. Counts positions VISITED, not cells kept: the
+	-- expensive part of a rejected position is the raycast it already paid for,
+	-- so counting survivors would leave a face that rejects everything with no
+	-- yield at all.
+	local onProgress = c.onProgress
+	local visited = 0
+
 	for iu = 0, nu - 1 do
 		for iv = 0, nv - 1 do
+			if onProgress then
+				visited += 1
+				if visited % LocalGrid.cellBudget == 0 then onProgress(visited, nil) end
+			end
 			local p = corner + u * ((iu + 0.5) * step) + v * ((iv + 0.5) * step)
 			local res = workspace:Raycast(p + n * castH, -n * castLen, rpPart)
 			if not res then continue end
