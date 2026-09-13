@@ -145,6 +145,9 @@ end
 local FIT_NAME = { "prone", "crouch", "stand" }
 LocalGrid.FIT_NAME = FIT_NAME
 
+-- Parts between yields in fromFloor when a caller opts into progress.
+LocalGrid.partBudget = 25
+
 local function fitOf(clearance: number, c: any): number
 	if clearance >= c.standHeight then return 3 end
 	if clearance >= c.crouchHeight then return 2 end
@@ -1231,7 +1234,19 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?, tr
 		if a.key.Z ~= b.key.Z then return a.key.Z < b.key.Z end
 		return a.key.Y < b.key.Y
 	end)
-	for _, entry in ipairs(ordered) do
+	-- THE SAME OPT-IN YIELD THE VOXELIZATION AND THE FLOOR EXTRACT CARRY, at the
+	-- one point that is safe to pause: between parts, before any face of the next
+	-- one is built. Yielding inside buildGrid would suspend a half-built lattice;
+	-- here every grid in `grids` is complete and the counters agree with it.
+	--
+	-- Off unless asked for, so ordinary bakes are untouched -- and the order above
+	-- is the seed of the whole bake, so nothing here may reorder anything.
+	local onProgress = c.onProgress
+
+	for idx, entry in ipairs(ordered) do
+		if onProgress and idx % LocalGrid.partBudget == 0 then
+			onProgress(idx, #ordered)
+		end
 		local part, sfs = entry.part, entry.sfs
 		nParts += 1
 		local faces = splitFaces(sfs, cosFace)

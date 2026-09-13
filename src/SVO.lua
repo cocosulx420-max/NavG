@@ -273,7 +273,31 @@ end
 -- Voxelize a part against its real collision geometry using GetPartsInPart.
 -- Descends the octree only where the part's geometry actually overlaps a node,
 -- so concave shapes (arches, holes) are represented correctly.
-function SVO:insertPartPrecise(part: BasePart, worldRoot: WorldRoot?)
+-- Probes between yields when a caller opts into progress. Small enough that one
+-- chunk is a frame's worth of work, large enough that the yield is not the cost.
+SVO.probeBudget = 2000
+
+-- WHY THIS ONE CALL CAN WEDGE STUDIO, and what was done about it.
+--
+-- The descent has to reach leaf size everywhere the geometry is, interior
+-- included, so the cost scales with the part's VOLUME. There is no escape from
+-- that: SVOLocal settled the same question and wrote it down -- containment
+-- inside a non-box shape cannot be proven by a boolean overlap query, so it
+-- never claims "full" either -- and the point-probe substitute is ruled out by
+-- GetPartsInPart's measured ~46% miss rate on solids probed at their own centre.
+--
+-- So the work is real and only the SHAPE of it can change. case6 has non-block
+-- parts of 146,000 cubic studs and this call, having no yield in it, blocked
+-- Studio's main thread for 45 minutes with nothing to show; case3's largest is
+-- nowhere near, which is why it never showed up before.
+--
+-- `onYield` makes the work divisible: the unit is a probe budget rather than a
+-- spatial slice, which needs no geometry to divide and gives smooth progress.
+-- Recursion is untouched -- Luau yields across depth without trouble, so the
+-- post-order tryCollapse and empty-child pruning below still run exactly as they
+-- did. Absent `onYield` the call is synchronous and behaves as it always has,
+-- which is what keeps every existing caller safe in a non-yieldable context.
+function SVO:insertPartPrecise(part: BasePart, worldRoot: WorldRoot?, onYield: (() -> ())?)
 	local root = worldRoot or workspace
 	local probe = Instance.new("Part")
 	probe.Anchored = true
@@ -286,7 +310,27 @@ function SVO:insertPartPrecise(part: BasePart, worldRoot: WorldRoot?)
 	op.FilterType = Enum.RaycastFilterType.Include
 	op.FilterDescendantsInstances = { part }
 	op.RespectCanCollide = false
+	-- the probe only ever asks WHETHER anything overlaps, and the filter is one
+	-- part, so the rest of the result table is built and thrown away
+	op.MaxParts = 1
+
+	-- CHEAP REJECT BEFORE THE EXPENSIVE ONE, the same guard SVOLocal puts in
+	-- front of its shape probes. Sound rather than heuristic: a part's Size box
+	-- bounds its collision geometry, so no OBB overlap means no geometry and the
+	-- probe could only have returned false. The tree is identical; the number of
+	-- world queries is not. Without it the descent starts at the world root and
+	-- probes all eight children at every level, so each part paid roughly eight
+	-- queries a level for ten levels before reaching itself -- on case6 that is
+	-- some 400,000 queries across the map that can only ever answer false.
+	local obb = SVO.obbFromPart(part)
+
+	local n = 0
 	local function overlaps(nc: Vector3, nh: number): boolean
+		if not obbHitsCube(obb, nc, nh) then return false end
+		if onYield then
+			n += 1
+			if n >= SVO.probeBudget then n = 0; onYield() end
+		end
 		probe.Size = Vector3.new(nh * 2, nh * 2, nh * 2)
 		probe.CFrame = CFrame.new(nc)
 		return #root:GetPartsInPart(probe, op) > 0
@@ -300,8 +344,14 @@ end
 -- Build an SVO from a list of parts. margin pads the world bounds.
 -- Block parts use fast OBB rasterization; non-block parts (unions/meshes/etc)
 -- are voxelized against their real collision geometry.
-function SVO.fromParts(parts: {BasePart}, leaf: number, margin: number)
+-- `opts.onProgress(done, total)` is called as each part finishes AND at every
+-- probe-budget yield inside a part, and may yield. Supplying it makes this
+-- function yield, so call it from a coroutine; omit it and the build is
+-- synchronous exactly as before. See insertPartPrecise for why a big map needs
+-- this to be divisible at all.
+function SVO.fromParts(parts: {BasePart}, leaf: number, margin: number, opts: any?)
 	assert(#parts > 0, "SVO.fromParts: no parts")
+	local onProgress = opts and opts.onProgress
 	local lo = Vector3.new(math.huge, math.huge, math.huge)
 	local hi = -lo
 	for _, part in ipairs(parts) do
@@ -318,12 +368,14 @@ function SVO.fromParts(parts: {BasePart}, leaf: number, margin: number)
 	local depth = math.max(0, math.ceil(math.log(maxE/leaf) / math.log(2))) -- luau: log base via division
 	local rootEdge = leaf * (2 ^ depth)
 	local tree = SVO.new(center, rootEdge * 0.5, leaf)
-	for _, part in ipairs(parts) do
+	local onYield = onProgress and function() onProgress(nil, #parts) end
+	for i, part in ipairs(parts) do
 		if SVO.isBlockPart(part) then
-			tree:insertPart(part)          -- fast OBB path
+			tree:insertPart(part)                          -- fast OBB path
 		else
-			tree:insertPartPrecise(part)   -- real-geometry path
+			tree:insertPartPrecise(part, nil, onYield)     -- real-geometry path
 		end
+		if onProgress then onProgress(i, #parts) end
 	end
 	return tree
 end

@@ -32,6 +32,7 @@ export type Config = {
 	leaf: number?, maxSlope: number?, agentHeight: number?,
 	clearCap: number?, maxGroundFootprint: number?, minClearance: number?,
 	root: Instance?, -- restrict the bake to this subtree (default: whole workspace)
+	onProgress: ((number?, number) -> ())?, -- opt-in; makes the voxelization yield
 }
 
 local DEFAULT = {
@@ -44,6 +45,10 @@ local DEFAULT = {
 }
 
 local UP = Vector3.new(0, 1, 0)
+
+-- Columns between yields in Floor.extract when a caller opts into progress.
+-- At the measured ~264us a column this is roughly a frame's worth of work.
+Floor.columnBudget = 250
 
 local function merged(cfg)
 	local c = {}
@@ -110,11 +115,26 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 	local surfels: {Surfel} = {}
 	local index: { [string]: {Surfel} } = {}
 
+	-- SAME OPT-IN YIELD AS THE VOXELIZATION, for the same reason and measured the
+	-- same way: this walks one column per stud over every solid leaf's top face
+	-- and spends four world queries on each, about 264 microseconds. case3's
+	-- thousands of columns are nothing; case6 has 1,017,217 of them, which is 269
+	-- seconds in a single call that cannot be interrupted or watched.
+	--
+	-- Absent `onProgress` nothing changes -- no yield, no counter cost worth
+	-- naming, and the surfels come out in the same order either way.
+	local onProgress = c.onProgress
+	local cols = 0
+
 	tree:forEachSolidLeaf(function(ctr: Vector3, h: number)
 		local edge = 2 * h
 		local top = ctr.Y + h
 		for i = 0, edge - 1 do
 			for j = 0, edge - 1 do
+				if onProgress then
+					cols += 1
+					if cols % Floor.columnBudget == 0 then onProgress(cols, nil) end
+				end
 				local cx = ctr.X - h + 0.5 + i
 				local cz = ctr.Z - h + 0.5 + j
 				if tree:isSolid(Vector3.new(cx, top + 0.5, cz)) then continue end
@@ -176,7 +196,10 @@ end
 function Floor.build(cfg: Config?)
 	local c = merged(cfg)
 	local parts = Floor.gatherParts(c)
-	local tree = SVO.fromParts(parts, c.leaf, 2)
+	-- onProgress is opt-in and makes the voxelization yield; a bake that does not
+	-- set it is synchronous as before. See SVO.insertPartPrecise.
+	local tree = SVO.fromParts(parts, c.leaf, 2,
+		c.onProgress and { onProgress = c.onProgress } or nil)
 	local data = Floor.extract(parts, tree, c)
 	return data, tree, parts
 end
