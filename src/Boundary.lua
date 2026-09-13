@@ -417,6 +417,77 @@ function Boundary.weld(faces: {any}, step: number)
 	return ids, { nodes = #pos - stitched, stitched = stitched }
 end
 
+-- A THIRD TIER, for ends the merge in `weld` could not reach.
+--
+-- `weld` already stitches unbalanced nodes of opposite imbalance, but only
+-- within SEAM_STEPS * step -- 0.8 studs at shipped settings -- and it does it by
+-- MERGING, which drags the boundary onto whichever node survived. case6 leaves
+-- 214 nodes unbalanced past that radius (one measured pair sits 1.58 studs
+-- apart, twice the tolerance), and each one is a node the walk can enter and not
+-- leave: 107 loops never close, and a region whose outer rim is one of them is
+-- refused by CDT outright. r001 is 110,451 cells of street lost that way.
+--
+-- BRIDGING, NOT MERGING, and the distinction is the point. The imbalance is
+-- always symmetric -- every affected region has exactly as many sources as sinks
+-- -- so pairing each sink with a source and adding the edge between them makes
+-- every node balanced, and a directed graph with in == out everywhere decomposes
+-- into cycles. Nothing is moved: the gap gets the boundary segment it was always
+-- missing, which is honest about the floor ending there.
+--
+-- Greedy nearest, capped. Past the cap the gap is not a seam artefact and
+-- closing it would invent boundary, so the loop is left open and reported --
+-- the same call `PathSimplify.closeMaxGap` makes one stage later.
+Boundary.bridgeMax = 4.0   -- studs between the two ends; refuse beyond this
+
+function Boundary.bridge(faces: {any}, ids: {any}, step: number)
+	local indeg, outdeg = {}, {}
+	local posOf, upOf, cellOf = {}, {}, {}
+	local seen = {}
+	for i, e in ipairs(ids) do
+		local f = faces[i]
+		outdeg[e.a] = (outdeg[e.a] or 0) + 1
+		indeg[e.b] = (indeg[e.b] or 0) + 1
+		if not seen[e.a] then seen[e.a] = true; posOf[e.a] = f.a; upOf[e.a] = f.up; cellOf[e.a] = f.cell end
+		if not seen[e.b] then seen[e.b] = true; posOf[e.b] = f.b; upOf[e.b] = f.up; cellOf[e.b] = f.cell end
+	end
+
+	-- SORTED, not `pairs`. Node ids are integers and Luau does not promise an
+	-- order for them; the bake's regions are already seeded off a deterministic
+	-- walk and an arbitrary pairing here would undo that.
+	local nodes = {}
+	for id in pairs(seen) do nodes[#nodes + 1] = id end
+	table.sort(nodes)
+
+	local sinks, sources = {}, {}
+	for _, id in ipairs(nodes) do
+		local d = (indeg[id] or 0) - (outdeg[id] or 0)
+		for _ = 1, d do sinks[#sinks + 1] = id end        -- an in with no out
+		for _ = 1, -d do sources[#sources + 1] = id end   -- an out with no in
+	end
+
+	local used, added = {}, 0
+	for _, sk in ipairs(sinks) do
+		local best, bd = nil, Boundary.bridgeMax
+		for k, sc in ipairs(sources) do
+			if not used[k] then
+				local dd = (posOf[sc] - posOf[sk]).Magnitude
+				if dd < bd then bd = dd; best = k end
+			end
+		end
+		if best then
+			used[best] = true
+			local sc = sources[best]
+			faces[#faces + 1] = {
+				a = posOf[sk], b = posOf[sc], up = upOf[sk],
+				cell = cellOf[sk], kind = "none", dir = 0, bridged = true,
+			}
+			ids[#ids + 1] = { a = sk, b = sc }
+			added += 1
+		end
+	end
+	return added, #sinks
+end
+
 -- Chain one region's faces into closed loops.
 --
 -- Most nodes join exactly two faces and the walk is forced. Where more meet, the
@@ -1149,11 +1220,13 @@ function Boundary.trace(data: any, cfg: any?)
 	local byRegion, fstats = Boundary.faces(data)
 	local out = {}
 	local stats = { regions = 0, loops = 0, closed = 0, broken = 0, stitched = 0, nodes = 0,
+		bridged = 0, looseEnds = 0,
 		faces = fstats.faces, borderCells = fstats.cells,
 		wall = fstats.wall, drop = fstats.drop, edge = fstats.edge,
 		unlabelled = fstats.none, adjacency = fstats.pairs_, asymmetric = fstats.asymmetric }
 	for r, faces in pairs(byRegion) do
 		local ids, wstats = Boundary.weld(faces, step)
+		local bridged, loose = Boundary.bridge(faces, ids, step)
 		local loops, broken = Boundary.chain(faces, ids, cw)
 		out[r] = { faces = faces, ids = ids, loops = loops }
 		stats.regions += 1
@@ -1162,6 +1235,8 @@ function Boundary.trace(data: any, cfg: any?)
 		stats.closed += (#loops - broken)
 		stats.stitched += wstats.stitched
 		stats.nodes += wstats.nodes
+		stats.bridged += bridged
+		stats.looseEnds += loose
 	end
 	data.boundary = out
 	data.stats.boundaryFaces = stats.faces
