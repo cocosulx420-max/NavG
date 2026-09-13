@@ -919,6 +919,11 @@ local WALL_PROBE_STEPS = { 1, 2 }
 -- masonry.
 local STEP_UP = 1.5
 
+-- Exported so FaceKind splits step from drop on the SAME number this gate
+-- uses. Two copies of it would drift, and the difference between them is the
+-- difference between a two-way link and a one-way fall.
+LocalGrid.STEP_UP = STEP_UP
+
 -- THE BOX THE WALL TEST ACTUALLY OCCUPIES, once the octree says something might
 -- be there. Reaching from the floor's own edge outward, ankle to head.
 --

@@ -25,6 +25,8 @@ local Thickness = require(script.Parent:WaitForChild("Thickness"))
 local Erode = require(script.Parent:WaitForChild("Erode"))
 local Triangulate = require(script.Parent:WaitForChild("Triangulate"))
 local CDT = require(script.Parent:WaitForChild("CDT"))
+local SVOLocal = require(script.Parent:WaitForChild("SVOLocal"))
+local FaceKind = require(script.Parent:WaitForChild("FaceKind"))
 local Nodes = require(script.Parent:WaitForChild("Nodes"))
 
 -- TUNING LIVES IN THE MODULES, NOT HERE. A number in OVERRIDES is a deliberate
@@ -160,6 +162,11 @@ end
 
 -- Cells, regions and boundary loops. Returns LocalGrid's data table with
 -- `boundary` filled in.
+-- Re-decide wall / drop / seam from SVOLocal after the trace. Off returns the
+-- old `classifyNodes` verdict untouched, which is what the two are compared
+-- against.
+Pipeline.faceKind = true
+
 function Pipeline.bake(cfg: any?): (any, any)
 	local c = resolve(cfg)
 	assert(c.root, "Pipeline: cfg.root is required -- name the model to bake")
@@ -181,6 +188,26 @@ function Pipeline.bake(cfg: any?): (any, any)
 	end
 	local _, bstats = Boundary.trace(data, c)
 	if estats then bstats.erode = estats end
+
+	-- WHY THE FLOOR STOPS, decided per raw face against a tree per PART rather
+	-- than against the merged global octree. See FaceKind for the measurements
+	-- that forced this; the short version is that `drop` used to be the `else`
+	-- of `wall`, so every failed probe read as open ground.
+	--
+	-- Runs here, after the trace, because it labels FACES and the faces only
+	-- exist once Boundary has emitted them. `classifyNodes` is deliberately left
+	-- alone -- edgeMask, stepMask, cell.wall and the erosion all still read the
+	-- masks it writes, and seams are the one verdict it already got right.
+	if Pipeline.faceKind then
+		local t0 = os.clock()
+		local trees, ttotals = SVOLocal.fromParts(data.parts, FaceKind.leaf, 0.01)
+		data.localTrees = trees
+		local kstats = FaceKind.build(data, trees)
+		kstats.buildSeconds = os.clock() - t0
+		kstats.trees = ttotals.parts
+		kstats.treeNodes = ttotals.nodes
+		bstats.kind = kstats
+	end
 	return data, bstats
 end
 
@@ -719,6 +746,81 @@ function Pipeline.drawEdgeKinds(result: any, opts: any?): (Instance, string)
 	return root, table.concat(parts, ", ")
 end
 
+-- Every RAW boundary face, coloured by its own verdict.
+--
+-- THIS IS WHERE THE VERDICT ACTUALLY LIVES, and it is not the line the mesh is
+-- drawn on. `drawEdgeKinds` colours the SIMPLIFIED edges, which is a derived
+-- curve sitting up to half a stud off these faces and carrying at best one
+-- label per edge -- so a run merged across a doorjamb comes back "mixed" and
+-- says nothing a portal builder can act on. A face has exactly one kind,
+-- because a face is one cell edge. There is no mixed here and there cannot be.
+--
+-- Drawn at cell resolution, so this is the staircase the simplifier smooths,
+-- not the outline. Expect roughly seven times as many segments as the outline
+-- has edges, and expect them to zigzag: that is the input, faithfully.
+function Pipeline.drawRawFaces(result: any, opts: any?): (Instance, string)
+	local o = opts or {}
+	local lift = o.lift or 0.3
+	local COLOUR = {
+		wall = Color3.fromRGB(255, 60, 60),
+		step = Color3.fromRGB(255, 170, 40),
+		drop = Color3.fromRGB(60, 255, 120),
+		ledge = Color3.fromRGB(170, 60, 220),
+		edge = Color3.fromRGB(60, 200, 255),
+		none = Color3.fromRGB(120, 120, 120),
+	}
+
+	local old = workspace:FindFirstChild(Pipeline.debugName)
+	if old then old:Destroy() end
+	local root = Instance.new("Folder")
+	root.Name = Pipeline.debugName
+	root.Parent = workspace
+	local byKind, tally = {}, {}
+
+	-- Walked through the LOOPS rather than through entry.faces, so only the
+	-- faces a traced ring actually uses are drawn. A face the trace never
+	-- reached is a defect worth seeing separately, not worth hiding in here.
+	local regions = {}
+	for r in pairs(result.data.boundary) do regions[#regions + 1] = r end
+	table.sort(regions)
+
+	for _, r in ipairs(regions) do
+		local entry = result.data.boundary[r]
+		for li, L in ipairs(entry.loops) do
+			for _, fi in ipairs(L.faces) do
+				local f = entry.faces[fi]
+				if f and (f.b - f.a).Magnitude > 1e-9 then
+					local k = f.kind or "none"
+					local folder = byKind[k]
+					if not folder then
+						folder = Instance.new("Folder")
+						folder.Name = k
+						folder.Parent = root
+						byKind[k] = folder
+						tally[k] = 0
+					end
+					tally[k] += 1
+					local off = f.up * lift
+					-- wall faces drawn thinner: what is being looked for is the
+					-- openings, and on a closed map the walls are most of the
+					-- drawing
+					segment(f.a + off, f.b + off,
+						(k == "wall") and 0.08 or 0.16, COLOUR[k] or COLOUR.none,
+						("r%03d_l%d_f%d"):format(r, li, fi), folder)
+				end
+			end
+		end
+	end
+
+	local parts, total = {}, 0
+	for k, v in pairs(tally) do
+		parts[#parts + 1] = ("%s %d"):format(k, v)
+		total += v
+	end
+	table.sort(parts)
+	return root, ("raw faces %d: %s"):format(total, table.concat(parts, ", "))
+end
+
 -- Cells to rectangle nodes. Cached, like the triangulation, so a draw and a
 -- report describe the same graph.
 function Pipeline.nodes(result: any, cfg: any?): any
@@ -1140,6 +1242,9 @@ function Pipeline.report(result: any): string
 	if s.edges and s.edges > 0 then
 		lines[#lines + 1] = ("edges     %d: %d wall, %d open, %d mixed, %d invented")
 			:format(s.edges, s.wallEdges, s.openEdges, s.mixedEdges, s.inventedEdges)
+	end
+	if result.stats.boundary and result.stats.boundary.kind then
+		lines[#lines + 1] = FaceKind.report(result.stats.boundary.kind)
 	end
 	lines[#lines + 1] = Rings.report(s.rings)
 	if result.tri then

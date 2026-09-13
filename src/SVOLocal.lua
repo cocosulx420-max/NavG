@@ -281,4 +281,90 @@ function SVOLocal.fromParts(parts: {BasePart}, leaf: number, contactPad: number?
 	return trees, totals
 end
 
+-- ---- queries ----------------------------------------------------------------
+
+-- SAT between an axis-aligned cube (centre `c`, half `h`) and an oriented box,
+-- both expressed in THIS part's local frame. 15 axes: the cube's three, the
+-- box's three, and the nine cross products.
+local AX = { Vector3.xAxis, Vector3.yAxis, Vector3.zAxis }
+local function cubeHitsOBB(c: Vector3, h: number, ocf: CFrame, osize: Vector3): boolean
+	local b1, b2, b3 = ocf.RightVector, ocf.UpVector, ocf.LookVector
+	local e1, e2, e3 = osize.X * 0.5, osize.Y * 0.5, osize.Z * 0.5
+	local t = ocf.Position - c
+	-- the cube's own axes
+	if math.abs(t.X) > h + math.abs(e1*b1.X) + math.abs(e2*b2.X) + math.abs(e3*b3.X) then return false end
+	if math.abs(t.Y) > h + math.abs(e1*b1.Y) + math.abs(e2*b2.Y) + math.abs(e3*b3.Y) then return false end
+	if math.abs(t.Z) > h + math.abs(e1*b1.Z) + math.abs(e2*b2.Z) + math.abs(e3*b3.Z) then return false end
+	-- the box's axes, then the cross products
+	local B = { b1, b2, b3 }
+	local E = { e1, e2, e3 }
+	for i = 1, 3 do
+		local L = B[i]
+		local r = h * (math.abs(L.X) + math.abs(L.Y) + math.abs(L.Z))
+		if math.abs(t:Dot(L)) > r + E[i] then return false end
+	end
+	for i = 1, 3 do
+		for j = 1, 3 do
+			local L = AX[i]:Cross(B[j])
+			local m = L.Magnitude
+			if m > 1e-6 then
+				L = L / m
+				local r = h * (math.abs(L.X) + math.abs(L.Y) + math.abs(L.Z))
+				local rb = math.abs(E[1]*B[1]:Dot(L)) + math.abs(E[2]*B[2]:Dot(L)) + math.abs(E[3]*B[3]:Dot(L))
+				if math.abs(t:Dot(L)) > r + rb then return false end
+			end
+		end
+	end
+	return true
+end
+
+-- Does any solid node of this part meet the world box?
+--
+-- The box is transformed into the PART'S frame once and the descent then tests
+-- an oriented box against axis-aligned cubes. That is the whole point of a tree
+-- per part: a rotated wall is voxelized tightly in its own frame, so a query
+-- against it is tight too, where a world-aligned tree would have smeared the
+-- same wall across cells at whatever angle it sits.
+function SVOLocal:overlapsBox(cf: CFrame, size: Vector3): boolean
+	local lcf = self.cf:ToObjectSpace(cf)
+	local function rec(node, lc: Vector3, h: number): boolean
+		if not cubeHitsOBB(lc, h, lcf, size) then return false end
+		if node.solid then return true end
+		local ch = node.children
+		if not ch then return false end
+		local q = h * 0.5
+		for i = 0, 7 do
+			local c = ch[i]
+			if c and rec(c, lc + OFF[i] * q, q) then return true end
+		end
+		return false
+	end
+	return rec(self.root, self.center, self.half)
+end
+
+-- Distance from a world point to the nearest solid node of this part, or nil
+-- when nothing is within `maxDist`. Branches further away than the best so far
+-- are pruned, so this costs a walk down one side of the tree and not the tree.
+function SVOLocal:nearestSolid(p: Vector3, maxDist: number): number?
+	local lp = self.cf:PointToObjectSpace(p)
+	local best = maxDist
+	local function rec(node, lc: Vector3, h: number)
+		local dx = math.max(0, math.abs(lp.X - lc.X) - h)
+		local dy = math.max(0, math.abs(lp.Y - lc.Y) - h)
+		local dz = math.max(0, math.abs(lp.Z - lc.Z) - h)
+		local d = math.sqrt(dx*dx + dy*dy + dz*dz)
+		if d >= best then return end
+		if node.solid then best = d; return end
+		local ch = node.children
+		if not ch then return end
+		local q = h * 0.5
+		for i = 0, 7 do
+			local c = ch[i]
+			if c then rec(c, lc + OFF[i] * q, q) end
+		end
+	end
+	rec(self.root, self.center, self.half)
+	return (best < maxDist) and best or nil
+end
+
 return SVOLocal
