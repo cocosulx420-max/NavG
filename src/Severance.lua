@@ -124,6 +124,23 @@ function Severance.snapshot(data: any, keep: ((any) -> boolean)?): any
 	local normTol = Severance.stepNormal
 	local tested = 0
 
+	-- EVERY CROSS-REGION PAIR THE GATE ACCEPTS, KEPT.
+	--
+	-- This loop already decides, for every pair of cells in the map, whether you
+	-- could have walked straight from one to the other -- and then dropped the
+	-- answer on the floor, keeping only whether the two ended up in the same
+	-- component. The pairs ARE the walk and step connectivity: the gate's own
+	-- 1.5 along the normal was chosen to clear case3's 1.38 stud treads, so a
+	-- staircase comes out as pairs between consecutive treads.
+	--
+	-- Only the cross-region ones are worth keeping. A pair inside one region is
+	-- the region being connected to itself, which the polygons already say.
+	--
+	-- `drop` is the along-normal separation, signed from `a` to `b`, so the step
+	-- height is free. It is NOT an absolute value: which way is up matters to
+	-- anything deciding whether a link is one-way.
+	local pairs_ = {}
+
 	for i = 1, n do
 		local a = cells[i]
 		local p = a.pos
@@ -144,6 +161,10 @@ function Severance.snapshot(data: any, keep: ((any) -> boolean)?): any
 								local flat = dv - up * dn
 								if flat:Dot(flat) <= plane2 and math.abs(dn) <= normTol then
 									tested += 1
+									local b2 = cells[j]
+									if a.region ~= b2.region then
+										pairs_[#pairs_ + 1] = { a = a, b = b2, drop = dn }
+									end
 									union(i, j)
 								end
 							end
@@ -179,6 +200,7 @@ function Severance.snapshot(data: any, keep: ((any) -> boolean)?): any
 	return {
 		cells = cells, comp = comp, of = of, sizes = sizes,
 		pieces = #sizes, cellCount = n, links = tested,
+		pairs = pairs_,
 	}
 end
 

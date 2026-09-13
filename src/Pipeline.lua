@@ -27,6 +27,7 @@ local Triangulate = require(script.Parent:WaitForChild("Triangulate"))
 local CDT = require(script.Parent:WaitForChild("CDT"))
 local SVOLocal = require(script.Parent:WaitForChild("SVOLocal"))
 local FaceKind = require(script.Parent:WaitForChild("FaceKind"))
+local EdgeKind = require(script.Parent:WaitForChild("EdgeKind"))
 local Nodes = require(script.Parent:WaitForChild("Nodes"))
 
 -- TUNING LIVES IN THE MODULES, NOT HERE. A number in OVERRIDES is a deliberate
@@ -162,10 +163,17 @@ end
 
 -- Cells, regions and boundary loops. Returns LocalGrid's data table with
 -- `boundary` filled in.
--- Re-decide wall / drop / seam from SVOLocal after the trace. Off returns the
--- old `classifyNodes` verdict untouched, which is what the two are compared
--- against.
-Pipeline.faceKind = true
+-- Re-decide wall / drop / seam from SVOLocal after the trace, per RAW FACE.
+--
+-- OFF: superseded by EdgeKind, which asks the same question of the polygon
+-- edges directly and so needs no provenance chain to get the answer back to
+-- them. Kept wired because it is the independent second opinion the EdgeKind
+-- verdicts are cross-checked against, and because it is the only thing that
+-- labels the raw faces for `drawRawFaces`.
+Pipeline.faceKind = false
+
+-- Label and split the polygon boundary edges as part of building the mesh.
+Pipeline.edgeKind = true
 
 function Pipeline.bake(cfg: any?): (any, any)
 	local c = resolve(cfg)
@@ -925,6 +933,20 @@ end
 function Pipeline.mesh(result: any): any
 	if not result.mesh then
 		result.mesh = CDT.build(result.loops, result.data)
+		-- Labelled in the same breath as it is built. A mesh whose edges have
+		-- not been asked about is one a portal builder would read as all-wall,
+		-- and the failure would look like a map with no doors rather than an
+		-- error.
+		if Pipeline.edgeKind then
+			local trees = result.data.localTrees
+			if not trees then
+				trees = SVOLocal.fromParts(result.data.parts, EdgeKind.leaf, 0.01)
+				result.data.localTrees = trees
+			end
+			local t0 = os.clock()
+			result.meshKind = EdgeKind.build(result.mesh, result.data, trees)
+			result.meshKind.seconds = os.clock() - t0
+		end
 	end
 	return result.mesh
 end
@@ -985,6 +1007,68 @@ function Pipeline.drawTriangles(result: any, opts: any?): (Instance, string)
 	end
 
 	return root, (o.cdt and CDT.report or Triangulate.report)(tri, result.loops)
+end
+
+-- The convex mesh with every boundary stretch coloured by what is on the other
+-- side of it. One folder per kind, so any one of them can be isolated.
+--
+-- This is the whole point of baking the verdict onto the edges: the mesh a
+-- pathfinder walks and the reason it may not leave are the same drawing.
+-- `drawRawFaces` shows the same information at cell resolution on a curve that
+-- does not line up with the polygons.
+function Pipeline.drawMeshKind(result: any, opts: any?): (Instance, string)
+	local o = opts or {}
+	local lift = o.lift or 0.35
+	local mesh = Pipeline.mesh(result)
+	local COLOUR = {
+		internal = Color3.fromRGB(70, 70, 80),
+		wall = Color3.fromRGB(255, 60, 60),
+		step = Color3.fromRGB(255, 170, 40),
+		drop = Color3.fromRGB(60, 255, 120),
+		ledge = Color3.fromRGB(170, 60, 220),
+		none = Color3.fromRGB(130, 130, 130),
+	}
+
+	local old = workspace:FindFirstChild(Pipeline.debugName)
+	if old then old:Destroy() end
+	local root = Instance.new("Folder")
+	root.Name = Pipeline.debugName
+	root.Parent = workspace
+	local byKind, tally, len = {}, {}, {}
+
+	for fi, f in ipairs(mesh.tris) do
+		local off = f.up * lift
+		for j = 1, f.n do
+			local k = (f.edgeKind and f.edgeKind[j]) or "none"
+			local folder = byKind[k]
+			if not folder then
+				folder = Instance.new("Folder")
+				folder.Name = k
+				folder.Parent = root
+				byKind[k] = folder
+				tally[k], len[k] = 0, 0
+			end
+			local A = f.verts[j] + off
+			local B = f.verts[j % f.n + 1] + off
+			tally[k] += 1
+			len[k] += (B - A).Magnitude
+			-- internal edges drawn thin: they are floor, and what is being
+			-- looked at is where the floor stops
+			local fall = f.edgeFall and f.edgeFall[j]
+			segment(A, B, (k == "internal") and 0.06 or 0.16, COLOUR[k] or COLOUR.none,
+				(fall and fall ~= math.huge)
+					and ("r%03d_f%03d_e%d_%.2f"):format(f.region, fi, j, fall)
+					or ("r%03d_f%03d_e%d"):format(f.region, fi, j),
+				folder)
+		end
+	end
+
+	local parts = {}
+	for k, v in pairs(tally) do
+		parts[#parts + 1] = ("%s %d (%.0f studs)"):format(k, v, len[k])
+	end
+	table.sort(parts)
+	return root, ("mesh edges: "):format() .. table.concat(parts, ", ")
 end
 
 -- Draw two traced boundaries against each other, in two folders and nothing
@@ -1252,6 +1336,9 @@ function Pipeline.report(result: any): string
 	end
 	if result.mesh then
 		lines[#lines + 1] = CDT.report(result.mesh, result.loops)
+	end
+	if result.meshKind then
+		lines[#lines + 1] = EdgeKind.report(result.meshKind)
 	end
 	return table.concat(lines, "\n")
 end
