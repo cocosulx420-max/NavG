@@ -572,7 +572,11 @@ function PathSimplify.collapseBevels(pts: {Vector3}, opts: any?)
 	-- refusedFloor counts whatever `validate` rejected, whatever it tests
 	local bevels = PathSimplify.findBevels(pts, o)
 	stats.found = #bevels
-	if #bevels == 0 then return pts, stats end
+	if #bevels == 0 then
+		local same = table.create(n)
+		for i = 1, n do same[i] = i end
+		return pts, stats, same
+	end
 
 	local replace = {}   -- v -> corner point, w -> false (drop)
 	for _, bv in ipairs(bevels) do
@@ -610,13 +614,24 @@ function PathSimplify.collapseBevels(pts: {Vector3}, opts: any?)
 		end
 	end
 
-	local out, m = {}, 0
+	-- `map[j] = i` -- which INPUT vertex output j came from. This is the only
+	-- pass that does not already hand back an index array, and without it the
+	-- chain from a raw boundary face to a finished corner breaks here.
+	--
+	-- A COLLAPSED BEVEL REPORTS ITS FIRST VERTEX. The new corner stands in for
+	-- both v and w, so an edge leaving it has to cover every raw face that lay
+	-- under either of them; reporting v makes the covered span run from v's raw
+	-- index to the next survivor's, which is exactly that set. Reporting w would
+	-- drop the faces between them on the floor.
+	--
+	-- Returned THIRD so every existing caller is untouched.
+	local out, map, m = {}, {}, 0
 	for i = 1, n do
 		local r = replace[i]
-		if r == nil then m += 1; out[m] = pts[i]
-		elseif r then m += 1; out[m] = r end
+		if r == nil then m += 1; out[m] = pts[i]; map[m] = i
+		elseif r then m += 1; out[m] = r; map[m] = i end
 	end
-	return out, stats
+	return out, stats, map
 end
 
 -- CLOSE AN OPEN PATH.

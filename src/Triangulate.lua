@@ -719,4 +719,14 @@ function Triangulate.report(res: any, loops: { any }?): string
 	return table.concat(lines, "\n")
 end
 
+-- Exported for CDT.lua, which reuses the two pieces of this module that are
+-- about SHAPE rather than about ear clipping: the convex splice test that
+-- drives Hertel-Mehlhorn, and the near-collinear corner removal. Its own driver
+-- differs -- a priority queue rather than a sweep, because the sweep rebuilds a
+-- global edge map per merge -- but the acceptance test must not be written
+-- twice, or the two decompositions can disagree about what convex means.
+Triangulate.spliceFaces = spliceFaces
+Triangulate.straighten = straighten
+Triangulate.mergeConvex = mergeConvex
+
 return Triangulate

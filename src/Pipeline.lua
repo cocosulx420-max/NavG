@@ -24,6 +24,7 @@ local Severance = require(script.Parent:WaitForChild("Severance"))
 local Thickness = require(script.Parent:WaitForChild("Thickness"))
 local Erode = require(script.Parent:WaitForChild("Erode"))
 local Triangulate = require(script.Parent:WaitForChild("Triangulate"))
+local CDT = require(script.Parent:WaitForChild("CDT"))
 local Nodes = require(script.Parent:WaitForChild("Nodes"))
 
 -- TUNING LIVES IN THE MODULES, NOT HERE. A number in OVERRIDES is a deliberate
@@ -199,9 +200,15 @@ end
 -- Duplicates are dropped. At a convex corner one cell contributes two faces
 -- whose midpoints both inset onto that cell's centre, so the same position would
 -- otherwise appear twice and give the simplifier a zero-length segment.
-local function polyline(entry: any, loop: any, step: number): ({Vector3}, Vector3)
+-- `faceOf` comes back alongside the points: which face each raw node was made
+-- from. Two of the steps above lose that correspondence -- a zero length face is
+-- skipped and a convex corner's two faces collapse onto one point -- so it
+-- cannot be recovered afterwards by counting, and it is what carries a face's
+-- wall/drop/edge verdict forward to the finished polygon.
+local function polyline(entry: any, loop: any, step: number): ({Vector3}, Vector3, {number})
 	local F = loop.faces
 	local pts = table.create(#F)
+	local faceOf = table.create(#F)
 	local up = Vector3.yAxis
 	local inset = step * 0.5
 	for i, fi in ipairs(F) do
@@ -211,13 +218,88 @@ local function polyline(entry: any, loop: any, step: number): ({Vector3}, Vector
 		if d.Magnitude > 1e-9 then
 			local p = (f.a + f.b) * 0.5 + f.up:Cross(d.Unit) * inset
 			local prev = pts[#pts]
-			if not prev or (prev - p).Magnitude > 1e-3 then pts[#pts + 1] = p end
+			if not prev or (prev - p).Magnitude > 1e-3 then
+				pts[#pts + 1] = p
+				faceOf[#pts] = fi
+			end
 		end
 	end
 	if #pts > 1 and loop.closed and (pts[1] - pts[#pts]).Magnitude < 1e-3 then
+		faceOf[#pts] = nil
 		pts[#pts] = nil
 	end
-	return pts, up
+	return pts, up, faceOf
+end
+
+-- WHAT EACH SIMPLIFIED EDGE IS MADE OF.
+--
+-- Boundary.faces already decides the only thing a portal builder needs to know
+-- -- whether the floor stops here because of a WALL or because it simply runs
+-- out -- and every pass after it threw that away, so a finished outline said
+-- "floor ends here" and nothing more. A wall and a stair nose looked identical.
+--
+-- BY PROVENANCE, NEVER BY PROXIMITY. Every corner knows the raw node it came
+-- from, so the span of raw nodes an edge covers is known exactly and the faces
+-- under that span are the faces the edge is made of. Matching an edge to nearby
+-- faces by distance instead needs a tolerance, and any tolerance wide enough to
+-- survive the 0.671 stud simplification deviation is also wide enough to pick up
+-- the wall on the FAR side of a doorway, which is the one answer that must never
+-- be wrong.
+--
+-- The span is half open, [a, b): the raw node at b belongs to the next edge.
+local function edgeKinds(entry: any, poly: {Vector3}, faceOf: {number},
+	rawIdx: {number}, pts: {Vector3}, closed: boolean): ({string}, {number})
+	local nRaw = #poly
+	local n = #pts
+	local last = closed and n or math.max(n - 1, 0)
+	local kinds, wallFrac = {}, {}
+	for i = 1, last do
+		local a = rawIdx[i]
+		local b = rawIdx[(i % n) + 1]
+		-- A corner the closing pass invented has no raw node behind it, so the
+		-- edges either side of it are this pipeline's own work and get said so
+		-- rather than guessed at.
+		if a == nil or b == nil or nRaw == 0 then
+			kinds[i] = "invented"
+			wallFrac[i] = 0
+		else
+			local tally, count, wall = {}, 0, 0
+			local j = a
+			for _ = 1, nRaw do
+				if j == b then break end
+				local fi = faceOf[j]
+				local f = fi and entry.faces[fi]
+				if f then
+					count += 1
+					tally[f.kind] = (tally[f.kind] or 0) + 1
+					if f.kind == "wall" then wall += 1 end
+				end
+				j = (j % nRaw) + 1
+			end
+			if count == 0 then
+				kinds[i] = "invented"
+				wallFrac[i] = 0
+			else
+				wallFrac[i] = wall / count
+				if wall == count then
+					kinds[i] = "wall"
+				elseif wall > 0 then
+					-- MIXED IS NOT ROUNDED TO THE MAJORITY. An edge merged across a
+					-- doorjamb is part wall and part opening, and calling it whichever
+					-- won on count either invents a doorway through a wall or seals a
+					-- real one. Whoever cuts portals out of these has to see the split.
+					kinds[i] = "mixed"
+				else
+					local best, bn = "none", -1
+					for k, v in pairs(tally) do
+						if v > bn or (v == bn and k < best) then best, bn = k, v end
+					end
+					kinds[i] = best
+				end
+			end
+		end
+	end
+	return kinds, wallFrac
 end
 
 -- Every traced loop, simplified to corners. One loop in, one entry out; a loop
@@ -272,6 +354,7 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 	local out = {}
 	local stats = { loops = 0, open = 0, raw = 0, corners = 0,
 		holesHeld = 0, rescued = 0, collapsed = 0,
+		edges = 0, wallEdges = 0, openEdges = 0, mixedEdges = 0, inventedEdges = 0,
 		closedBy = { merge = 0, intersect = 0, straight = 0, ["already closed"] = 0 } }
 
 	-- Region order follows Boundary's table, which LocalGrid numbers largest
@@ -283,11 +366,15 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 	for _, r in ipairs(regions) do
 		local entry = data.boundary[r]
 		for li, L in ipairs(entry.loops) do
-			local poly, up = polyline(entry, L, step)
+			local poly, up, faceOf = polyline(entry, L, step)
 			local rawArea = ringArea(poly, up)
 			local isHole = L.closed and rawArea < 0
 
-			local function run(base: any): { Vector3 }
+			-- `ri` is the third return: the raw node each finished corner came
+			-- from. Threaded rather than recovered, because collapseBevels can
+			-- replace two corners with one and no amount of counting afterwards
+			-- says which raw nodes that new corner speaks for.
+			local function run(base: any)
 				local opts = table.clone(base)
 				opts.closed = L.closed
 				opts.up = up
@@ -295,12 +382,15 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 				local p, i = PathSimplify.simplify(poly, opts)
 				p, i = PathSimplify.merge(p, i, poly, opts)
 				p, i = PathSimplify.dejog(p, i, poly, opts)
-				return PathSimplify.collapseBevels(p, opts), opts
+				local q, _, map = PathSimplify.collapseBevels(p, opts)
+				local ri = table.create(#q)
+				for j = 1, #q do ri[j] = i[map[j]] end
+				return q, opts, ri
 			end
 
 			local opts
-			local pts
-			pts, opts = run((isHole and Pipeline.holeTight) and tight or o)
+			local pts, rawIdx
+			pts, opts, rawIdx = run((isHole and Pipeline.holeTight) and tight or o)
 			if isHole and Pipeline.holeTight then stats.holesHeld += 1 end
 
 			-- Refuse a simplification that deleted the ring rather than
@@ -310,10 +400,10 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 			if L.closed and math.abs(rawArea) > 1e-6 then
 				local kept = math.abs(ringArea(pts, up)) / math.abs(rawArea)
 				if #pts < 3 or kept < Pipeline.keepArea then
-					local retry, ropts = run(tight)
+					local retry, ropts, rri = run(tight)
 					local rkept = math.abs(ringArea(retry, up)) / math.abs(rawArea)
 					if #retry >= 3 and rkept > kept then
-						pts, opts = retry, ropts
+						pts, opts, rawIdx = retry, ropts, rri
 						stats.rescued += 1
 					else
 						stats.collapsed += 1
@@ -323,15 +413,40 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 
 			local closed, method = L.closed, nil
 			if not closed then
+				local before = pts
 				local ok, cs
 				pts, ok, cs = PathSimplify.close(pts, opts)
 				closed = ok
 				method = ok and cs.method or nil
 				if ok then stats.closedBy[cs.method] = (stats.closedBy[cs.method] or 0) + 1 end
+				-- Realign provenance across the closing pass. `close` moves or adds
+				-- corners rather than deleting them, so a corner it left alone is
+				-- bit identical to the one it came from; anything else has no raw
+				-- node behind it and is left nil, which edgeKinds reports as
+				-- invented. Matching by position is safe HERE and nowhere else --
+				-- these are the same floats, not nearby ones.
+				if pts ~= before then
+					local at = {}
+					for j, p in ipairs(before) do at[tostring(p)] = rawIdx[j] end
+					local moved = table.create(#pts)
+					for j, p in ipairs(pts) do moved[j] = at[tostring(p)] end
+					rawIdx = moved
+				end
+			end
+
+			local kinds, wallFrac = edgeKinds(entry, poly, faceOf, rawIdx, pts, closed)
+			for _, k in pairs(kinds) do
+				stats.edges += 1
+				if k == "wall" then stats.wallEdges += 1
+				elseif k == "mixed" then stats.mixedEdges += 1
+				elseif k == "invented" then stats.inventedEdges += 1
+				else stats.openEdges += 1 end
 			end
 
 			out[#out + 1] = { region = r, index = li, up = up,
-				poly = poly, pts = pts, closed = closed, closedBy = method }
+				poly = poly, pts = pts, closed = closed, closedBy = method,
+				faceOf = faceOf, rawIdx = rawIdx,
+				edgeKind = kinds, edgeWall = wallFrac }
 			stats.loops += 1
 			stats.raw += #poly
 			stats.corners += #pts
@@ -547,6 +662,63 @@ function Pipeline.draw(result: any, opts: any?): Instance
 	return root
 end
 
+-- Draw the boundary coloured by WHAT EACH EDGE IS MADE OF, not by which loop it
+-- belongs to. This is the drawing that says where a portal could go: red is a
+-- wall and nothing can cross it, green is floor simply running out, yellow is an
+-- edge the simplifier merged across a doorjamb so it is part of each.
+--
+-- The one thing to look for is green where there is plainly a wall, or red
+-- across an opening. Either means the provenance chain is misaligned, and no
+-- amount of portal logic downstream will survive it.
+function Pipeline.drawEdgeKinds(result: any, opts: any?): (Instance, string)
+	local o = opts or {}
+	local lift = o.lift or 0.3
+	local COLOUR = {
+		wall = Color3.fromRGB(255, 60, 60),
+		drop = Color3.fromRGB(60, 255, 120),
+		edge = Color3.fromRGB(60, 200, 255),
+		none = Color3.fromRGB(200, 200, 200),
+		mixed = Color3.fromRGB(255, 210, 40),
+		invented = Color3.fromRGB(255, 0, 255),
+	}
+
+	local old = workspace:FindFirstChild(Pipeline.debugName)
+	if old then old:Destroy() end
+	local root = Instance.new("Folder")
+	root.Name = Pipeline.debugName
+	root.Parent = workspace
+	local byKind = {}
+	local tally = {}
+
+	for _, L in ipairs(result.loops) do
+		local pts, up = L.pts, L.up
+		local n = #pts
+		local off = up * lift
+		for i = 1, (L.closed and n or n - 1) do
+			local k = (L.edgeKind and L.edgeKind[i]) or "none"
+			local f = byKind[k]
+			if not f then
+				f = Instance.new("Folder")
+				f.Name = k
+				f.Parent = root
+				byKind[k] = f
+				tally[k] = 0
+			end
+			tally[k] += 1
+			-- wall edges drawn thinner: what is being looked for is the
+			-- openings, and on a closed map the walls are most of the drawing
+			segment(pts[i] + off, pts[(i % n) + 1] + off,
+				(k == "wall") and 0.10 or 0.18, COLOUR[k] or COLOUR.none,
+				("r%03d_l%d_e%d"):format(L.region, L.index, i), f)
+		end
+	end
+
+	local parts = {}
+	for k, v in pairs(tally) do parts[#parts + 1] = ("%s %d"):format(k, v) end
+	table.sort(parts)
+	return root, table.concat(parts, ", ")
+end
+
 -- Cells to rectangle nodes. Cached, like the triangulation, so a draw and a
 -- report describe the same graph.
 function Pipeline.nodes(result: any, cfg: any?): any
@@ -642,6 +814,19 @@ function Pipeline.triangulate(result: any): any
 	return result.tri
 end
 
+-- Rings to a convex polygon mesh: constrained Delaunay, Ruppert refinement,
+-- then Hertel-Mehlhorn. This is the navmesh; `Pipeline.triangulate` above is the
+-- older boundary-only ear clip, kept so the two can be drawn against each other.
+--
+-- `data` goes in because the Steiner points need the region's FLOOR plane, and
+-- only the cells know where that is.
+function Pipeline.mesh(result: any): any
+	if not result.mesh then
+		result.mesh = CDT.build(result.loops, result.data)
+	end
+	return result.mesh
+end
+
 -- Draw the triangles as wireframe plus a ball at each centroid.
 --
 -- THE CENTROID IS DRAWN BECAUSE IT IS THE SEARCH NODE. Everything downstream
@@ -652,7 +837,9 @@ end
 function Pipeline.drawTriangles(result: any, opts: any?): (Instance, string)
 	local o = opts or {}
 	local lift = o.lift or 0.35
-	local tri = Pipeline.triangulate(result)
+	-- `cdt` draws the refined convex mesh instead of the ear clip. Same drawing
+	-- either way: both emit n-gons with a centroid, and the centroid is the node.
+	local tri = o.cdt and Pipeline.mesh(result) or Pipeline.triangulate(result)
 
 	local old = workspace:FindFirstChild(Pipeline.debugName)
 	if old then old:Destroy() end
@@ -695,7 +882,7 @@ function Pipeline.drawTriangles(result: any, opts: any?): (Instance, string)
 		n.Parent = g
 	end
 
-	return root, Triangulate.report(tri, result.loops)
+	return root, (o.cdt and CDT.report or Triangulate.report)(tri, result.loops)
 end
 
 -- Draw two traced boundaries against each other, in two folders and nothing
@@ -950,9 +1137,16 @@ function Pipeline.report(result: any): string
 			:format(s.holesHeld, s.rescued, s.collapsed)
 	end
 	lines[#lines + 1] = ("closing   %s, %d still open"):format(#by > 0 and table.concat(by, ", ") or "nothing to close", s.open)
+	if s.edges and s.edges > 0 then
+		lines[#lines + 1] = ("edges     %d: %d wall, %d open, %d mixed, %d invented")
+			:format(s.edges, s.wallEdges, s.openEdges, s.mixedEdges, s.inventedEdges)
+	end
 	lines[#lines + 1] = Rings.report(s.rings)
 	if result.tri then
 		lines[#lines + 1] = Triangulate.report(result.tri, result.loops)
+	end
+	if result.mesh then
+		lines[#lines + 1] = CDT.report(result.mesh, result.loops)
 	end
 	return table.concat(lines, "\n")
 end

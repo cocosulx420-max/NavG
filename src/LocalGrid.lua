@@ -958,6 +958,12 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	op.FilterType = Enum.RaycastFilterType.Include
 	op.FilterDescendantsInstances = data.parts or {}
 	op.MaxParts = 1
+	-- The same filter WITHOUT the cap, for the bounds query below. MaxParts = 1
+	-- would hand back whichever candidate the broadphase happened to return
+	-- first, so a mesh standing in front of a wall would hide the wall.
+	local opAll = OverlapParams.new()
+	opAll.FilterType = Enum.RaycastFilterType.Include
+	opAll.FilterDescendantsInstances = data.parts or {}
 	local box = Instance.new("Part")
 	box.Name = "NVGN_WallProbe"
 	box.Size = Vector3.new(c.step * 0.9, PROBE_HEIGHT, PROBE_DEPTH)
@@ -1076,7 +1082,16 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 							end
 							if maybe then break end
 						end
-						if maybe then
+						-- THE EXACT TEST NO LONGER WAITS FOR THE OCTREE. Gating it on
+						-- `maybe` meant a wall the SVO missed was never looked for at
+						-- all: 67 plain blocks sat within 0.9 studs of a face labelled
+						-- dropoff on case3, every one of them a shape we can test
+						-- exactly. GetPartBoundsInBox is a broadphase query and SAT is
+						-- arithmetic, so running it always costs little.
+						--
+						-- `maybe` still gates the MESH fallback, which is the expensive
+						-- and unreliable half.
+						do
 							-- a box from the floor's edge outward, along this
 							-- direction only, so a wall on the OTHER axis of a
 							-- corner cannot register here
@@ -1084,8 +1099,40 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 							local dir = out.Unit
 							local mid = cell.pos + dir * (c.step * 0.5 + PROBE_DEPTH * 0.5)
 								+ Vector3.yAxis * PROBE_RISE
-							box.CFrame = CFrame.lookAt(mid, mid + dir)
-							solid = #workspace:GetPartsInPart(box, op) > 0
+							local probeCF = CFrame.lookAt(mid, mid + dir)
+							local probeSize = box.Size
+							box.CFrame = probeCF
+							-- GETPARTSINPART WAS VETOING REAL WALLS. It was the final
+							-- arbiter here and it misses solids outright -- measured on
+							-- case3 at 31% of probes refused, and every refusal turns a
+							-- wall into a dropoff. Downstream that is a boundary edge
+							-- labelled as open ground with masonry 0.5 studs behind it.
+							--
+							-- Same remedy as the kill test in buildGrid: GetPartBoundsInBox
+							-- sees EVERY solid, and the shapes we can test exactly are then
+							-- tested exactly rather than trusted on their bounding box.
+							-- A mesh is neither, so it still falls through to the physics
+							-- probe -- unreliable, but better than a bounding box, which
+							-- calls the empty middle of an archway solid.
+							local meshSeen = false
+							for _, cand in ipairs(workspace:GetPartBoundsInBox(probeCF, probeSize, opAll)) do
+								if isBlock(cand) then
+									if boxOverlap(probeCF, probeSize, cand.CFrame, cand.Size) then
+										solid = true
+										break
+									end
+								elseif isWedge(cand) then
+									if wedgeOverlap(probeCF, probeSize, cand) then
+										solid = true
+										break
+									end
+								else
+									meshSeen = true
+								end
+							end
+							if not solid and meshSeen and maybe then
+								solid = #workspace:GetPartsInPart(box, op) > 0
+							end
 							if not solid then nRefused += 1 end
 						end
 						if solid ~= above then
