@@ -17,6 +17,9 @@ export type Cell = {
 	wall: boolean?,
 	dropoff: boolean?,
 	fit: number?,             -- 1 prone, 2 crouch, 3 stand (from clearance)
+	fpos: Vector3?,           -- centre of the footprint the kill test judged
+	fu: number?,              -- that footprint's size along the grid's u
+	fv: number?,              -- and along v; both <= step, clipped to the part
 	region: number?,          -- set by LocalGrid.regions; 1 = largest
 	line: number?,            -- set by LocalGrid.contours: the fitted line this
 	                          -- border cell belongs to, unique across the bake
@@ -275,6 +278,136 @@ local function surfaceFrame(part: BasePart, surfels: {any}, step: number)
 	return n, u, v, uExt, vExt, center, dev
 end
 
+-- Exact box-vs-box overlap by separating axis.
+--
+-- Rays sample points and a wall is not a point: a 0.375 stud slab can cut the
+-- side of a 0.5 stud tile without passing through any of its five sample
+-- columns, which is how 194 case3 nodes kept standing inside block walls. Most
+-- walls ARE blocks, so for those the question has an exact answer and there is
+-- no reason to sample it. Anything that is not a block -- mesh, union, wedge --
+-- has no box to test and stays with the ray samples, where a bounds test would
+-- condemn the floor under every archway.
+local function boxOverlap(cfA: CFrame, sA: Vector3, cfB: CFrame, sB: Vector3): boolean
+	local hA, hB = sA * 0.5, sB * 0.5
+	local A = { cfA.RightVector, cfA.UpVector, cfA.LookVector }
+	local B = { cfB.RightVector, cfB.UpVector, cfB.LookVector }
+	local t = cfB.Position - cfA.Position
+	local function separated(ax: Vector3): boolean
+		local rA = math.abs(A[1]:Dot(ax)) * hA.X + math.abs(A[2]:Dot(ax)) * hA.Y + math.abs(A[3]:Dot(ax)) * hA.Z
+		local rB = math.abs(B[1]:Dot(ax)) * hB.X + math.abs(B[2]:Dot(ax)) * hB.Y + math.abs(B[3]:Dot(ax)) * hB.Z
+		-- MINUS the tolerance, so boxes that merely touch count as SEPARATED.
+		-- Abutting is the normal case for floor against wall and for one stair
+		-- plank against the next, and with the tile clipped to its part those
+		-- contacts are exact: with the sign the other way every stair tread in
+		-- case3 died on face-to-face contact alone.
+		return math.abs(t:Dot(ax)) > rA + rB - 1e-4
+	end
+	for _, ax in ipairs(A) do if separated(ax) then return false end end
+	for _, ax in ipairs(B) do if separated(ax) then return false end end
+	for _, a in ipairs(A) do
+		for _, b in ipairs(B) do
+			local x = a:Cross(b)
+			if x.Magnitude > 1e-6 and separated(x.Unit) then return false end
+		end
+	end
+	return true
+end
+
+local function isBlock(p: BasePart): boolean
+	return p:IsA("Part") and (p :: Part).Shape == Enum.PartType.Block
+end
+
+-- How far the part itself reaches from its centre along `dir` -- the support of
+-- its box. Exact for a block, and for anything else the bounding box, which as
+-- a CLIP errs towards a smaller tile and so towards keeping a node.
+local function supportHalf(part: BasePart, dir: Vector3): number
+	local cf, s = part.CFrame, part.Size
+	return 0.5 * (math.abs(dir:Dot(cf.RightVector)) * s.X
+		+ math.abs(dir:Dot(cf.UpVector)) * s.Y
+		+ math.abs(dir:Dot(cf.LookVector)) * s.Z)
+end
+
+-- A WEDGE IS HALF A BOX, and case3 has 48 of them holding up its ramps. Tested
+-- as "not a block" they fell through to the mesh path and nodes stood inside
+-- them; tested as their full box they would condemn the floor under the open
+-- half. Both are avoidable: a wedge is a triangular prism, so it has an exact
+-- answer too.
+--
+-- Which half is solid was measured, not assumed -- a ray along the part's local
+-- X spans the prism, so it hits exactly where the cross-section is solid. The
+-- answer is `y * hz <= z * hy`: the triangle (-hy,-hz), (-hy,+hz), (+hy,+hz),
+-- extruded along X. `cf.LookVector` is local -Z, hence `az`.
+local function wedgePoints(part: BasePart): ({Vector3}, {Vector3})
+	local cf, sz = part.CFrame, part.Size
+	local hx, hy, hz = sz.X * 0.5, sz.Y * 0.5, sz.Z * 0.5
+	local ax, ay, az = cf.RightVector, cf.UpVector, -cf.LookVector
+	local verts = table.create(6)
+	for _, x in ipairs({ -hx, hx }) do
+		verts[#verts + 1] = cf:PointToWorldSpace(Vector3.new(x, -hy, -hz))
+		verts[#verts + 1] = cf:PointToWorldSpace(Vector3.new(x, -hy, hz))
+		verts[#verts + 1] = cf:PointToWorldSpace(Vector3.new(x, hy, hz))
+	end
+	local slopeN = (ay * hz - az * hy)
+	local slopeE = (ay * hy + az * hz)
+	local dirs = { ax, ay, az,
+		slopeN.Magnitude > 1e-6 and slopeN.Unit or ay,
+		slopeE.Magnitude > 1e-6 and slopeE.Unit or az }
+	return verts, dirs
+end
+
+-- Separating axis over two vertex sets. Touching counts as separated, for the
+-- same reason it does in boxOverlap: floor meets wall flush everywhere.
+local function hullsApart(a: {Vector3}, b: {Vector3}, axes: {Vector3}): boolean
+	for _, ax in ipairs(axes) do
+		local aLo, aHi = math.huge, -math.huge
+		for _, p in ipairs(a) do
+			local d = p:Dot(ax)
+			if d < aLo then aLo = d end
+			if d > aHi then aHi = d end
+		end
+		local bLo, bHi = math.huge, -math.huge
+		for _, p in ipairs(b) do
+			local d = p:Dot(ax)
+			if d < bLo then bLo = d end
+			if d > bHi then bHi = d end
+		end
+		if aLo > bHi - 1e-4 or bLo > aHi - 1e-4 then return true end
+	end
+	return false
+end
+
+local function boxPoints(cf: CFrame, size: Vector3): ({Vector3}, {Vector3})
+	local h = size * 0.5
+	local verts = table.create(8)
+	for _, x in ipairs({ -h.X, h.X }) do
+		for _, y in ipairs({ -h.Y, h.Y }) do
+			for _, z in ipairs({ -h.Z, h.Z }) do
+				verts[#verts + 1] = cf:PointToWorldSpace(Vector3.new(x, y, z))
+			end
+		end
+	end
+	return verts, { cf.RightVector, cf.UpVector, cf.LookVector }
+end
+
+local function wedgeOverlap(tileCF: CFrame, tileSize: Vector3, wedge: BasePart): boolean
+	local bv, bd = boxPoints(tileCF, tileSize)
+	local wv, wd = wedgePoints(wedge)
+	local axes = {}
+	for _, d in ipairs(bd) do axes[#axes + 1] = d end
+	for _, d in ipairs(wd) do axes[#axes + 1] = d end
+	for _, p in ipairs(bd) do
+		for _, q in ipairs(wd) do
+			local x = p:Cross(q)
+			if x.Magnitude > 1e-6 then axes[#axes + 1] = x.Unit end
+		end
+	end
+	return not hullsApart(bv, wv, axes)
+end
+
+local function isWedge(p: BasePart): boolean
+	return p:IsA("Part") and (p :: Part).Shape == Enum.PartType.Wedge
+end
+
 local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: RaycastParams, probe: BasePart, op: OverlapParams, rpTerrain: RaycastParams): Grid?
 	local n, u, v, uExt, vExt, surfaceCenter, dev = surfaceFrame(part, surfels, c.step)
 	if not n then return nil end
@@ -296,6 +429,10 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 	local rpPart = RaycastParams.new()
 	rpPart.FilterType = Enum.RaycastFilterType.Include
 	rpPart.FilterDescendantsInstances = { part }
+
+	-- reused by the headroom narrow phase, one candidate at a time
+	local rpOne = RaycastParams.new()
+	rpOne.FilterType = Enum.RaycastFilterType.Include
 
 	local grid: Grid = {
 		part = part, fallback = false, origin = corner,
@@ -329,10 +466,157 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 			-- more than faceAngle off this face belongs to another face, and that
 			-- face has a grid of its own to claim it.
 			if res.Normal:Dot(n) < cosFace then continue end
-			probe.CFrame = CFrame.new(res.Position + UP * (0.1 + (c.minClearance - 0.1) * 0.5))
+			-- HEADROOM. Both of the probes this replaces could miss the solid
+			-- standing ON the cell, and case3 shipped `stand` nodes buried in
+			-- geometry because of it:
+			--
+			--   * a 0.05 needle through GetPartsInPart, which does not reliably
+			--     report a solid it sits inside -- it returned nothing for a
+			--     wooden pillar a 0.6 bounds box finds every time;
+			--   * an up-ray from 0.15 above the surface, which returns nothing
+			--     when that origin is INSIDE the cover. A pillar standing on
+			--     this floor and a slab whose underside IS the cell's plane both
+			--     swallow the origin, so the ray flew on and reported the next
+			--     thing up: 7.35 and 15.40 studs of "headroom" under solid.
+			--
+			-- Broad phase by bounds, because GetPartBoundsInBox is the one query
+			-- that sees every solid. Narrow phase per candidate, because bounds
+			-- alone would condemn the floor under an archway:
+			--
+			--   underside found  -> blocks only if it is inside the band
+			--   none, but the candidate occupies this column from above
+			--                    -> no underside above the cell means the cell is
+			--                       INSIDE it
+			--   neither          -> bounds overlap with nothing over the cell
+			-- THE WHOLE TILE, NOT ITS CENTRE COLUMN. A node is a place to stand,
+			-- so a wall that cuts any part of it deletes it. One centre sample
+			-- left 956 of case3's 9224 nodes standing in geometry -- every cell a
+			-- wall clipped without covering its middle.
+			-- THE BAND STARTS AT THE SURFACE, not at 0.1 above it. The 0.1
+			-- was a toe gap inherited from the needle probe, meant to keep the
+			-- probe off the floor it stands on -- but the grid's own part is
+			-- excluded by name anyway, so all the gap bought was a blind
+			-- sliver. A skirting plate 0.375 thick at the base of a wall,
+			-- 19 studs of it, rose 0.078 studs through the tread and sat
+			-- entirely inside that sliver: the nodes were visibly buried in it
+			-- and every probe reported clear.
+			local bandLo = 0.02
+			local bandH = c.minClearance - bandLo
+			-- CLIP THE TILE TO THE FACE IT SITS ON. The lattice rounds the cell
+			-- count up, so a tile at the rim overhangs the part by up to half a
+			-- step, and judging a node on that overhang judges it on floor it
+			-- does not own. A 1.75 stud stair tread is four rows deep and the
+			-- last row pokes 0.125 studs into the NEXT step: tested unclipped,
+			-- every tread lost its back row and pruneNarrow then took the whole
+			-- tread for being under minWidth. The stairs disappeared.
+			--
+			-- Clip to the PART, not to `uExt`/`vExt`: those are the lattice's
+			-- extents, already padded up to a whole number of steps (a 1.75 stud
+			-- tread reports 2.0), so clipping to them left the same 0.125 studs
+			-- of overhang and the same dead treads.
+			local du = (p - surfaceCenter):Dot(u)
+			local dv = (p - surfaceCenter):Dot(v)
+			local uLim = math.min(uExt, supportHalf(part, u))
+			local vLim = math.min(vExt, supportHalf(part, v))
+			local uLo = math.max(du - step * 0.5, -uLim)
+			local uHi = math.min(du + step * 0.5, uLim)
+			local vLo = math.max(dv - step * 0.5, -vLim)
+			local vHi = math.min(dv + step * 0.5, vLim)
+			local uW = math.max(uHi - uLo, 1e-3)
+			local vW = math.max(vHi - vLo, 1e-3)
+			local tileCtr = res.Position
+				+ u * ((uLo + uHi) * 0.5 - du)
+				+ v * ((vLo + vHi) * 0.5 - dv)
+			local hu, hv = uW * 0.49, vW * 0.49
+			local cols = {
+				tileCtr,
+				tileCtr + u * hu + v * hv,
+				tileCtr + u * hu - v * hv,
+				tileCtr - u * hu + v * hv,
+				tileCtr - u * hu - v * hv,
+			}
+			local tileCF = CFrame.fromMatrix(tileCtr + n * (bandLo + bandH * 0.5), u, n)
+			local tileSize = Vector3.new(uW, bandH, vW)
 			local killer: Instance? = nil
-			for _, hit in ipairs(workspace:GetPartsInPart(probe, op)) do
-				if hit ~= part then killer = hit; break end
+			local probed, volHit = false, nil :: Instance?
+			for _, cand in ipairs(workspace:GetPartBoundsInBox(
+				CFrame.new(tileCtr + UP * (bandLo + bandH * 0.5)),
+				Vector3.new(uW, bandH, vW), op)) do
+				if cand ~= part then
+					if isBlock(cand) then
+						if boxOverlap(tileCF, tileSize, cand.CFrame, cand.Size) then
+							killer = cand
+							break
+						end
+						continue
+					end
+					if isWedge(cand) then
+						if wedgeOverlap(tileCF, tileSize, cand) then
+							killer = cand
+							break
+						end
+						continue
+					end
+					-- A mesh or a union has no box to test, so take the one
+					-- true positive that is cheap: GetPartsInPart misses solids
+					-- (that is what put nodes inside a pillar to begin with) but
+					-- it never invents one, so a hit here is a kill and a miss
+					-- falls through to the samples. Worth the call: it catches
+					-- the flare of a pillar base that all five columns thread.
+					if not probed then
+						probed = true
+						probe.Size = tileSize
+						probe.CFrame = tileCF
+						for _, h in ipairs(workspace:GetPartsInPart(probe, op)) do
+							if h ~= part then volHit = h; break end
+						end
+					end
+					if volHit then killer = volHit; break end
+					rpOne.FilterDescendantsInstances = { cand }
+					-- SWEEP THE TILE HORIZONTALLY. A vertical sample can only
+					-- miss a vertical wall, and a mesh panel 0.1 studs thick
+					-- threads all five columns: 72 case3 nodes stood inside
+					-- mesh walls that way. A ray ACROSS the tile crosses such a
+					-- panel whatever its thickness.
+					--
+					-- Fired from just outside each edge, and a hit counts only
+					-- if it lands strictly INSIDE the tile -- a wall flush with
+					-- the edge is what every floor does where it meets a wall,
+					-- and killing those is erosion, which is off.
+					local swept = false
+					for _, h in ipairs({ bandLo + 0.05, bandH * 0.5, bandH - 0.05 }) do
+						local base = tileCtr + n * h
+						for _, a in ipairs({ { u, uW }, { v, vW } }) do
+							local axis, w = a[1], a[2]
+							for _, sgn in ipairs({ 1, -1 }) do
+								local from = base - axis * sgn * (w * 0.5 + 0.05)
+								local hit = workspace:Raycast(from, axis * sgn * (w + 0.1), rpOne)
+								if hit then
+									local into = hit.Distance - 0.05
+									if into > 1e-3 and into < w - 1e-3 then
+										swept = true
+										break
+									end
+								end
+							end
+							if swept then break end
+						end
+						if swept then break end
+					end
+					if swept then killer = cand; break end
+					for _, p0 in ipairs(cols) do
+						local under = workspace:Raycast(p0 + UP * bandLo, UP * c.clearCap, rpOne)
+						local blocks
+						if under then
+							blocks = under.Distance + bandLo < c.minClearance
+						else
+							blocks = workspace:Raycast(p0 + UP * c.clearCap,
+								-UP * (c.clearCap - 0.05), rpOne) ~= nil
+						end
+						if blocks then killer = cand; break end
+					end
+					if killer then break end
+				end
 			end
 			if killer then
 				kill(iu, iv, res.Position, killer)
@@ -358,6 +642,12 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 			local cell: Cell = {
 				ui = iu, vi = iv, pos = res.Position, normal = res.Normal,
 				slope = slope, clearance = clearance, cover = cover,
+				-- The FOOTPRINT the kill test judged: the tile clipped to the
+				-- part. Kept so the drawing can show what was actually tested.
+				-- Without it the viz draws a full step tile for a rim cell and
+				-- the node appears to stand inside the wall it merely abuts,
+				-- which reads exactly like a bug in the kill test.
+				fpos = tileCtr, fu = uW, fv = vW,
 			}
 			grid.cells[#grid.cells + 1] = cell
 			grid.index[string.format("%d:%d", iu, iv)] = cell
@@ -1657,6 +1947,12 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 	-- cell came from rather than what it connects to.
 	local byLine = o.by == "line"
 	local byRegion = (not byLine) and (o.by ~= "part") and data.stats.regions ~= nil
+	-- EROSION IS NOT DESTRUCTIVE -- it clears `cell.region` and leaves the cell
+	-- in the grid -- so a draw that walks `g.cells` shows the UN-eroded mask
+	-- whatever the bake did, which is a picture of a floor the trace will not
+	-- use. Follow the erosion by default; `showEroded` puts the removed cells
+	-- back in, which is how you see what the radius cost.
+	local showEroded = o.showEroded == true
 	-- Skip the interior entirely rather than building it and deleting it after.
 	-- The interior is roughly nine tenths of the cells, so filtering here rather
 	-- than afterwards is what keeps a border-only draw inside a single call.
@@ -1736,6 +2032,15 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 			-- read the same as they do between unmerged tiles
 			local along = len * step - (1 - w) * step
 			dot.Size = Vector3.new(along, 0.1, w * step)
+			-- A SINGLE CELL IS DRAWN AT ITS TESTED FOOTPRINT, not at a full
+			-- step. A rim cell's tile is clipped to the part it stands on, and
+			-- drawing the unclipped square put nodes visibly inside walls they
+			-- only abut -- indistinguishable, by eye, from the kill test
+			-- failing. Runs keep the step, since a run is interior by
+			-- construction and its ends are the only cells that could differ.
+			if len == 1 and first.fu then
+				dot.Size = Vector3.new(w * first.fu, 0.1, w * first.fv)
+			end
 			if byLine then
 				-- a cell Contour never put on a line is not part of the boundary
 				-- description, so it recedes rather than competing for attention
@@ -1755,6 +2060,7 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 			dot.Material = isBorder(first) and Enum.Material.DiamondPlate
 				or Enum.Material.SmoothPlastic
 			local mid = first.pos:Lerp(last.pos, 0.5)
+			if len == 1 and first.fpos then mid = first.fpos end
 			if oriented then
 				dot.CFrame = CFrame.fromMatrix(mid, g.u, g.n)
 			else
@@ -1777,9 +2083,15 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 			if isBorder(first) then nBorder += len end
 		end
 
+		local function shown(cell: Cell): boolean
+			if borderOnly and not isBorder(cell) then return false end
+			if cell.eroded and not showEroded then return false end
+			return true
+		end
+
 		if not merge then
 			for _, cell in ipairs(g.cells) do
-				if not (borderOnly and not isBorder(cell)) then
+				if shown(cell) then
 					local _, w, v = band(cell)
 					emit(cell, cell, 1, w, v)
 				end
@@ -1792,7 +2104,7 @@ function LocalGrid.visualize(data: any, opts: any?, parent: Instance?)
 		-- and dead cells still show as gaps.
 		local rows: { [number]: {Cell} } = {}
 		for _, cell in ipairs(g.cells) do
-			if not (borderOnly and not isBorder(cell)) then
+			if shown(cell) then
 				local r = rows[cell.vi]
 				if not r then r = {}; rows[cell.vi] = r end
 				r[#r + 1] = cell
