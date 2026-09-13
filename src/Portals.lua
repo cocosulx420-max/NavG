@@ -304,17 +304,33 @@ end
 
 -- The gate a group of cells describes.
 --
--- Direction from the two most distant members rather than an eigen solve: a
--- doorway is a handful of cells, the farthest pair is exact for a run that
--- really is a line, and `residual` says when it was not. `order` comes back
--- sorted along that direction with each member's perpendicular offset, which is
--- what lets a bent group be cut at its corner rather than averaged through it.
-local function fitSegment(mids: { Vector3 }, members: { number }, step: number)
+-- ITS DIRECTION IS NOT SIMPLY THE SPREAD OF THE POINTS. A portal is the opening
+-- you pass THROUGH, so it must lie across the direction of travel -- and travel
+-- is known exactly, because every member of the group is a cell pair that says
+-- which way you would step.
+--
+-- Taking the direction from the two most distant members alone was the first
+-- version and it was wrong in the worst possible way: where a crossing's cells
+-- run lengthwise ALONG the direction of travel -- an untraced strip you step
+-- over, a stair -- the widest spread IS the travel direction, and nine gates on
+-- case3 came out within ten degrees of pointing the way you walk rather than
+-- across it. A gate turned ninety degrees is not a narrow gate, it is a wrong
+-- one. Cocosulx spotted it in the drawing before it was measured.
+--
+-- `order` comes back sorted along the axis with each member's distance off the
+-- line, which is what lets a group that turns a corner be cut at the corner.
+local function fitSegment(mids: { Vector3 }, dirs: { Vector3 }, up: Vector3,
+	members: { number }, step: number)
+
 	local n = #members
-	local c = Vector3.zero
-	for _, i in ipairs(members) do c += mids[i] end
+	local c, travel = Vector3.zero, Vector3.zero
+	for _, i in ipairs(members) do
+		c += mids[i]
+		travel += dirs[i]
+	end
 	c /= n
 
+	-- The cells' own widest spread, which is where the opening actually lies...
 	local far, fd = mids[members[1]], -1
 	for _, i in ipairs(members) do
 		local d = (mids[i] - c).Magnitude
@@ -326,23 +342,53 @@ local function fitSegment(mids: { Vector3 }, members: { number }, step: number)
 		if d > od then other, od = mids[i], d end
 	end
 
-	if od < 1e-6 then
-		-- ONE CELL IS ONE CELL WIDE. Not a fallback: a degenerate portal here is
-		-- the honest width, and widening it would invent floor.
-		return c, c, 0, { members[1] }, { 0 }
+	-- ...used AS IS when it already lies across travel, and replaced when it does
+	-- not. Travel decides WHICH of the two the spread is, and nothing more.
+	--
+	-- Forcing perpendicularity by projecting travel out of the spread was tried
+	-- and is wrong, because it ROTATES the axis off the cells' own line whenever
+	-- travel is the least bit skew. The gable ridge is 49 cells in a dead
+	-- straight line along Z and its travel is (0.985, 0, -0.171); removing that
+	-- -0.171 tilted the bar ten degrees, which over 24 studs is 3.9 studs away
+	-- from the cells it is meant to span, and the splitter below then shredded
+	-- one good gate into dozens chasing the error.
+	--
+	-- The cells' own line is the truth about WHERE the opening is. Travel is only
+	-- needed to catch the case where the spread is not the opening at all: where
+	-- a crossing's cells run lengthwise ALONG travel -- an untraced strip stepped
+	-- over, a stair -- the widest spread IS the travel direction, and using it
+	-- points the gate the way you walk. That was nine gates on case3, and there
+	-- the cells have nothing to say about width, so the plane must answer instead.
+	local ACROSS = 0.707      -- 45 degrees; beyond this the spread is travel, not width
+	local axis, fromCells = nil, true
+	if od > 1e-6 then
+		local sp = (other - far).Unit
+		if travel.Magnitude < 1e-6 or math.abs(sp:Dot(travel.Unit)) < ACROSS then
+			axis = sp
+		end
 	end
+	if not axis and travel.Magnitude > 1e-6 then
+		fromCells = false
+		-- The spread is along travel, or there is no spread: one cell wide. Turn
+		-- travel a quarter turn in the floor plane; the cells cannot help here.
+		local flat = travel - up * travel:Dot(up)
+		if flat.Magnitude > 1e-6 then
+			local a2 = up:Cross(flat.Unit)
+			if a2.Magnitude > 1e-6 then axis = a2.Unit end
+		end
+	end
+	if not axis then return c, c, 0, { members[1] }, { 0 }, true, travel end
 
-	local dir = (other - far).Unit
 	local tmin, tmax, resid = math.huge, -math.huge, 0
-	local ts, perp = {}, {}
+	local ts, off = {}, {}
 	for _, i in ipairs(members) do
-		local v = mids[i] - far
-		local t = v:Dot(dir)
+		local v = mids[i] - c
+		local t = v:Dot(axis)
 		ts[i] = t
-		perp[i] = (v - dir * t).Magnitude
+		off[i] = (v - axis * t).Magnitude
 		if t < tmin then tmin = t end
 		if t > tmax then tmax = t end
-		if perp[i] > resid then resid = perp[i] end
+		if off[i] > resid then resid = off[i] end
 	end
 	local order = table.clone(members)
 	table.sort(order, function(a, b) return ts[a] < ts[b] end)
@@ -350,53 +396,67 @@ local function fitSegment(mids: { Vector3 }, members: { number }, step: number)
 	-- half a step past the outermost member at each end, so the gate spans the
 	-- cells rather than the line through their centres
 	local h = step * 0.5
-	return far + dir * (tmin - h), far + dir * (tmax + h), resid, order, perp
+	return c + axis * (tmin - h), c + axis * (tmax + h), resid, order, off,
+		fromCells, travel
 end
 
 -- How deep a bent group may be cut before it is emitted as it stands.
 Portals.maxSplit = 4
 
--- Emit one gate per group, CUTTING A GROUP THAT IS NOT A LINE instead of forcing
--- a straight segment through it.
+-- Emit one gate per group, CUTTING A GROUP THAT DOES NOT LIE ON ONE LINE rather
+-- than forcing a single segment through it.
 --
 -- A contiguity flood keeps two doorways either side of a pillar apart, but it
--- happily returns a single run that turns a corner -- an untraced strip wrapping
--- the end of a wall, say. Six groups on case3 did, the worst deviating 1.08
--- studs over a span of 2.42, and a straight gate through that does not lie on
--- walkable floor at all. Cutting at the member furthest from the fitted line,
--- recursively, leaves every emitted gate within one step of its own cells.
+-- happily returns one run that turns a corner -- an untraced strip wrapping the
+-- end of a wall, say -- and a straight gate through that does not lie on
+-- walkable floor at all. Cutting at the member furthest from the fitted line
+-- leaves every emitted gate within one step of its own cells.
 --
--- The corner member is kept by BOTH halves, so the two gates meet there rather
--- than leaving a notch between them.
-local function fitAll(mids: { Vector3 }, members: { number }, step: number,
-	out: { any }, depth: number?)
+-- The corner member is kept by BOTH halves, so the two gates meet there instead
+-- of leaving a notch between them.
+local function fitAll(mids: { Vector3 }, dirs: { Vector3 }, up: Vector3,
+	members: { number }, step: number, out: { any }, depth: number?)
 
 	local d = depth or 0
-	local L, R, resid, order, perp = fitSegment(mids, members, step)
-	if resid <= step or #members < 4 or d >= Portals.maxSplit then
-		out[#out + 1] = { left = L, right = R, resid = resid, members = members }
+	local L, R, resid, order, off, fromCells, travel =
+		fitSegment(mids, dirs, up, members, step)
+
+	-- SPLITTING ONLY MAKES SENSE WHERE THE CELLS DREW THE LINE. When the axis
+	-- came from travel instead -- the cells run along the way you walk, so they
+	-- cannot say how wide the opening is -- they necessarily sit OFF the gate,
+	-- and `resid` measures the depth of the crossing rather than an error. Left
+	-- unguarded that fired on two-cell groups, which is nonsense on its face:
+	-- two points always lie on their own line.
+	if resid <= step or not fromCells or #members < 4 or d >= Portals.maxSplit then
+		out[#out + 1] = { left = L, right = R, resid = resid,
+			members = members, fromCells = fromCells, travel = travel }
 		return
 	end
 
-	-- worst member, excluding the two ends: cutting at an end removes one point
+	-- worst member, excluding the two ends: cutting at an end drops one point
 	-- and refits the same line, which never terminates
 	local cut, worst = 2, -1
 	for k = 2, #order - 1 do
-		if perp[order[k]] > worst then cut, worst = k, perp[order[k]] end
+		if off[order[k]] > worst then cut, worst = k, off[order[k]] end
 	end
 
 	local a, b = {}, {}
 	for k = 1, cut do a[#a + 1] = order[k] end
 	for k = cut, #order do b[#b + 1] = order[k] end
-	fitAll(mids, a, step, out, d + 1)
-	fitAll(mids, b, step, out, d + 1)
+	fitAll(mids, dirs, up, a, step, out, d + 1)
+	fitAll(mids, dirs, up, b, step, out, d + 1)
 end
 
 -- One place that records how well a fitted group actually was a line, so seam
 -- and bridge groups are held to the same standard instead of only the kind that
 -- happened to be written first.
 local function noteFit(stats: any, kind: string, lo: number, hi: number,
-	resid: number, n: number, step: number)
+	resid: number, n: number, step: number, fromCells: boolean?)
+	if fromCells == false then
+		-- the cells never claimed to be on this line; see fitAll
+		stats.gatesFromTravel += 1
+		return
+	end
 	if resid > stats.worstResidual then
 		stats.worstResidual = resid
 		stats.worstResidualAt = ("%s f%04d-f%04d, %d cells"):format(kind, lo, hi, n)
@@ -434,9 +494,16 @@ local function seamLinks(snap: any, of: { [any]: number }, step: number,
 		if lo > hi then lo, hi, dn = pb, pa, -dn end
 		local k = lo .. ":" .. hi
 		local e = buckets[k]
-		if not e then e = { lo = lo, hi = hi, mids = {}, drops = {} }; buckets[k] = e end
+		if not e then
+			e = { lo = lo, hi = hi, mids = {}, drops = {}, dirs = {},
+				up = (lo == pa and pr.a or pr.b).normal or Vector3.yAxis }
+			buckets[k] = e
+		end
 		e.mids[#e.mids + 1] = (pr.a.pos + pr.b.pos) * 0.5
 		e.drops[#e.drops + 1] = dn
+		-- which way you step, always from the low-numbered polygon
+		local step_ = pr.b.pos - pr.a.pos
+		e.dirs[#e.dirs + 1] = (lo == pa) and step_ or -step_
 	end
 
 	local keys = {}
@@ -447,7 +514,7 @@ local function seamLinks(snap: any, of: { [any]: number }, step: number,
 		local e = buckets[k]
 		for _, members in ipairs(groupsOf(e.mids, step * Portals.groupReach)) do
 			local gates = {}
-			fitAll(e.mids, members, step, gates)
+			fitAll(e.mids, e.dirs, e.up, members, step, gates)
 			if #gates > 1 then stats.gatesSplit += #gates - 1 end
 			for _, gt in ipairs(gates) do
 				local dsum = 0
@@ -458,10 +525,10 @@ local function seamLinks(snap: any, of: { [any]: number }, step: number,
 					centre = (gt.left + gt.right) * 0.5,
 					span = (gt.right - gt.left).Magnitude,
 					drop = dsum / #gt.members,
-					count = #gt.members, residual = gt.resid,
+					count = #gt.members, residual = gt.resid, travel = gt.travel, fitted = gt.fromCells,
 				}
 				stats.seam += 1
-				noteFit(stats, "seam", e.lo, e.hi, gt.resid, #gt.members, step)
+				noteFit(stats, "seam", e.lo, e.hi, gt.resid, #gt.members, step, gt.fromCells)
 			end
 		end
 	end
@@ -609,12 +676,17 @@ local function bridgeLinks(snap: any, of: { [any]: number }, data: any, step: nu
 					used = true
 					local k = lo .. ":" .. hi
 					local e = buckets[k]
-					if not e then e = { lo = lo, hi = hi, mids = {}, drops = {} }; buckets[k] = e end
+					local up = t[lo].src.normal or Vector3.yAxis
+					if not e then
+						e = { lo = lo, hi = hi, mids = {}, drops = {}, dirs = {}, up = up }
+						buckets[k] = e
+					end
 					e.mids[#e.mids + 1] = cell.pos
 					-- measured between the two polygon-side cells, along the low
 					-- side's own normal, so it means the same thing a seam drop does
-					local up = t[lo].src.normal or Vector3.yAxis
 					e.drops[#e.drops + 1] = (t[hi].src.pos - t[lo].src.pos):Dot(up)
+					-- travel across the crossing, low side to high side
+					e.dirs[#e.dirs + 1] = t[hi].src.pos - t[lo].src.pos
 				end
 			end
 		end
@@ -631,7 +703,7 @@ local function bridgeLinks(snap: any, of: { [any]: number }, data: any, step: nu
 		local e = buckets[k]
 		for _, members in ipairs(groupsOf(e.mids, step * Portals.groupReach)) do
 			local gates = {}
-			fitAll(e.mids, members, step, gates)
+			fitAll(e.mids, e.dirs, e.up, members, step, gates)
 			if #gates > 1 then stats.gatesSplit += #gates - 1 end
 			for _, gt in ipairs(gates) do
 				local dsum = 0
@@ -642,10 +714,10 @@ local function bridgeLinks(snap: any, of: { [any]: number }, data: any, step: nu
 					centre = (gt.left + gt.right) * 0.5,
 					span = (gt.right - gt.left).Magnitude,
 					drop = dsum / #gt.members,
-					count = #gt.members, residual = gt.resid,
+					count = #gt.members, residual = gt.resid, travel = gt.travel, fitted = gt.fromCells,
 				}
 				stats.bridge += 1
-				noteFit(stats, "bridge", e.lo, e.hi, gt.resid, #gt.members, step)
+				noteFit(stats, "bridge", e.lo, e.hi, gt.resid, #gt.members, step, gt.fromCells)
 				-- A BRIDGE CHAINS TWO GATE CROSSINGS, so its height change is not bounded
 				-- by Severance's 1.5 the way a seam's is -- in off one side and out the
 				-- other can total 3.0. Four links on case3 come out at 2.75, which is two
@@ -706,7 +778,7 @@ function Portals.build(mesh: any, data: any, snap: any): any
 		pairs = #snap.pairs, pairsUsed = 0, pairsNoPolygon = 0, pairsSamePoly = 0,
 		bridge = 0, bridgeCells = 0, bridgeCrossings = 0, bridgeDeadEnd = 0,
 		bridgeDuplicate = 0, bridgeTooFar = 0, crossLimit = 0,
-		bridgeSteep = 0, bridgeSteepAt = {}, gatesSplit = 0,
+		bridgeSteep = 0, bridgeSteepAt = {}, gatesSplit = 0, gatesFromTravel = 0,
 		bentGroups = 0, bentAt = {}, worstResidual = 0, worstResidualAt = "none",
 		orphans = {}, pieces = 0, sevPieces = 0, sevSplit = {},
 		sevNarrow = 0, sevNarrowAt = {},
@@ -822,8 +894,8 @@ function Portals.report(res: any): string
 				s.crossLimit, s.bridgeTooFar, s.bridgeDuplicate),
 		("  %d components, severance says %d over the same cells (an upper bound: it does not know the agent's width)")
 			:format(s.pieces, s.sevPieces),
-		("  worst gate residual %.2f (%s), %d extra gates from cutting bent groups")
-			:format(s.worstResidual, s.worstResidualAt, s.gatesSplit),
+		("  worst gate residual %.2f (%s), %d extra gates from cutting bent groups, %d gates squared to travel")
+			:format(s.worstResidual, s.worstResidualAt, s.gatesSplit, s.gatesFromTravel),
 	}
 	if s.overshared > 0 then
 		lines[#lines + 1] = ("  !! %d edges owned by more than two polygons -- NOT A SURFACE")
