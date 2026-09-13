@@ -29,6 +29,7 @@ local SVOLocal = require(script.Parent:WaitForChild("SVOLocal"))
 local FaceKind = require(script.Parent:WaitForChild("FaceKind"))
 local EdgeKind = require(script.Parent:WaitForChild("EdgeKind"))
 local Nodes = require(script.Parent:WaitForChild("Nodes"))
+local Portals = require(script.Parent:WaitForChild("Portals"))
 
 -- TUNING LIVES IN THE MODULES, NOT HERE. A number in OVERRIDES is a deliberate
 -- departure from a module's own default, and the module comment next to that
@@ -173,7 +174,18 @@ end
 Pipeline.faceKind = false
 
 -- Label and split the polygon boundary edges as part of building the mesh.
-Pipeline.edgeKind = true
+--
+-- OFF. Portals need neither of its answers: inside a region a shared polygon
+-- edge is proof of adjacency on its own, and across one Severance has already
+-- decided reachability with a gate it validated against case3's own treads. The
+-- classification also carries a measured defect -- 213 of 1369 `wall` samples
+-- have nothing in the probe box, from voxel over-claim -- which there is no
+-- reason to inherit. Turning it off also skips `SVOLocal.fromParts`, which is
+-- most of a second of the bake and is built for nothing else here.
+--
+-- Turn it back on to draw `drawMeshKind` or to work on the classification
+-- itself. Nothing in the mesh or the portals changes when it does.
+Pipeline.edgeKind = false
 
 function Pipeline.bake(cfg: any?): (any, any)
 	local c = resolve(cfg)
@@ -1079,6 +1091,125 @@ end
 -- first. So the comparison is between two TRACES of the same bake -- the raw
 -- cells and the eroded ones -- rather than between a polygon and a moved copy
 -- of itself.
+-- The links that make the polygons a mesh rather than a pile of faces.
+--
+-- Cached on the result like `Pipeline.mesh`, so a draw and a report describe the
+-- same graph. The Severance snapshot is taken here rather than passed in
+-- because the pairs must come from the SAME data the mesh was cut from -- a
+-- snapshot of anything else would link polygons through cells that are not
+-- underneath them.
+function Pipeline.portals(result: any): any
+	if not result.portals then
+		local mesh = Pipeline.mesh(result)
+		local snap = result.severance
+		if not snap then
+			snap = Severance.snapshot(result.data)
+			result.severance = snap
+		end
+		result.portals = Portals.build(mesh, result.data, snap)
+	end
+	return result.portals
+end
+
+-- A bar across every portal, plus the polygon centres it joins.
+--
+-- ONE FOLDER PER KIND, because the three are found by completely different means
+-- and a defect in one says nothing about the others: `shared` links are exact
+-- polygon edges, `seam` links are fitted through Severance's cross-region cell
+-- pairs, and `bridge` links cross floor that was never traced at all. Being able
+-- to hide two and look at the third is the whole point.
+--
+-- Orphan polygons get a marker of their own -- a polygon with no link is a hole
+-- in the mesh and should be findable without reading a report.
+function Pipeline.drawPortals(result: any, opts: any?): (Instance, string)
+	local o = opts or {}
+	local lift = o.lift or 0.45
+	local res = Pipeline.portals(result)
+	local mesh = Pipeline.mesh(result)
+
+	local old = workspace:FindFirstChild(Pipeline.debugName)
+	if old then old:Destroy() end
+	local root = Instance.new("Folder")
+	root.Name = Pipeline.debugName
+	root.Parent = workspace
+
+	local function folder(name: string): Folder
+		local f = Instance.new("Folder")
+		f.Name = name
+		f.Parent = root
+		return f
+	end
+	local byKind = {
+		shared = folder("shared"),
+		seam = folder("seam"),
+		bridge = folder("bridge"),
+	}
+
+	-- Colour says HEIGHT, not kind -- the folder already says kind. A flush link
+	-- and a 1.38 stud step look nothing alike to anything that has to price them.
+	local SHARED = Color3.fromRGB(90, 220, 255)
+	local FLUSH  = Color3.fromRGB(120, 255, 140)
+	local STEP   = Color3.fromRGB(255, 205, 70)
+	local STEEP  = Color3.fromRGB(255, 90, 200)
+
+	for i, L in ipairs(res.links) do
+		local into = byKind[L.kind] or byKind.seam
+		local up = mesh.tris[L.a].up
+		local off = up * lift
+		local g = Instance.new("Folder")
+		g.Name = ("p%04d_f%04d-f%04d_%.1fw_%+.2fdrop"):format(i, L.a, L.b, L.span, L.drop)
+		g.Parent = into
+
+		local colour = SHARED
+		if L.kind ~= "shared" then
+			local d = math.abs(L.drop)
+			colour = (d <= 0.25) and FLUSH or (d <= 1.5) and STEP or STEEP
+		end
+		if L.span > 1e-4 then
+			segment(L.left + off, L.right + off, 0.22, colour, "gate", g)
+		else
+			-- a one-cell-pair portal has no width to draw, and a missing bar
+			-- would read as a missing link
+			local b = Instance.new("Part")
+			b.Anchored = true; b.CanCollide = false; b.CanQuery = false; b.CanTouch = false
+			b.Shape = Enum.PartType.Ball
+			b.Size = Vector3.new(0.3, 0.3, 0.3)
+			b.Color = colour; b.Material = Enum.Material.Neon
+			b.CFrame = CFrame.new(L.centre + off)
+			b.Name = "gate"
+			b.Parent = g
+		end
+		-- the two ends of the link, so the graph is visible and not just the gates
+		segment(mesh.tris[L.a].centre + off, L.centre + off, 0.07, colour, "a", g)
+		segment(mesh.tris[L.b].centre + mesh.tris[L.b].up * lift, L.centre + off,
+			0.07, colour, "b", g)
+	end
+
+	local orphans = 0
+	local fOrphan: Folder? = nil
+	local degree = {}
+	for _, L in ipairs(res.links) do
+		degree[L.a] = true; degree[L.b] = true
+	end
+	for i, f in ipairs(mesh.tris) do
+		if not degree[i] then
+			if not fOrphan then fOrphan = folder("orphan") end
+			orphans += 1
+			local b = Instance.new("Part")
+			b.Anchored = true; b.CanCollide = false; b.CanQuery = false; b.CanTouch = false
+			b.Shape = Enum.PartType.Ball
+			b.Size = Vector3.new(0.9, 0.9, 0.9)
+			b.Color = Color3.fromRGB(255, 60, 60)
+			b.Material = Enum.Material.Neon
+			b.CFrame = CFrame.new(f.centre + f.up * lift)
+			b.Name = ("f%04d_r%03d"):format(i, f.region)
+			b.Parent = fOrphan
+		end
+	end
+
+	return root, Portals.report(res)
+end
+
 function Pipeline.drawCompare(rawLoops: {any}, cutLoops: {any}, opts: any?): (Instance, string)
 	local o = opts or {}
 	local lift = o.lift or 0.3
@@ -1339,6 +1470,9 @@ function Pipeline.report(result: any): string
 	end
 	if result.meshKind then
 		lines[#lines + 1] = EdgeKind.report(result.meshKind)
+	end
+	if result.portals then
+		lines[#lines + 1] = Portals.report(result.portals)
 	end
 	return table.concat(lines, "\n")
 end
