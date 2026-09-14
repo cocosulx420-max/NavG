@@ -110,7 +110,34 @@ function Severance.snapshot(data: any, keep: ((any) -> boolean)?): any
 		if rank[ra] == rank[rb] then rank[ra] += 1 end
 	end
 
-	local G = bucketSize()
+	-- HOW FAR A CELL REACHES BEYOND ITS OWN CENTRE.
+	--
+	-- The gate is a physical distance -- could you have walked straight from one
+	-- patch of floor to the other -- so it is measured between centres, which is
+	-- exact only while every cell is one `step` square. A coarse cell's floor
+	-- extends past its centre, and two cells whose FLOOR touches would otherwise
+	-- read as severed because their centres are metres apart.
+	--
+	-- Returns 0 for a uniform cell, so the squared test below is untouched and a
+	-- uniform lattice gives bit-identical components.
+	local gStep = (data.config and data.config.step) or 0.5
+	local function overhang(c: any): number
+		local su, sv = c.su, c.sv
+		if not su or not sv then return 0 end
+		local m = math.max(su, sv)
+		return (m > gStep) and (m - gStep) * 0.5 or 0
+	end
+
+	-- The bucket must still be at least the gate's REACH, and a coarse cell
+	-- widens that reach. Scanned unconditionally so the widest pair in the map
+	-- still lands inside the 3x3x3 block; with no coarse cells this is 0 and G
+	-- is exactly bucketSize() as before.
+	local maxOver = 0
+	for i = 1, n do
+		local o = overhang(cells[i])
+		if o > maxOver then maxOver = o end
+	end
+	local G = math.max(bucketSize(), Severance.stepPlane + 2 * maxOver)
 	local hash: { [number]: {number} } = {}
 	for i = 1, n do
 		local p = cells[i].pos
@@ -145,6 +172,7 @@ function Severance.snapshot(data: any, keep: ((any) -> boolean)?): any
 		local a = cells[i]
 		local p = a.pos
 		local up = a.normal or Vector3.yAxis
+		local oa = overhang(a)
 		local bx, by, bz = math.floor(p.X / G), math.floor(p.Y / G), math.floor(p.Z / G)
 		for ox = -1, 1 do
 			for oy = -1, 1 do
@@ -159,7 +187,13 @@ function Severance.snapshot(data: any, keep: ((any) -> boolean)?): any
 								local dv = cells[j].pos - p
 								local dn = dv:Dot(up)
 								local flat = dv - up * dn
-								if flat:Dot(flat) <= plane2 and math.abs(dn) <= normTol then
+								local lim = plane2
+								local ob = overhang(cells[j])
+								if oa ~= 0 or ob ~= 0 then
+									local reach = Severance.stepPlane + oa + ob
+									lim = reach * reach
+								end
+								if flat:Dot(flat) <= lim and math.abs(dn) <= normTol then
 									tested += 1
 									local b2 = cells[j]
 									if a.region ~= b2.region then

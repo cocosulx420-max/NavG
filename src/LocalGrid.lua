@@ -742,20 +742,55 @@ local function buildWorldIndex(grids: any)
 		b[#b + 1] = v
 	end
 	for _, g in pairs(grids) do
-		for _, cell in ipairs(g.cells) do push(live, cell.pos, { cell = cell, part = g.part }) end
-		for _, d in ipairs(g.dead) do push(dead, d.pos, { dead = d, part = g.part }) end
+		-- `g` as well as `g.part`: a cell's footprint is measured in its own
+		-- grid's in-plane axes, and a coarse cell cannot be tested without them.
+		for _, cell in ipairs(g.cells) do push(live, cell.pos, { cell = cell, part = g.part, g = g }) end
+		for _, d in ipairs(g.dead) do push(dead, d.pos, { dead = d, part = g.part, g = g }) end
 	end
 	return live, dead
 end
 
+-- Does `p` fall inside this cell's own footprint?
+--
+-- THE NEIGHBOUR LOOKUPS ARE CENTRE-PROXIMITY TESTS: they ask whether some cell's
+-- CENTRE sits within probeRadius of where a neighbour should be. That is exact
+-- while every cell is one `step` square, and wrong the moment one is not -- a
+-- 0.5 cell beside a 4-stud cell looks 0.5 studs inward and finds the big cell's
+-- centre 2 studs away, so it reports no neighbour and emits a boundary face into
+-- the middle of solid floor.
+--
+-- Deliberately answers FALSE for any cell that is still one step across, so on a
+-- uniform lattice this is dead code and the verdicts are bit-identical. A
+-- uniform cell's footprint lies inside the proximity radius anyway (half-diagonal
+-- 0.354 against a 0.375 reach), so it could never have added a match.
+local function cellCovers(g: any, cell: any, p: Vector3): boolean
+	local su, sv = cell.su, cell.sv
+	if not su or not sv then return false end
+	if su <= g.step and sv <= g.step then return false end
+	local d = p - cell.pos
+	local du, dv
+	if not g.fallback and g.u and g.v then
+		du, dv = d:Dot(g.u), d:Dot(g.v)
+	else
+		du, dv = d.X, d.Z
+	end
+	return math.abs(du) <= su * 0.5 and math.abs(dv) <= sv * 0.5
+end
+LocalGrid.cellCovers = cellCovers
+
 -- Where the neighbour in local direction d would be, in world space. Block
 -- grids step along their own face axes; fallback grids are world-aligned.
 -- Only a part with a degenerate Size ends up world-aligned now.
+-- Steps from THIS cell's own edge, not by a fixed `step`: half of this cell plus
+-- half of a minimum-size one lands in the middle of whatever abuts it. For a
+-- uniform cell (su == sv == step) that is `d * step` exactly as before.
 local function neighbourPos(g: Grid, cell: Cell, d: {number}): Vector3
+	local ou = d[1] * ((cell.su or g.step) + g.step) * 0.5
+	local ov = d[2] * ((cell.sv or g.step) + g.step) * 0.5
 	if not g.fallback and g.u and g.v then
-		return cell.pos + g.u * (d[1] * g.step) + g.v * (d[2] * g.step)
+		return cell.pos + g.u * ou + g.v * ov
 	end
-	return cell.pos + Vector3.new(d[1] * g.step, 0, d[2] * g.step)
+	return cell.pos + Vector3.new(ou, 0, ov)
 end
 
 -- Drop cells on surfaces too narrow to stand on.
@@ -818,7 +853,8 @@ function LocalGrid.pruneNarrow(data: any, cfg: Config?)
 					for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
 						local q = e.cell.pos
 						local dx, dz = q.X - p.X, q.Z - p.Z
-						if dx * dx + dz * dz <= r2 and math.abs(q.Y - p.Y) <= tol then
+						if (dx * dx + dz * dz <= r2 or cellCovers(e.g, e.cell, p))
+							and math.abs(q.Y - p.Y) <= tol then
 							found = true
 							break
 						end
@@ -1035,7 +1071,7 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 						for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
 							local q = e.cell.pos
 							local dx, dz = q.X - p.X, q.Z - p.Z
-							if dx * dx + dz * dz <= r2 then
+							if dx * dx + dz * dz <= r2 or cellCovers(e.g, e.cell, p) then
 								-- MEASURED AGAINST WHERE THIS SURFACE WOULD CONTINUE,
 								-- not against our own height. `p` lies on this grid's
 								-- own plane, so on a tilted slab the next cell along
@@ -1445,7 +1481,7 @@ function LocalGrid.regions(data: any, cfg: Config?)
 						for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
 							local q = e.cell
 							local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
-							if dx * dx + dz * dz <= r2
+							if (dx * dx + dz * dz <= r2 or cellCovers(e.g, q, p))
 								and math.abs(q.pos.Y - p.Y) <= tol
 								and cell.normal:Dot(q.normal) >= cosTol
 								and q.fit == cell.fit then
@@ -1515,7 +1551,7 @@ function LocalGrid.regions(data: any, cfg: Config?)
 									if mine[q] and bandOf[q] == bandOf[cell]
 										and q.fit == cell.fit then
 										local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
-										if dx * dx + dz * dz <= r2
+										if (dx * dx + dz * dz <= r2 or cellCovers(e.g, q, p))
 											and math.abs(q.pos.Y - p.Y) <= tol then
 											local ra, rb = bfind(cell), bfind(q)
 											if ra ~= rb then bup[ra] = rb end

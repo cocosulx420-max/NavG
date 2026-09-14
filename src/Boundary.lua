@@ -94,11 +94,33 @@ end
 Boundary.nodeKey = nodeKey
 
 -- Where the neighbour in local direction d would sit, in world space.
+-- Steps from THIS cell's own edge: half of this cell plus half of a
+-- minimum-size one lands in the middle of whatever abuts it. Reduces to
+-- `d * step` exactly while every cell is one step across.
 local function neighbourPos(g: any, cell: any, d: {number}): Vector3
+	local ou = d[1] * ((cell.su or g.step) + g.step) * 0.5
+	local ov = d[2] * ((cell.sv or g.step) + g.step) * 0.5
 	if not g.fallback and g.u and g.v then
-		return cell.pos + g.u * (d[1] * g.step) + g.v * (d[2] * g.step)
+		return cell.pos + g.u * ou + g.v * ov
 	end
-	return cell.pos + Vector3.new(d[1] * g.step, 0, d[2] * g.step)
+	return cell.pos + Vector3.new(ou, 0, ov)
+end
+
+-- Does `p` fall inside this cell's own footprint? See LocalGrid.cellCovers --
+-- same test, same reasoning, and the same deliberate FALSE for any cell still
+-- one step across, so a uniform lattice is bit-identical.
+local function cellCovers(g: any, cell: any, p: Vector3): boolean
+	local su, sv = cell.su, cell.sv
+	if not su or not sv then return false end
+	if su <= g.step and sv <= g.step then return false end
+	local d = p - cell.pos
+	local du, dv
+	if not g.fallback and g.u and g.v then
+		du, dv = d:Dot(g.u), d:Dot(g.v)
+	else
+		du, dv = d.X, d.Z
+	end
+	return math.abs(du) <= su * 0.5 and math.abs(dv) <= sv * 0.5
 end
 
 -- Which of `cell`'s four directions faces the point `p`. Used to mark the far
@@ -180,7 +202,8 @@ function Boundary.faces(data: any)
 							if q ~= cell and q.region == cell.region then
 								local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
 								local dd = dx * dx + dz * dz
-								if dd <= r2 and math.abs(q.pos.Y - p.Y) <= tol and dd < bd then
+								if (dd <= r2 or cellCovers(e.g, q, p))
+									and math.abs(q.pos.Y - p.Y) <= tol and dd < bd then
 									bd = dd; found = q; fg = e.g
 								end
 							end
@@ -208,7 +231,8 @@ function Boundary.faces(data: any)
 							local q = en.cell
 							if q ~= cell and q.region == cell.region then
 								local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
-								if dx * dx + dz * dz <= r2 and math.abs(q.pos.Y - p.Y) <= tol then
+								if (dx * dx + dz * dz <= r2 or cellCovers(en.g, q, p))
+									and math.abs(q.pos.Y - p.Y) <= tol then
 									local t = diag[cell]
 									if not t then t = {}; diag[cell] = t end
 									t[q] = true
