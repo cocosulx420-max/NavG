@@ -520,7 +520,7 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 	-- pays a fourth. `workspace:Raycast` is deterministic, so caching cannot
 	-- change a verdict -- `false` is stored for a miss so it is not re-cast.
 	local surf: { [string]: any } = {}
-	local function probe(iu: number, iv: number)
+	local function surfaceAt(iu: number, iv: number)
 		local key = iu .. ":" .. iv
 		local hit = surf[key]
 		if hit == nil then
@@ -552,7 +552,7 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 		local p = corner + u * ((iu + k * 0.5) * step) + v * ((iv + k * 0.5) * step)
 		local res
 		if k == 1 then
-			res = probe(iu, iv)
+			res = surfaceAt(iu, iv)
 		else
 			res = workspace:Raycast(p + n * castH, -n * castLen, rpPart)
 		end
@@ -884,7 +884,7 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 	local function faceIsWhole(iu: number, iv: number, k: number, p: Vector3): boolean
 		for a = -1, k do
 			for b = -1, k do
-				local res = probe(iu + a, iv + b)
+				local res = surfaceAt(iu + a, iv + b)
 				if not res then return false end
 				if res.Normal:Dot(n) < cosFace then return false end
 				if math.abs((res.Position - p):Dot(n)) > c.flushTol then return false end
