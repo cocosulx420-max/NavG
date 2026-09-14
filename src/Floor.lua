@@ -89,6 +89,91 @@ function Floor.gatherParts(cfg: Config?): {BasePart}
 	return out
 end
 
+-- IS THERE ANY TERRAIN OVER THIS BAKE AT ALL?
+--
+-- Terrain is never walkable and is never in `parts`, but it still blocks headroom,
+-- and an overlap query cannot see it -- so every clearance test in the pipeline
+-- pays a terrain-only ray pair. That is two of the four rays a surviving column
+-- costs here, and two of the five world queries a LocalGrid cell costs. On a map
+-- with no terrain over it every one of those provably returns nil.
+--
+-- `Terrain.MaxExtents` CANNOT answer this. It reports the maximum POSSIBLE region
+-- -- (-32000, -32000, -32000) to (32000, 32000, 32000) -- and reads identically on
+-- an empty world. `ReadVoxels` at resolution 4 is the native voxel pitch, so an
+-- all-Air result is a PROOF and not a sample. Measured on case6: 607926 voxels
+-- over the town's bounding box, every one of them Air.
+--
+-- SCOPED TO THE BAKE ROOT, never global. A place usually holds several test maps
+-- side by side, and terrain beside one of them would switch the saving off for
+-- every other -- which is exactly the case here: case6 has none over it while the
+-- place does have terrain elsewhere.
+local TERRAIN_LIMIT = 32000
+local VOXEL = 4
+function Floor.hasTerrain(cfg: Config?): boolean
+	local c = merged(cfg)
+	local root = c.root
+	-- A whole-workspace bake has no bounds worth taking, so assume the worst and
+	-- keep casting: this may only ever REMOVE provably-empty queries.
+	if not root then return true end
+
+	local lo = Vector3.new(math.huge, math.huge, math.huge)
+	local hi = -lo
+	local any = false
+	for _, d in ipairs(root:GetDescendants()) do
+		if d:IsA("BasePart") then
+			local cf, sz = d.CFrame, d.Size * 0.5
+			local x, y, z = cf.RightVector, cf.UpVector, cf.LookVector
+			local h = Vector3.new(
+				math.abs(x.X) * sz.X + math.abs(y.X) * sz.Y + math.abs(z.X) * sz.Z,
+				math.abs(x.Y) * sz.X + math.abs(y.Y) * sz.Y + math.abs(z.Y) * sz.Z,
+				math.abs(x.Z) * sz.X + math.abs(y.Z) * sz.Y + math.abs(z.Z) * sz.Z)
+			lo = lo:Min(d.Position - h); hi = hi:Max(d.Position + h); any = true
+		end
+	end
+	if not any then return false end
+
+	-- Reach as far as any clearance ray could, then snap out to the voxel grid.
+	local pad = Vector3.new(c.clearCap, c.clearCap, c.clearCap)
+	lo -= pad; hi += pad
+	local function clamp(v: Vector3, f): Vector3
+		return Vector3.new(
+			math.clamp(f(v.X / VOXEL) * VOXEL, -TERRAIN_LIMIT, TERRAIN_LIMIT),
+			math.clamp(f(v.Y / VOXEL) * VOXEL, -TERRAIN_LIMIT, TERRAIN_LIMIT),
+			math.clamp(f(v.Z / VOXEL) * VOXEL, -TERRAIN_LIMIT, TERRAIN_LIMIT))
+	end
+	lo = clamp(lo, math.floor); hi = clamp(hi, math.ceil)
+
+	-- Chunked so one call never approaches ReadVoxels' per-call voxel ceiling.
+	local T = workspace.Terrain
+	local SPAN, SPAN_Y = 128, 256
+	for x = lo.X, hi.X - VOXEL, SPAN do
+		for z = lo.Z, hi.Z - VOXEL, SPAN do
+			for y = lo.Y, hi.Y - VOXEL, SPAN_Y do
+				local a = Vector3.new(x, y, z)
+				local b = Vector3.new(
+					math.min(x + SPAN, hi.X), math.min(y + SPAN_Y, hi.Y), math.min(z + SPAN, hi.Z))
+				if b.X > a.X and b.Y > a.Y and b.Z > a.Z then
+					local ok, mats = pcall(function()
+						return T:ReadVoxels(Region3.new(a, b):ExpandToGrid(VOXEL), VOXEL)
+					end)
+					-- A refused read is not a proof of emptiness, so it counts as terrain.
+					if not ok then return true end
+					for i = 1, #mats do
+						local mi = mats[i]
+						for j = 1, #mi do
+							local mj = mi[j]
+							for k = 1, #mj do
+								if mj[k] ~= Enum.Material.Air then return true end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	return false
+end
+
 -- Extract surfels from a prebuilt SVO over `parts`.
 function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 	local c = merged(cfg)
@@ -108,9 +193,14 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 	local op = OverlapParams.new()
 	op.FilterType = Enum.RaycastFilterType.Include
 	op.FilterDescendantsInstances = parts
-	local rpTerrain = RaycastParams.new()
-	rpTerrain.FilterType = Enum.RaycastFilterType.Include
-	rpTerrain.FilterDescendantsInstances = { workspace.Terrain }
+	-- nil when the bake root has no terrain over it, which makes every terrain
+	-- cast below a no-op rather than a query. See Floor.hasTerrain.
+	local rpTerrain = nil
+	if Floor.hasTerrain(c) then
+		rpTerrain = RaycastParams.new()
+		rpTerrain.FilterType = Enum.RaycastFilterType.Include
+		rpTerrain.FilterDescendantsInstances = { workspace.Terrain }
+	end
 
 	local surfels: {Surfel} = {}
 	local index: { [string]: {Surfel} } = {}
@@ -167,11 +257,13 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 					-- Terrain is not in `parts` (never walkable) but still blocks
 					-- headroom; overlap queries are parts-only, so use a terrain-only
 					-- ray pair (down-ray catches embedded origin under a blob).
-					local tUp = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), Vector3.new(0, c.clearCap, 0), rpTerrain)
-					if tUp then
-						clearance = math.min(clearance, tUp.Distance)
-					elseif workspace:Raycast(res.Position + Vector3.new(0, c.clearCap, 0), Vector3.new(0, -(c.clearCap - 0.25), 0), rpTerrain) then
-						clearance = 0
+					if rpTerrain then
+						local tUp = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), Vector3.new(0, c.clearCap, 0), rpTerrain)
+						if tUp then
+							clearance = math.min(clearance, tUp.Distance)
+						elseif workspace:Raycast(res.Position + Vector3.new(0, c.clearCap, 0), Vector3.new(0, -(c.clearCap - 0.25), 0), rpTerrain) then
+							clearance = 0
+						end
 					end
 				end
 				local surfel: Surfel = {
@@ -188,7 +280,8 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 	end)
 	probe:Destroy()
 
-	return { surfels = surfels, index = index, config = c }
+	-- Carried so LocalGrid does not have to re-derive it.
+	return { surfels = surfels, index = index, config = c, noTerrain = rpTerrain == nil }
 end
 
 -- Convenience one-call bake: gather parts, build SVO, extract floor.

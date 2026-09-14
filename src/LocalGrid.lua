@@ -482,7 +482,7 @@ local function isWedge(p: BasePart): boolean
 	return p:IsA("Part") and (p :: Part).Shape == Enum.PartType.Wedge
 end
 
-local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: RaycastParams, probe: BasePart, op: OverlapParams, rpTerrain: RaycastParams): Grid?
+local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: RaycastParams, probe: BasePart, op: OverlapParams, rpTerrain: RaycastParams?): Grid?
 	local n, u, v, uExt, vExt, surfaceCenter, dev = surfaceFrame(part, surfels, c.step)
 	if not n then return nil end
 	local cosFace = math.cos(math.rad(c.faceAngle))
@@ -739,15 +739,17 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 		local upRes = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap, filterAll)
 		local clearance = upRes and upRes.Distance or c.clearCap
 		local cover: Instance? = upRes and upRes.Instance or nil
-		local tUp = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap, rpTerrain)
-		if tUp then
-			if tUp.Distance < clearance then
-				clearance = tUp.Distance
+		if rpTerrain then
+			local tUp = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap, rpTerrain)
+			if tUp then
+				if tUp.Distance < clearance then
+					clearance = tUp.Distance
+					cover = workspace.Terrain
+				end
+			elseif workspace:Raycast(res.Position + UP * c.clearCap, -UP * (c.clearCap - 0.25), rpTerrain) then
+				clearance = 0
 				cover = workspace.Terrain
 			end
-		elseif workspace:Raycast(res.Position + UP * c.clearCap, -UP * (c.clearCap - 0.25), rpTerrain) then
-			clearance = 0
-			cover = workspace.Terrain
 		end
 		if clearance < c.minClearance then
 			kill(iu, iv, res.Position, cover)
@@ -1000,8 +1002,10 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 			local from = q + UP * 0.15
 			local hit = workspace:Raycast(from, UP * c.clearCap, filterAll)
 			local d = hit and hit.Distance or c.clearCap
-			local t = workspace:Raycast(from, UP * c.clearCap, rpTerrain)
-			if t and t.Distance < d then d = t.Distance end
+			if rpTerrain then
+				local t = workspace:Raycast(from, UP * c.clearCap, rpTerrain)
+				if t and t.Distance < d then d = t.Distance end
+			end
 			return d
 		end
 		local fit = fitOf(clearanceAt(p), c)
@@ -1019,7 +1023,7 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 		end
 		-- 4. terrain is invisible to a bounds query, so a hit forces the exact
 		--    path rather than being silently ignored.
-		if workspace:Raycast(p + n * 0.15, UP * col, rpTerrain) then return false end
+		if rpTerrain and workspace:Raycast(p + n * 0.15, UP * col, rpTerrain) then return false end
 		-- 5. and on a face whose shape proves nothing, the surface itself.
 		if shaped and not faceIsWhole(iu, iv, k, p) then return false end
 		return true
@@ -1703,9 +1707,21 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?, tr
 	local op = OverlapParams.new()
 	op.FilterType = Enum.RaycastFilterType.Include
 	op.FilterDescendantsInstances = parts
-	local rpTerrain = RaycastParams.new()
-	rpTerrain.FilterType = Enum.RaycastFilterType.Include
-	rpTerrain.FilterDescendantsInstances = { workspace.Terrain }
+	-- NIL WHEN THE BAKE ROOT HAS NO TERRAIN OVER IT, which turns every terrain cast
+	-- in `emit`, `clearanceAt` and collapse test 4 into a no-op instead of a query.
+	-- Terrain is invisible to an overlap query, so those casts are the only way to
+	-- see it -- and on a map without any they provably return nil every time. Two
+	-- of the five world queries an ordinary cell costs, and half of the clearance
+	-- rays a collapse attempt costs. `Floor.extract` has already answered this, so
+	-- read its verdict rather than paying for the voxel scan twice.
+	local rpTerrain = nil
+	local noTerrain = floorData.noTerrain
+	if noTerrain == nil then noTerrain = not Floor.hasTerrain(c) end
+	if not noTerrain then
+		rpTerrain = RaycastParams.new()
+		rpTerrain.FilterType = Enum.RaycastFilterType.Include
+		rpTerrain.FilterDescendantsInstances = { workspace.Terrain }
+	end
 
 	local byPart = groupByPart(floorData.surfels)
 	-- An ARRAY now, not a map keyed by part: a part can own several grids, one
