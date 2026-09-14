@@ -413,6 +413,7 @@ local function selfIntersects(pts: {Vector3}, up: Vector3): boolean
 	local e2 = up:Cross(e1).Unit
 	local x, y = table.create(n), table.create(n)
 	for i = 1, n do x[i] = pts[i]:Dot(e1); y[i] = pts[i]:Dot(e2) end
+	local EPS = 1e-6
 	local function side(x1, y1, x2, y2, x3, y3): number
 		return (x2 - x1) * (y3 - y1) - (y2 - y1) * (x3 - x1)
 	end
@@ -426,8 +427,17 @@ local function selfIntersects(pts: {Vector3}, up: Vector3): boolean
 				local d2 = side(x[i], y[i], x[i2], y[i2], x[j2], y[j2])
 				local d3 = side(x[j], y[j], x[j2], y[j2], x[i], y[i])
 				local d4 = side(x[j], y[j], x[j2], y[j2], x[i2], y[i2])
-				-- strict, so a ring that merely touches itself is left alone
-				if (d1 > 0) ~= (d2 > 0) and (d3 > 0) ~= (d4 > 0) then return true end
+				-- A PROPER crossing only: all four determinants strictly off zero.
+				-- A lattice walk pinches -- two cells touching at a corner put the
+				-- same vertex in the ring twice -- and a pinch makes one of these
+				-- exactly zero. Treating that as a crossing called case3's RAW
+				-- rings non-simple, which they are not: a touch is a pinch the
+				-- mesher handles, a crossing is not.
+				if math.abs(d1) > EPS and math.abs(d2) > EPS
+					and math.abs(d3) > EPS and math.abs(d4) > EPS
+					and (d1 > 0) ~= (d2 > 0) and (d3 > 0) ~= (d4 > 0) then
+					return true
+				end
 			end
 		end
 	end
