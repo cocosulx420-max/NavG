@@ -482,7 +482,7 @@ local function isWedge(p: BasePart): boolean
 	return p:IsA("Part") and (p :: Part).Shape == Enum.PartType.Wedge
 end
 
-local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: RaycastParams, probe: BasePart, op: OverlapParams, rpTerrain: RaycastParams?): Grid?
+local function buildGrid(part: BasePart, surfels: {any}, c: any, bf: any, probe: BasePart, rpTerrain: RaycastParams?): Grid?
 	local n, u, v, uExt, vExt, surfaceCenter, dev = surfaceFrame(part, surfels, c.step)
 	if not n then return nil end
 	local cosFace = math.cos(math.rad(c.faceAngle))
@@ -499,6 +499,8 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 	local nu = math.max(1, math.ceil(2 * uExt / step - 1e-6))
 	local nv = math.max(1, math.ceil(2 * vExt / step - 1e-6))
 	local corner = surfaceCenter - u * (nu * step * 0.5) - v * (nv * step * 0.5)
+
+	local op, bakeSet, castBake = bf.op, bf.set, bf.cast
 
 	local rpPart = RaycastParams.new()
 	rpPart.FilterType = Enum.RaycastFilterType.Include
@@ -656,7 +658,7 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 		for _, cand in ipairs(workspace:GetPartBoundsInBox(
 			CFrame.new(tileCtr + UP * (bandLo + bandH * 0.5)),
 			Vector3.new(uW, bandH, vW), op)) do
-			if cand ~= part then
+			if cand ~= part and bakeSet[cand] then
 				if isBlock(cand) then
 					if boxOverlap(tileCF, tileSize, cand.CFrame, cand.Size) then
 						killer = cand
@@ -682,7 +684,7 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 					probe.Size = tileSize
 					probe.CFrame = tileCF
 					for _, h in ipairs(workspace:GetPartsInPart(probe, op)) do
-						if h ~= part then volHit = h; break end
+						if h ~= part and bakeSet[h] then volHit = h; break end
 					end
 				end
 				if volHit then killer = volHit; break end
@@ -736,7 +738,7 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 			kill(iu, iv, res.Position, killer)
 			return
 		end
-		local upRes = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap, filterAll)
+		local upRes = castBake(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap)
 		local clearance = upRes and upRes.Distance or c.clearCap
 		local cover: Instance? = upRes and upRes.Instance or nil
 		if rpTerrain then
@@ -866,7 +868,7 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 		local meshes: {BasePart}? = nil
 		local half = aabbHalf(cf, size)
 		for _, cand in ipairs(workspace:GetPartBoundsInBox(CFrame.new(cf.Position), half * 2, op)) do
-			if cand ~= part then
+			if cand ~= part and bakeSet[cand] then
 				if isBlock(cand) then
 					if boxOverlap(cf, size, cand.CFrame, cand.Size) then return false end
 				elseif isWedge(cand) then
@@ -887,7 +889,7 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 		probe.Size = size
 		probe.CFrame = cf
 		for _, hit in ipairs(workspace:GetPartsInPart(probe, op)) do
-			if hit ~= part and not isBlock(hit) and not isWedge(hit) then return false end
+			if hit ~= part and bakeSet[hit] and not isBlock(hit) and not isWedge(hit) then return false end
 		end
 		return not raysHitBox(meshes, cf, size)
 	end
@@ -1000,7 +1002,7 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 		--    per strip across the gradient, k boxes instead of one.
 		local function clearanceAt(q: Vector3): number
 			local from = q + UP * 0.15
-			local hit = workspace:Raycast(from, UP * c.clearCap, filterAll)
+			local hit = castBake(from, UP * c.clearCap)
 			local d = hit and hit.Distance or c.clearCap
 			if rpTerrain then
 				local t = workspace:Raycast(from, UP * c.clearCap, rpTerrain)
@@ -1475,16 +1477,19 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	-- Included, not excluded: the probe can only ever hit the parts this bake
 	-- was built from, so a debug drawing in the workspace cannot register as a
 	-- wall however it is parented.
-	local op = OverlapParams.new()
-	op.FilterType = Enum.RaycastFilterType.Include
-	op.FilterDescendantsInstances = data.parts or {}
-	op.MaxParts = 1
-	-- The same filter WITHOUT the cap, for the bounds query below. MaxParts = 1
-	-- would hand back whichever candidate the broadphase happened to return
-	-- first, so a mesh standing in front of a wall would hide the wall.
-	local opAll = OverlapParams.new()
-	opAll.FilterType = Enum.RaycastFilterType.Include
-	opAll.FilterDescendantsInstances = data.parts or {}
+	-- ONE FILTER, ROOT-SCOPED, and no MaxParts cap. See Floor.bakeFilter: a filter
+	-- list is scanned per query, so an Include list of every part in the map cost
+	-- 527us a query against 0.95us for one entry. Membership is re-established
+	-- against `bakeSet` instead, which also keeps a debug drawing in the workspace
+	-- from registering as a wall however it is parented.
+	--
+	-- The cap has to go with it: it would hand back whichever candidate the
+	-- broadphase returned first, and that can now be something outside the bake,
+	-- which would hide the wall behind it. Same reason the uncapped variant
+	-- existed for the bounds query.
+	local cbf = Floor.bakeFilter(data.parts or {}, data.config and data.config.root)
+	local bakeSet = cbf.set
+	local op, opAll = cbf.op, cbf.op
 	local box = Instance.new("Part")
 	box.Name = "NVGN_WallProbe"
 	box.Size = Vector3.new(c.step * 0.9, PROBE_HEIGHT, PROBE_DEPTH)
@@ -1637,7 +1642,9 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 							-- calls the empty middle of an archway solid.
 							local meshSeen = false
 							for _, cand in ipairs(workspace:GetPartBoundsInBox(probeCF, probeSize, opAll)) do
-								if isBlock(cand) then
+								if not bakeSet[cand] then
+									-- not part of the bake; the old Include list simply never returned it
+								elseif isBlock(cand) then
 									if boxOverlap(probeCF, probeSize, cand.CFrame, cand.Size) then
 										solid = true
 										break
@@ -1652,7 +1659,9 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 								end
 							end
 							if not solid and meshSeen and maybe then
-								solid = #workspace:GetPartsInPart(box, op) > 0
+								for _, h in ipairs(workspace:GetPartsInPart(box, op)) do
+									if bakeSet[h] then solid = true; break end
+								end
 							end
 							if not solid then nRefused += 1 end
 						end
@@ -1694,9 +1703,11 @@ end
 -- Build per-part local grids from an existing floor extraction.
 function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?, tree: any?)
 	local c = merged(cfg)
-	local filterAll = RaycastParams.new()
-	filterAll.FilterType = Enum.RaycastFilterType.Include
-	filterAll.FilterDescendantsInstances = parts
+	-- THE FILTER LIST LENGTH IS THE COST OF THE QUERY -- 0.95us a ray at one entry
+	-- against 527us at 18197, measured on case6. Every hot query here filtered on
+	-- the whole part list. See Floor.bakeFilter for the rule and the re-cast that
+	-- keeps it exact.
+	local bf = Floor.bakeFilter(parts, c.root)
 
 	local probe = Instance.new("Part")
 	probe.Name = "NVGN_ClearProbe"
@@ -1704,9 +1715,7 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?, tr
 	probe.Anchored = true; probe.CanCollide = false; probe.CanQuery = false; probe.CanTouch = false
 	probe.Transparency = 1
 	probe.Parent = workspace
-	local op = OverlapParams.new()
-	op.FilterType = Enum.RaycastFilterType.Include
-	op.FilterDescendantsInstances = parts
+	local op = bf.op
 	-- NIL WHEN THE BAKE ROOT HAS NO TERRAIN OVER IT, which turns every terrain cast
 	-- in `emit`, `clearanceAt` and collapse test 4 into a no-op instead of a query.
 	-- Terrain is invisible to an overlap query, so those casts are the only way to
@@ -1777,7 +1786,7 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?, tr
 		local faces = splitFaces(sfs, cosFace)
 		nFaces += #faces
 		for _, face in ipairs(faces) do
-			local g: Grid? = buildGrid(part, face.list, c, filterAll, probe, op, rpTerrain)
+			local g: Grid? = buildGrid(part, face.list, c, bf, probe, rpTerrain)
 			if g then
 				nBlock += 1
 			else
