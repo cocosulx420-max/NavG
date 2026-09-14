@@ -392,6 +392,48 @@ Pipeline.holeTight = true
 -- is not a simplification, it is a deletion, and it gets refused.
 Pipeline.keepArea = 0.7
 
+-- Does this closed ring cross itself?
+--
+-- Simplification moves corners, and a corner that moves far enough can carry its
+-- edge across another part of the same ring. The result still looks like a ring
+-- and still encloses an area, so nothing upstream notices -- but CDT then has to
+-- constrain two segments that intersect, and a constrained edge can never be
+-- flipped, so one of them simply cannot be inserted. That is where "the ring is
+-- not simple" and "boundary edges could not be forced" come from, and on case6
+-- they are the same regions 21 times out of 29.
+--
+-- O(n^2) on the ring, which is what CDT's own report-only check already costs.
+local function selfIntersects(pts: {Vector3}, up: Vector3): boolean
+	local n = #pts
+	if n < 4 then return false end
+	local ax = (math.abs(up.X) < 0.9) and Vector3.xAxis or Vector3.yAxis
+	local e1 = ax:Cross(up)
+	if e1.Magnitude < 1e-9 then return false end
+	e1 = e1.Unit
+	local e2 = up:Cross(e1).Unit
+	local x, y = table.create(n), table.create(n)
+	for i = 1, n do x[i] = pts[i]:Dot(e1); y[i] = pts[i]:Dot(e2) end
+	local function side(x1, y1, x2, y2, x3, y3): number
+		return (x2 - x1) * (y3 - y1) - (y2 - y1) * (x3 - x1)
+	end
+	for i = 1, n do
+		local i2 = i % n + 1
+		for j = i + 2, n do
+			local j2 = j % n + 1
+			-- neighbours share a vertex and always "touch"; so do the first and last
+			if i2 ~= j and j2 ~= i then
+				local d1 = side(x[i], y[i], x[i2], y[i2], x[j], y[j])
+				local d2 = side(x[i], y[i], x[i2], y[i2], x[j2], y[j2])
+				local d3 = side(x[j], y[j], x[j2], y[j2], x[i], y[i])
+				local d4 = side(x[j], y[j], x[j2], y[j2], x[i2], y[i2])
+				-- strict, so a ring that merely touches itself is left alone
+				if (d1 > 0) ~= (d2 > 0) and (d3 > 0) ~= (d4 > 0) then return true end
+			end
+		end
+	end
+	return false
+end
+
 function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 	local c = resolve(cfg)
 	local o = {}
@@ -406,6 +448,7 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 	local out = {}
 	local stats = { loops = 0, open = 0, raw = 0, corners = 0,
 		holesHeld = 0, rescued = 0, collapsed = 0, degenerate = 0,
+		unkinked = 0, rawFallback = 0, kinked = 0,
 		edges = 0, wallEdges = 0, openEdges = 0, mixedEdges = 0, inventedEdges = 0,
 		closedBy = { merge = 0, intersect = 0, straight = 0, ["already closed"] = 0 } }
 
@@ -476,6 +519,27 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 					else
 						stats.collapsed += 1
 					end
+				end
+			end
+
+			-- A RING THAT CROSSES ITSELF CANNOT BE MESHED, so do not hand one on.
+			-- Try the tight settings, which move corners less and usually do not
+			-- make the crossing; failing that fall back to the RAW lattice walk,
+			-- which is simple by construction because it is a closed walk over
+			-- cell edges. That costs corners on a handful of rings and buys a mesh
+			-- that can actually constrain them.
+			if L.closed and #pts >= 4 and selfIntersects(pts, up) then
+				local retry, ropts, rri = run(tight)
+				if #retry >= 4 and not selfIntersects(retry, up) then
+					pts, opts, rawIdx = retry, ropts, rri
+					stats.unkinked += 1
+				elseif not selfIntersects(poly, up) then
+					pts = poly
+					rawIdx = table.create(#poly)
+					for j = 1, #poly do rawIdx[j] = j end
+					stats.rawFallback += 1
+				else
+					stats.kinked += 1
 				end
 			end
 
