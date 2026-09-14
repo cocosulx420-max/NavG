@@ -185,6 +185,9 @@ LocalGrid.cellBudget = 4000
 -- is the wrong trade for a stage whose output everything downstream describes.
 LocalGrid.maxNodeCells = 4
 
+-- the four corners of a node, as (u, v) signs
+local CORNERS = { { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 } }
+
 local function fitOf(clearance: number, c: any): number
 	if clearance >= c.standHeight then return 3 end
 	if clearance >= c.crouchHeight then return 2 end
@@ -865,11 +868,33 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 			Vector3.new(ho * 2, bandHN, ho * 2)) then
 			return false
 		end
-		-- 3. nothing in the column up to standHeight. NOT clearCap: the node only
-		--    has to agree on its POSTURE BAND, which is what `fitOf` reads, and
-		--    demanding 20 clear studs would refuse every indoor floor. The stored
-		--    clearance is the centre cast's own -- exact there, and at least
-		--    standHeight everywhere else in the node.
+		-- 3. the node has to AGREE WITH ITS CENTRE ON POSTURE. Not be open to the
+		--    sky -- that is what it used to ask, and it is the wrong question
+		--    anywhere with a ceiling.
+		--
+		--    `col` was standHeight flat. A crouch space HAS less than standHeight
+		--    of headroom and a prone space less than crouchHeight, by definition,
+		--    so the test could not be passed on that floor at all and every one of
+		--    those cells stayed 0.5 studs across: on case5 all 4474 prone cells
+		--    were k1, on case3 all 183 prone and all 283 crouch. A low room is not
+		--    a ragged one, and only its BORDER -- where the cover starts or stops
+		--    -- has any reason to be fine.
+		--
+		--    What the collapse actually owes is the claim `emit` makes: one
+		--    `clearance` for the node, read off ONE cast at its centre, and the
+		--    `fit` derived from it. So measure that clearance here, and ask the
+		--    box for the FLOOR OF THE CENTRE'S OWN BAND -- standHeight, crouch-
+		--    Height or minClearance -- rather than always the highest of the
+		--    three. No cell in the node can then be a worse posture than the
+		--    centre's.
+		--
+		--    THE CORNERS ARE SAMPLED TOO, for the other half of the claim. The box
+		--    is a lower bound and cannot prove a cell is not BETTER than the
+		--    centre, so a node straddling the lip of an overhang would collapse
+		--    and label open floor `crouch`. Four casts at the node's own corners,
+		--    all required to land in the same band, is what keeps the fine ring at
+		--    the edge of the cover and nowhere else. Sampling, not proof -- the
+		--    same standard the per-cell path holds itself to.
 		--
 		--    THE COLUMN FOLLOWS THE FACE. It used to be a world-axis box with a
 		--    flat bottom at the node centre's height, which is right only on level
@@ -896,7 +921,23 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 		--    rises and this box does not, so an overhang above a big node's uphill
 		--    edge on a steep face can be missed. Exact would be one vertical box
 		--    per strip across the gradient, k boxes instead of one.
-		local col = c.standHeight / math.max(math.abs(n.Y), 0.2)
+		local function clearanceAt(q: Vector3): number
+			local from = q + UP * 0.15
+			local hit = workspace:Raycast(from, UP * c.clearCap, filterAll)
+			local d = hit and hit.Distance or c.clearCap
+			local t = workspace:Raycast(from, UP * c.clearCap, rpTerrain)
+			if t and t.Distance < d then d = t.Distance end
+			return d
+		end
+		local fit = fitOf(clearanceAt(p), c)
+		local hc = h * 0.98
+		for _, sgn in ipairs(CORNERS) do
+			if fitOf(clearanceAt(p + u * (hc * sgn[1]) + v * (hc * sgn[2])), c) ~= fit then
+				return false
+			end
+		end
+		local need = (fit >= 3 and c.standHeight) or (fit == 2 and c.crouchHeight) or c.minClearance
+		local col = need / math.max(math.abs(n.Y), 0.2)
 		if not clearBox(CFrame.fromMatrix(p + n * (bandLoN + col * 0.5), u, n),
 			Vector3.new(ho * 2, col, ho * 2)) then
 			return false
