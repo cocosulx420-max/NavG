@@ -197,14 +197,22 @@ end
 --
 -- Overlap queries need none of this -- they return a LIST, so exactness is
 -- restored by skipping what is not in `set`.
--- ONLY WORTH IT ON A LONG LIST, and the crossover was measured rather than
--- guessed. Under a few hundred entries the Include list is already ~1-5us and the
--- root filter's membership tests and re-casts cost more than they save: case5,
--- 155 parts, went 7.76s -> 17.68s on the root filter, while case6's 15772 parts
--- are the case the whole thing exists for. So a short list keeps the exact filter
--- it always had and `cast` is a plain raycast; `set` is still returned, and the
--- membership guards at the call sites stay in, because with an Include list of
--- `parts` every candidate is in `set` anyway and the lookup is free.
+-- ONLY WORTH IT ON A LONG LIST. The measured curve is the whole argument: a ray
+-- costs 0.95us against a 1-entry filter, 1.76us at 100, 5.5us at 500, 169us at
+-- 2000 and 527us at 18197. Below a few hundred entries there is simply nothing
+-- to win, and the root filter is not free -- it admits everything under the root,
+-- so every call site pays a membership test and `cast` can drop into its re-cast
+-- path. case6's 15772 parts are what this exists for; case5's 155 are not.
+--
+-- So a short list keeps the exact filter it always had and `cast` is a plain
+-- raycast. `set` is still returned and the membership guards stay in at every
+-- call site: on the short path every lookup answers true and costs nothing.
+--
+-- (An earlier version of this comment claimed the root filter took case5 from
+-- 7.76s to 17.68s. That was a measurement error -- both bakes were timed in one
+-- script, and a second bake in the same script is always slower. Measured one
+-- per call, case5 is 7.04s before and 6.92s after. The threshold is kept on the
+-- argument above, not on that number.)
 Floor.bigFilter = 1000
 
 function Floor.bakeFilter(parts: {BasePart}, root: Instance?)
