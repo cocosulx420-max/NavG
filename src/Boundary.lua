@@ -348,8 +348,28 @@ function Boundary.faces(data: any)
 						local list = out[r]
 						if not list then list = {}; out[r] = list end
 						local o = (u * d[1] + v * d[2])
-						local ctr = cell.pos + o * (step / 2)
 						local t = up:Cross(o)
+						-- A FACE IS THE CELL'S OWN EDGE, not a step-sized stub at its
+						-- centre. This emitted `step` wide, offset `step / 2` out, for
+						-- every cell whatever its size -- so a 2-stud node put a 0.5
+						-- stud face a quarter of a stud from its middle, buried inside
+						-- itself, nowhere near the edge it was meant to describe.
+						--
+						-- It went unseen because the collapse halo keeps nearly every
+						-- border cell one step across, where the two are the same
+						-- thing. Where a coarse node DOES reach a rim -- case5's floor
+						-- around the rotated planks -- the rim came out as stubs that
+						-- could not chain: three loops left open, each missing about
+						-- eight studs, and `bridge` rightly refused to invent them.
+						--
+						-- `o` runs along u for bits 1 and 3 and along v for 2 and 4, and
+						-- `t` is the other axis, so the offset takes that side's half
+						-- width and the face takes the other's. Identical for a one-step
+						-- cell, where su == sv == step.
+						local su, sv = cell.su or step, cell.sv or step
+						local outHalf = (d[1] ~= 0) and su * 0.5 or sv * 0.5
+						local alongHalf = (d[1] ~= 0) and sv * 0.5 or su * 0.5
+						local ctr = cell.pos + o * outHalf
 						local m = bit32.lshift(1, bit - 1)
 						local kind = (bit32.band(em, m) ~= 0 and "edge")
 							or (bit32.band(wm, m) ~= 0 and "wall")
@@ -358,8 +378,8 @@ function Boundary.faces(data: any)
 						stats.faces += 1
 						any = true
 						list[#list + 1] = {
-							a = ctr - t * (step / 2),
-							b = ctr + t * (step / 2),
+							a = ctr - t * alongHalf,
+							b = ctr + t * alongHalf,
 							up = up, cell = cell, kind = kind, dir = bit,
 						}
 					end
