@@ -174,52 +174,76 @@ function Floor.hasTerrain(cfg: Config?): boolean
 	return false
 end
 
+-- A FILTER LIST IS SCANNED PER QUERY, SO ITS LENGTH IS THE COST OF THE QUERY.
+--
+-- Measured on case6, one raycast against an Include filter: 0.95us with 1 entry
+-- in the list, 1.76us at 100, 5.5us at 500, 169us at 2000, 527us at 18197. Every
+-- hot query in this pipeline filtered on the full part list, and that one number
+-- was most of the bake -- Floor.extract's own comment already recorded the
+-- symptom without naming the cause ("about 264 microseconds" a column, 1,017,217
+-- of them, 268 seconds). The geometry in a column is a fraction of a microsecond.
+--
+-- So filter by the ROOT, which is ONE entry, and re-establish exactness in Lua.
+-- `RespectCanCollide` reproduces gatherParts' CanCollide rule for free; what is
+-- left is the handful the root admits and the gather rejects -- on case6 exactly
+-- 49 of 15821, being 44 character parts and 5 oversize slabs.
+--
+-- `cast` re-casts from the SAME origin with the rejected instances excluded,
+-- rather than nudging the origin past them. Nudging cost 18 of case6's 298549
+-- surfels: a decoration lying flush on a floor puts a non-bake surface and a bake
+-- surface at the same point, and stepping even 1e-3 past the first skips the
+-- second. Excluding by identity cannot skip anything, and the RaycastResult comes
+-- back untouched, so `Distance` needs no repair.
+--
+-- Overlap queries need none of this -- they return a LIST, so exactness is
+-- restored by skipping what is not in `set`.
+function Floor.bakeFilter(parts: {BasePart}, root: Instance?)
+	local set: { [Instance]: boolean } = {}
+	for _, p in ipairs(parts) do set[p] = true end
+	local scope = root or workspace
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Include
+	rp.FilterDescendantsInstances = { scope }
+	rp.RespectCanCollide = true
+	local op = OverlapParams.new()
+	op.FilterType = Enum.RaycastFilterType.Include
+	op.FilterDescendantsInstances = { scope }
+	op.RespectCanCollide = true
+
+	-- Reused across the cold path so a rejected hit costs no allocation.
+	local rpEx = RaycastParams.new()
+	rpEx.FilterType = Enum.RaycastFilterType.Exclude
+	rpEx.RespectCanCollide = true
+
+	local function cast(origin: Vector3, dir: Vector3)
+		local res = workspace:Raycast(origin, dir, rp)
+		if not res then return nil end
+		if set[res.Instance] then return res end
+		-- Cold: the nearest thing in front of us is not part of the bake. Exclude it
+		-- by IDENTITY and ask again from the same origin, so a bake surface sharing
+		-- that exact point is still found. Exclude mode also admits parts outside
+		-- the root, which are rejected the same way and converge out.
+		local ex = { res.Instance }
+		for _ = 1, 32 do
+			rpEx.FilterDescendantsInstances = ex
+			res = workspace:Raycast(origin, dir, rpEx)
+			if not res then return nil end
+			if set[res.Instance] then return res end
+			ex[#ex + 1] = res.Instance
+		end
+		return nil
+	end
+
+	return { set = set, rp = rp, op = op, cast = cast }
+end
+
 -- Extract surfels from a prebuilt SVO over `parts`.
 function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 	local c = merged(cfg)
 
-	-- A FILTER LIST IS SCANNED PER QUERY, SO ITS LENGTH IS THE COST OF THE QUERY.
-	-- Measured on case6, one raycast: 0.95us with 1 entry in the list, 1.76us at
-	-- 100, 5.5us at 500, 169us at 2000, 527us at 18197 -- and this list held every
-	-- part of the map. That single number was most of the bake. The comment above
-	-- says a column costs "about 264 microseconds"; the geometry in a column is a
-	-- fraction of one, and the rest was the engine walking a 15773-entry filter.
-	--
-	-- So filter by the ROOT -- one entry -- and re-establish exactness in Lua.
-	-- `RespectCanCollide` reproduces gatherParts' CanCollide rule for free, and on
-	-- case6 that leaves just 49 parts the root admits and the gather rejects (44
-	-- character parts, 5 oversize slabs), so the re-cast below is a cold path.
-	local bake: { [Instance]: boolean } = {}
-	for _, p in ipairs(parts) do bake[p] = true end
-	local rp = RaycastParams.new()
-	rp.FilterType = Enum.RaycastFilterType.Include
-	rp.FilterDescendantsInstances = { c.root or workspace }
-	rp.RespectCanCollide = true
-
-	-- Nearest hit that is actually part of the bake. Anything else is stepped past
-	-- and the ray continues, which is exactly what an Include list of `parts`
-	-- did -- it let the ray through. `Distance` is rebuilt against the ORIGINAL
-	-- origin so callers cannot tell the difference.
-	local function castBake(origin: Vector3, dir: Vector3)
-		local len = dir.Magnitude
-		if len < 1e-6 then return nil end
-		local unit = dir / len
-		local travelled = 0
-		for _ = 1, 16 do
-			local res = workspace:Raycast(origin + unit * travelled, unit * (len - travelled), rp)
-			if not res then return nil end
-			if bake[res.Instance] then
-				if travelled == 0 then return res end
-				return {
-					Instance = res.Instance, Position = res.Position, Normal = res.Normal,
-					Material = res.Material, Distance = travelled + res.Distance,
-				}
-			end
-			travelled += res.Distance + 1e-3
-			if travelled >= len then return nil end
-		end
-		return nil
-	end
+	-- See Floor.bakeFilter: the filter list length IS the cost of the query.
+	local bf = Floor.bakeFilter(parts, c.root)
+	local bake, rp, castBake = bf.set, bf.rp, bf.cast
 
 	-- Embedded-origin probe: a thin invisible part spanning [0.1, minClearance]
 	-- above each candidate, tested with precise GetPartsInPart (see clearance
@@ -230,12 +254,7 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 	probe.Anchored = true; probe.CanCollide = false; probe.CanQuery = false; probe.CanTouch = false
 	probe.Transparency = 1
 	probe.Parent = workspace
-	-- Same reasoning, and easier: an overlap query returns a LIST, so exactness is
-	-- restored by skipping what is not in the bake -- no re-cast needed.
-	local op = OverlapParams.new()
-	op.FilterType = Enum.RaycastFilterType.Include
-	op.FilterDescendantsInstances = { c.root or workspace }
-	op.RespectCanCollide = true
+	local op = bf.op
 	-- nil when the bake root has no terrain over it, which makes every terrain
 	-- cast below a no-op rather than a query. See Floor.hasTerrain.
 	local rpTerrain = nil
