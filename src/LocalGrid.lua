@@ -1110,10 +1110,27 @@ function LocalGrid.pruneNarrow(data: any, cfg: Config?)
 					for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
 						local q = e.cell.pos
 						local dx, dz = q.X - p.X, q.Z - p.Z
-						if (dx * dx + dz * dz <= r2 or cellCovers(e.g, e.cell, p))
-							and math.abs(q.Y - p.Y) <= tol then
-							found = true
-							break
+						-- A COARSE NODE IS A PLANE, NOT A POINT. `cellCovers` proves
+						-- p is inside the node's footprint, but the flush test then
+						-- compared p against the node's CENTRE height, which on a
+						-- slope is not the surface height at p: half of a 2 stud node
+						-- on case5's 26.5 degree ClipRamp is 0.5 studs of rise against
+						-- a 0.3 flushTol, so the node refused to hold up the very
+						-- cells it abuts and the ramp lost its outer two columns to
+						-- the narrow prune. Evaluate the node's own plane at p
+						-- instead. Dead code on a uniform lattice, where `cellCovers`
+						-- is always false and this is the centre it always was.
+						local covers = cellCovers(e.g, e.cell, p)
+						if covers or dx * dx + dz * dz <= r2 then
+							local qy = q.Y
+							local nrm = covers and e.cell.normal
+							if nrm and math.abs(nrm.Y) > 1e-3 then
+								qy -= ((p.X - q.X) * nrm.X + (p.Z - q.Z) * nrm.Z) / nrm.Y
+							end
+							if math.abs(qy - p.Y) <= tol then
+								found = true
+								break
+							end
 						end
 					end
 					if found then break end
