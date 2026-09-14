@@ -98,6 +98,11 @@ local VALIDATE = {
 	floorDrop = 1.8,
 }
 
+-- A CLOSED RING ENCLOSING LESS THAN THIS IS NOT A BOUNDARY, it is debris.
+-- Squared studs, and a tenth of one 0.5-stud cell -- far under any hole a real
+-- lattice can describe, so nothing real is ever this small.
+Pipeline.degenArea = 0.05
+
 Pipeline.debugName = "NVGN_Debug"
 -- An ABSOLUTE location, not `script.Parent`. The module is routinely required
 -- from a throwaway clone to get past Luau's require cache, and a stamp written
@@ -400,7 +405,7 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 
 	local out = {}
 	local stats = { loops = 0, open = 0, raw = 0, corners = 0,
-		holesHeld = 0, rescued = 0, collapsed = 0,
+		holesHeld = 0, rescued = 0, collapsed = 0, degenerate = 0,
 		edges = 0, wallEdges = 0, openEdges = 0, mixedEdges = 0, inventedEdges = 0,
 		closedBy = { merge = 0, intersect = 0, straight = 0, ["already closed"] = 0 } }
 
@@ -416,6 +421,22 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 			local poly, up, faceOf = polyline(entry, L, step)
 			local rawArea = ringArea(poly, up)
 			local isHole = L.closed and rawArea < 0
+
+			-- A CLOSED RING THAT ENCLOSES NOTHING IS NOT A BOUNDARY. `Boundary.chain`
+			-- can close a walk over coincident faces -- the small-region collapse,
+			-- where a couple of border cells yield two edges lying on top of one
+			-- another -- and what comes back is a ring of zero area.
+			--
+			-- It survived because the rescue below is gated on `rawArea > 1e-6`, so
+			-- the one case it most needed to catch was the one case it skipped.
+			-- case5 shipped 14 of these as ONE-POINT rings, each of them a CDT
+			-- complaint and a polygon describing no floor. Dropping one removes
+			-- nothing by definition: it encloses no area. Counted, so the loss stays
+			-- visible instead of becoming a gap in the loop numbering.
+			if L.closed and math.abs(rawArea) <= Pipeline.degenArea then
+				stats.degenerate += 1
+				continue
+			end
 
 			-- `ri` is the third return: the raw node each finished corner came
 			-- from. Threaded rather than recovered, because collapseBevels can
@@ -456,6 +477,14 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 						stats.collapsed += 1
 					end
 				end
+			end
+
+			-- And again after simplification: the tight retry above can still fail
+			-- to keep three corners, and `stats.collapsed` only COUNTED that while
+			-- emitting the ring anyway. Fewer than three corners is not a polygon.
+			if L.closed and (#pts < 3 or math.abs(ringArea(pts, up)) <= Pipeline.degenArea) then
+				stats.degenerate += 1
+				continue
 			end
 
 			local closed, method = L.closed, nil
