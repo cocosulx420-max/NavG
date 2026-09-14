@@ -1120,10 +1120,16 @@ function LocalGrid.pruneNarrow(data: any, cfg: Config?)
 						-- the narrow prune. Evaluate the node's own plane at p
 						-- instead. Dead code on a uniform lattice, where `cellCovers`
 						-- is always false and this is the centre it always was.
-						local covers = cellCovers(e.g, e.cell, p)
-						if covers or dx * dx + dz * dz <= r2 then
+						-- The centre-proximity test stays FIRST and unchanged: it is
+						-- the answer for every one-step cell, which is nearly all of
+						-- them, and `cellCovers` is only asked when it has failed.
+						if dx * dx + dz * dz <= r2 and math.abs(q.Y - p.Y) <= tol then
+							found = true
+							break
+						end
+						if cellCovers(e.g, e.cell, p) then
+							local nrm = e.cell.normal
 							local qy = q.Y
-							local nrm = covers and e.cell.normal
 							if nrm and math.abs(nrm.Y) > 1e-3 then
 								qy -= ((p.X - q.X) * nrm.X + (p.Z - q.Z) * nrm.Z) / nrm.Y
 							end
