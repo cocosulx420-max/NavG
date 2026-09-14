@@ -171,36 +171,50 @@ LocalGrid.cellBudget = 4000
 -- Widest collapsed node, in CELLS, and a power of two so the descent bottoms out
 -- at exactly one cell.
 --
--- 4, and the measurement is why. Timing fromFloor on case5 against the same
--- stage 1-3 output, with the floor each one actually covers:
+-- 16. It was 4 for most of this module's life, and the reason was sound at the
+-- time: 8 and 16 covered 200114 of case5's 200498 slots, so they lost floor, and
+-- 4 was the largest node that reproduced it exactly.
 --
---     K=1   46.88s   200498 cells   covers 200498
---     K=2   29.81s    87926 cells   covers 200498
---     K=4   19.35s    62603 cells   covers 200498
---     K=8   16.90s    57563 cells   covers 200114
---     K=16  16.36s    56675 cells   covers 200114
+-- THAT LOSS WAS A BUG, NOT A PROPERTY OF BIG NODES. `pruneNarrow` compared a
+-- probe point against a covering node's CENTRE height, which on a slope is not
+-- the surface height there, so the wider the node the more of case5's ClipRamp
+-- it pruned as narrow. Fixed; every K now reproduces the floor exactly, measured
+-- as a slot-for-slot diff rather than as an area.
 --
--- 4 is the largest node that still reproduces the floor EXACTLY. 8 and 16 buy
--- three more points of speed and pay 384 cells and a broken loop for them, which
--- is the wrong trade for a stage whose output everything downstream describes.
-LocalGrid.maxNodeCells = 4
+-- On case5, bake against the uniform lattice: K=1 31.1s / 200498 cells,
+-- K=4 8.1s / 45035, K=16 7.2s / 38159. On case3 the difference between 4 and 16
+-- is inside the noise -- it is a small dense map and finds only 19 nodes of 8
+-- cells -- so 16 costs nothing there and pays on open ground.
+LocalGrid.maxNodeCells = 16
 
--- PROTOTYPE, OFF BY DEFAULT. Collapse faces that are NOT blocks.
+-- Collapse faces that are NOT blocks. ON, and it is the difference between the
+-- adaptive grid earning its keep on a dense map and doing nothing there.
 --
--- `collapseOK` is restricted to block faces because a block hands it two things
+-- `collapseOK` was restricted to block faces because a block hands it two things
 -- for free: `supportHalf` is the real edge of the floor, so the extent test is
 -- exact, and the face is flat, so one centre raycast speaks for every cell in
 -- the node. On a mesh or a union `supportHalf` is the BOUNDING BOX -- it claims
 -- floor across the opening of an arch -- and the surface can curve or step.
 --
--- With this on, both are MEASURED instead: `faceIsWhole` fires one down-ray per
--- lattice cell across the node and its halo and demands every one land on this
--- part, agree on normal within `faceAngle`, and be coplanar within `flushTol`.
--- That is the resolution the per-cell path itself works at, so nothing wider
--- than a cell can hide -- but it is a SAMPLE where the block path has a PROOF,
--- and a hole narrower than a cell would be missed. That is the whole reason it
--- is a flag and not the default.
-LocalGrid.collapseShaped = false
+-- Both are MEASURED instead: `faceIsWhole` fires one down-ray per lattice cell
+-- across the node and its halo and demands every one land on this part, agree on
+-- normal within `faceAngle`, and be coplanar within `flushTol`. Affordable only
+-- because those rays are cached and are the same rays `emit` is about to fire,
+-- so a REFUSED collapse costs almost nothing.
+--
+-- case3 is the map that shows it, being two thirds mesh and union floor:
+-- 1.30s / 7961 cells with this off, 1.07s / 4826 with it on -- 20% off the bake
+-- where blocks-only bought 2%. case5, with only 1260 mesh cells, moves 3%.
+-- Both reproduce the uniform lattice slot for slot, gaining nothing and losing
+-- nothing, with no posture relabelled.
+--
+-- THE ONE THING TO KNOW: this is a SAMPLE at cell resolution where the block
+-- path has a PROOF. Nothing wider than a cell can hide, but a hole NARROWER than
+-- a cell -- grating, a slotted mesh floor, a lattice railing underfoot -- would
+-- be missed and a node would span it. Neither test map has such geometry, so
+-- the zeros above are evidence and not proof. Bake a perforated map against
+-- `collapseShaped = false` before trusting it on one.
+LocalGrid.collapseShaped = true
 
 -- the four corners of a node, as (u, v) signs
 local CORNERS = { { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 } }
