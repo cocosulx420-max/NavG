@@ -748,9 +748,6 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 			math.abs(x.Y) * h.X + math.abs(y.Y) * h.Y + math.abs(z.Y) * h.Z,
 			math.abs(x.Z) * h.X + math.abs(y.Z) * h.Y + math.abs(z.Z) * h.Z)
 	end
-	-- orientation only, for sizing a footprint in the grid's own frame
-	local faceRot = CFrame.fromMatrix(Vector3.zero, u, n)
-
 	-- A BOUNDING BOX IS NOT GEOMETRY, and this test used to treat it as one:
 	-- anything `GetPartBoundsInBox` returned refused the collapse. That is a
 	-- broadphase query -- it reports every part whose AXIS-ALIGNED BOUNDS meet
@@ -874,13 +871,34 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 		--    clearance is the centre cast's own -- exact there, and at least
 		--    standHeight everywhere else in the node.
 		--
-		--    This one stays WORLD-AXIS on purpose: clearance is measured along UP,
-		--    so the column is the node's footprint projected onto the world axes,
-		--    not a box in the face's frame.
-		local col = c.standHeight
-		local fh = aabbHalf(faceRot, Vector3.new(ho * 2, 0, ho * 2))
-		if not clearBox(CFrame.new(p + UP * (col * 0.5)),
-			Vector3.new(fh.X * 2, col, fh.Z * 2)) then
+		--    THE COLUMN FOLLOWS THE FACE. It used to be a world-axis box with a
+		--    flat bottom at the node centre's height, which is right only on level
+		--    floor: over a tilted face the floor rises across the footprint, so the
+		--    uphill end of that box sat UNDERGROUND. On case5's 26.5 degree
+		--    ClipRamp the bottom dug 0.33 / 0.45 / 0.67 / 1.12 / 2.01 studs under
+		--    the floor for a node of 1 / 2 / 4 / 8 / 16 cells, and what it found
+		--    down there was the staircase the clip ramp is laid over -- a tread
+		--    0.71 studs BELOW the walking surface, with five clear studs over the
+		--    node's head. Every column refusal on every ramp was a stair block,
+		--    and the two 45 degree ramps, where the wedge is as deep as the node is
+		--    wide, collapsed nothing at all: 3480 cells that are one flat plane.
+		--
+		--    Aligned to `n` the bottom face lies ON the floor everywhere, so the
+		--    box can only ever hold space above it.
+		--
+		--    SCALED BY 1/|n.Y|, because a horizontal ceiling `v` studs up sits
+		--    `v / |n.Y|` away along the normal: at standHeight the box would reach
+		--    only standHeight * |n.Y| vertically -- 3.54 studs at 45 degrees -- and
+		--    a node could claim `stand` over a cell that is really crouch. Free on
+		--    case5, which reproduces the same node counts either way.
+		--
+		--    Still an approximation: a true vertical prism leans in-plane as it
+		--    rises and this box does not, so an overhang above a big node's uphill
+		--    edge on a steep face can be missed. Exact would be one vertical box
+		--    per strip across the gradient, k boxes instead of one.
+		local col = c.standHeight / math.max(math.abs(n.Y), 0.2)
+		if not clearBox(CFrame.fromMatrix(p + n * (bandLoN + col * 0.5), u, n),
+			Vector3.new(ho * 2, col, ho * 2)) then
 			return false
 		end
 		-- 4. terrain is invisible to a bounds query, so a hit forces the exact
