@@ -1072,6 +1072,17 @@ function LocalGrid.pruneNarrow(data: any, cfg: Config?)
 		-- Shifting the anchor to the centre of the cell's first sub-cell puts the
 		-- probes back on centres. Zero shift for a one-step cell, so unchanged.
 		local function standable(u: Vector3, v: Vector3, cell: Cell): boolean
+			-- A NODE AN AGENT WIDE IS STANDABLE BY CONSTRUCTION. `collapseOK`
+			-- already proved the node and a one-cell halo are one uninterrupted
+			-- piece of this part's face, so a footprint fits inside it and no
+			-- probing can say otherwise. Without this the window is sized to the
+			-- AGENT but anchored on the node's first sub-cell, so for a node wider
+			-- than the agent it never reaches the node's own middle and judges it
+			-- on ground outside its corner: at maxNodeCells 8 that deleted six
+			-- whole 4-stud nodes, 384 cells, and broke a loop.
+			if cell.su and cell.su >= c.minWidth and cell.sv and cell.sv >= c.minWidth then
+				return true
+			end
 			local bu = cell.su and (cell.su - step) * 0.5 or 0
 			local bv = cell.sv and (cell.sv - step) * 0.5 or 0
 			local base = cell.pos - u * bu - v * bv
