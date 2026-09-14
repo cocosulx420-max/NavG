@@ -1162,6 +1162,31 @@ end
 -- uniform lattice this is dead code and the verdicts are bit-identical. A
 -- uniform cell's footprint lies inside the proximity radius anyway (half-diagonal
 -- 0.354 against a 0.375 reach), so it could never have added a match.
+-- THE SURFACE HEIGHT OF A CELL AT `p`, not the height of its centre.
+--
+-- Every flush test in this pipeline compares a probe point against a neighbouring
+-- cell's `pos.Y` within `flushTol` (0.3). That is exact while every cell is one
+-- step across and wrong the moment one is not: a coarse node is a PLANE, and its
+-- centre is not its height anywhere but the middle. Half of an 8-stud node on
+-- case5's 26.5 degree ramp is 2 studs of rise against a 0.3 tolerance, so the
+-- node fails the flush test from its own neighbours, the adjacency is missed, and
+-- a boundary face is emitted INSIDE continuous floor.
+--
+-- That is what took case5 from 80 boundary loops to 656 at maxNodeCells 16 --
+-- about 5.5 rings per region where there should be one -- and it is why a roof
+-- that is one rectangle came out as seventeen polygons.
+--
+-- Answers with the centre for a one-step cell, so a uniform lattice is unchanged.
+local function heightAt(g: any, cell: any, p: Vector3): number
+	local q = cell.pos
+	local su, sv = cell.su, cell.sv
+	if not su or not sv or (su <= g.step and sv <= g.step) then return q.Y end
+	local nrm = cell.normal
+	if not nrm or math.abs(nrm.Y) <= 1e-3 then return q.Y end
+	return q.Y - ((p.X - q.X) * nrm.X + (p.Z - q.Z) * nrm.Z) / nrm.Y
+end
+LocalGrid.heightAt = heightAt
+
 local function cellCovers(g: any, cell: any, p: Vector3): boolean
 	local su, sv = cell.su, cell.sv
 	if not su or not sv then return false end
@@ -1269,16 +1294,10 @@ function LocalGrid.pruneNarrow(data: any, cfg: Config?)
 							found = true
 							break
 						end
-						if cellCovers(e.g, e.cell, p) then
-							local nrm = e.cell.normal
-							local qy = q.Y
-							if nrm and math.abs(nrm.Y) > 1e-3 then
-								qy -= ((p.X - q.X) * nrm.X + (p.Z - q.Z) * nrm.Z) / nrm.Y
-							end
-							if math.abs(qy - p.Y) <= tol then
-								found = true
-								break
-							end
+						if cellCovers(e.g, e.cell, p)
+							and math.abs(heightAt(e.g, e.cell, p) - p.Y) <= tol then
+							found = true
+							break
 						end
 					end
 					if found then break end
@@ -1957,7 +1976,7 @@ function LocalGrid.regions(data: any, cfg: Config?)
 							local q = e.cell
 							local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
 							if (dx * dx + dz * dz <= r2 or cellCovers(e.g, q, p))
-								and math.abs(q.pos.Y - p.Y) <= tol
+								and math.abs(heightAt(e.g, q, p) - p.Y) <= tol
 								and cell.normal:Dot(q.normal) >= cosTol
 								and q.fit == cell.fit then
 								union(cell, q)

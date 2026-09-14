@@ -116,6 +116,26 @@ local function neighbourPos(g: any, cell: any, d: {number}): Vector3
 	return cell.pos + Vector3.new(ou, 0, ov)
 end
 
+-- Surface height of a cell AT `p`. Mirrors LocalGrid's helper of the same name --
+-- same test, same reasoning, and the same deliberate CENTRE for any cell still
+-- one step across, so a uniform lattice is bit-identical. Kept local like
+-- `cellCovers` below rather than imported, because this module does not require
+-- LocalGrid.
+--
+-- Without it a coarse node fails the flush test from its own neighbours on any
+-- slope -- half of an 8-stud node at 26.5 degrees is 2 studs of rise against a
+-- 0.3 tolerance -- so the adjacency is missed and a face is emitted inside
+-- continuous floor. case5 at maxNodeCells 16: 656 boundary loops over 119
+-- regions, against 80 loops over 77 regions on the uniform lattice.
+local function heightAt(g: any, cell: any, p: Vector3): number
+	local q = cell.pos
+	local su, sv = cell.su, cell.sv
+	if not su or not sv or (su <= g.step and sv <= g.step) then return q.Y end
+	local nrm = cell.normal
+	if not nrm or math.abs(nrm.Y) <= 1e-3 then return q.Y end
+	return q.Y - ((p.X - q.X) * nrm.X + (p.Z - q.Z) * nrm.Z) / nrm.Y
+end
+
 -- Does `p` fall inside this cell's own footprint? See LocalGrid.cellCovers --
 -- same test, same reasoning, and the same deliberate FALSE for any cell still
 -- one step across, so a uniform lattice is bit-identical.
@@ -265,7 +285,7 @@ function Boundary.faces(data: any)
 								local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
 								local dd = dx * dx + dz * dz
 								if (dd <= r2 or cellCovers(e.g, q, p))
-									and math.abs(q.pos.Y - p.Y) <= tol and dd < bd then
+									and math.abs(heightAt(e.g, q, p) - p.Y) <= tol and dd < bd then
 									bd = dd; found = q; fg = e.g
 								end
 							end
@@ -295,7 +315,7 @@ function Boundary.faces(data: any)
 							if q ~= cell and q.region == cell.region then
 								local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
 								if (dx * dx + dz * dz <= r2 or cellCovers(en.g, q, p))
-									and math.abs(q.pos.Y - p.Y) <= tol then
+									and math.abs(heightAt(en.g, q, p) - p.Y) <= tol then
 									local t = diag[cell]
 									if not t then t = {}; diag[cell] = t end
 									t[q] = true
