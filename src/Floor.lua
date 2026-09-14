@@ -40,7 +40,22 @@ local DEFAULT = {
 	maxSlope = 65,            -- max walkable slope (deg); Cocosulx-tested
 	agentHeight = 5,          -- reference stand height
 	clearCap = 20,            -- clearance raycast cap
-	maxGroundFootprint = 400, -- parts wider than this (baseplate) are excluded
+	-- OFF. It used to be 400, dropping any part wider than that on the theory that
+	-- a baseplate-scale slab was "handled analytically elsewhere" -- and nothing
+	-- anywhere did. Grep the repo: this number is read here and in FloorLocal, and
+	-- both only ever REJECT. So it was not an optimisation with a counterpart, it
+	-- was floor the navmesh silently did not have.
+	--
+	-- It was also the wrong shape of test. Keyed on max(X, Z), a 595 x 29 walkway
+	-- -- 17500 sq studs -- was condemned while a 399 x 399 slab of 159000 sq studs
+	-- sailed through, nine times the area.
+	--
+	-- The reason to have it at all was cost, and that reason is gone: the adaptive
+	-- grid collapses open floor into 8-stud nodes and the filter fix took a world
+	-- query from 527us to 1us, so a big flat part is now the CHEAPEST thing on the
+	-- map per stud rather than the most expensive. Set it to a number to bring the
+	-- rule back for one bake.
+	maxGroundFootprint = math.huge,
 	minClearance = 1.5,       -- headroom below this is dead space (crawl floor)
 }
 
