@@ -1490,6 +1490,14 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	local cbf = Floor.bakeFilter(data.parts or {}, data.config and data.config.root)
 	local bakeSet = cbf.set
 	local op, opAll = cbf.op, cbf.op
+	if not cbf.wide then
+		-- A short filter is the exact `parts` list, so every hit is in the bake and
+		-- the cap is safe again -- keep it, it is the cheaper query.
+		op = OverlapParams.new()
+		op.FilterType = Enum.RaycastFilterType.Include
+		op.FilterDescendantsInstances = data.parts or {}
+		op.MaxParts = 1
+	end
 	local box = Instance.new("Part")
 	box.Name = "NVGN_WallProbe"
 	box.Size = Vector3.new(c.step * 0.9, PROBE_HEIGHT, PROBE_DEPTH)

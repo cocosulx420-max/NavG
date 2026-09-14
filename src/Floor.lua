@@ -197,18 +197,37 @@ end
 --
 -- Overlap queries need none of this -- they return a LIST, so exactness is
 -- restored by skipping what is not in `set`.
+-- ONLY WORTH IT ON A LONG LIST, and the crossover was measured rather than
+-- guessed. Under a few hundred entries the Include list is already ~1-5us and the
+-- root filter's membership tests and re-casts cost more than they save: case5,
+-- 155 parts, went 7.76s -> 17.68s on the root filter, while case6's 15772 parts
+-- are the case the whole thing exists for. So a short list keeps the exact filter
+-- it always had and `cast` is a plain raycast; `set` is still returned, and the
+-- membership guards at the call sites stay in, because with an Include list of
+-- `parts` every candidate is in `set` anyway and the lookup is free.
+Floor.bigFilter = 1000
+
 function Floor.bakeFilter(parts: {BasePart}, root: Instance?)
 	local set: { [Instance]: boolean } = {}
 	for _, p in ipairs(parts) do set[p] = true end
 	local scope = root or workspace
+	local wide = #parts > Floor.bigFilter
+
 	local rp = RaycastParams.new()
 	rp.FilterType = Enum.RaycastFilterType.Include
-	rp.FilterDescendantsInstances = { scope }
-	rp.RespectCanCollide = true
+	rp.FilterDescendantsInstances = wide and { scope } or parts
+	rp.RespectCanCollide = wide
 	local op = OverlapParams.new()
 	op.FilterType = Enum.RaycastFilterType.Include
-	op.FilterDescendantsInstances = { scope }
-	op.RespectCanCollide = true
+	op.FilterDescendantsInstances = wide and { scope } or parts
+	op.RespectCanCollide = wide
+
+	if not wide then
+		return { set = set, rp = rp, op = op, wide = false,
+			cast = function(origin: Vector3, dir: Vector3)
+				return workspace:Raycast(origin, dir, rp)
+			end }
+	end
 
 	-- Reused across the cold path so a rejected hit costs no allocation.
 	local rpEx = RaycastParams.new()
@@ -234,7 +253,7 @@ function Floor.bakeFilter(parts: {BasePart}, root: Instance?)
 		return nil
 	end
 
-	return { set = set, rp = rp, op = op, cast = cast }
+	return { set = set, rp = rp, op = op, cast = cast, wide = true }
 end
 
 -- Extract surfels from a prebuilt SVO over `parts`.
