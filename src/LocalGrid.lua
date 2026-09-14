@@ -185,6 +185,23 @@ LocalGrid.cellBudget = 4000
 -- is the wrong trade for a stage whose output everything downstream describes.
 LocalGrid.maxNodeCells = 4
 
+-- PROTOTYPE, OFF BY DEFAULT. Collapse faces that are NOT blocks.
+--
+-- `collapseOK` is restricted to block faces because a block hands it two things
+-- for free: `supportHalf` is the real edge of the floor, so the extent test is
+-- exact, and the face is flat, so one centre raycast speaks for every cell in
+-- the node. On a mesh or a union `supportHalf` is the BOUNDING BOX -- it claims
+-- floor across the opening of an arch -- and the surface can curve or step.
+--
+-- With this on, both are MEASURED instead: `faceIsWhole` fires one down-ray per
+-- lattice cell across the node and its halo and demands every one land on this
+-- part, agree on normal within `faceAngle`, and be coplanar within `flushTol`.
+-- That is the resolution the per-cell path itself works at, so nothing wider
+-- than a cell can hide -- but it is a SAMPLE where the block path has a PROOF,
+-- and a hole narrower than a cell would be missed. That is the whole reason it
+-- is a flag and not the default.
+LocalGrid.collapseShaped = false
+
 -- the four corners of a node, as (u, v) signs
 local CORNERS = { { 1, 1 }, { 1, -1 }, { -1, 1 }, { -1, -1 } }
 
@@ -495,6 +512,25 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 	local castH = 2 + dev
 	local castLen = castH + dev + 0.5
 
+	-- ONE DOWN-RAY PER LATTICE CELL, CACHED. `emit` needs it for every cell it
+	-- builds and `faceIsWhole` needs it for every position of a node and its
+	-- halo, and those are the same rays: a 4-cell node probes what its 2-cell
+	-- children probe, which is what their cells probe. Without the cache the
+	-- shaped path pays for the same position up to three times and then `emit`
+	-- pays a fourth. `workspace:Raycast` is deterministic, so caching cannot
+	-- change a verdict -- `false` is stored for a miss so it is not re-cast.
+	local surf: { [string]: any } = {}
+	local function probe(iu: number, iv: number)
+		local key = iu .. ":" .. iv
+		local hit = surf[key]
+		if hit == nil then
+			local q = corner + u * ((iu + 0.5) * step) + v * ((iv + 0.5) * step)
+			hit = workspace:Raycast(q + n * castH, -n * castLen, rpPart) or false
+			surf[key] = hit
+		end
+		return hit or nil
+	end
+
 	-- See LocalGrid.cellBudget. Counts positions VISITED, not cells kept: the
 	-- expensive part of a rejected position is the raycast it already paid for,
 	-- so counting survivors would leave a face that rejects everything with no
@@ -514,7 +550,12 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 		end
 		local span = k * step
 		local p = corner + u * ((iu + k * 0.5) * step) + v * ((iv + k * 0.5) * step)
-		local res = workspace:Raycast(p + n * castH, -n * castLen, rpPart)
+		local res
+		if k == 1 then
+			res = probe(iu, iv)
+		else
+			res = workspace:Raycast(p + n * castH, -n * castLen, rpPart)
+		end
 		if not res then return end
 		local slope = math.deg(math.acos(math.clamp(res.Normal:Dot(UP), -1, 1)))
 		if not ((slope <= c.maxSlope) or isClip(part)) then return end
@@ -735,7 +776,8 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 	-- union or a mesh satisfies neither -- its floor is an arbitrary subset of
 	-- its bounding rectangle and its surface can curve -- so those keep the
 	-- uniform path.
-	local canCollapse = isBlock(part)
+	local shaped = LocalGrid.collapseShaped and not isBlock(part)
+	local canCollapse = isBlock(part) or shaped
 	local uLimAll = math.min(uExt, supportHalf(part, u))
 	local vLimAll = math.min(vExt, supportHalf(part, v))
 	local bandLoN = 0.02
@@ -832,6 +874,25 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 			if hit ~= part and not isBlock(hit) and not isWedge(hit) then return false end
 		end
 		return not raysHitBox(meshes, cf, size)
+	end
+
+	-- Is the node and its halo one unbroken, flat piece of THIS face? Every
+	-- lattice cell has to answer yes, which is what replaces the two guarantees
+	-- a block's shape would have given. Runs LAST in `collapseOK`, after the
+	-- cheap box tests, because it is the expensive one -- and mostly free when it
+	-- fails, since the rays it casts are the ones `emit` is about to cast anyway.
+	local function faceIsWhole(iu: number, iv: number, k: number, p: Vector3): boolean
+		for a = -1, k do
+			for b = -1, k do
+				local res = probe(iu + a, iv + b)
+				if not res then return false end
+				if res.Normal:Dot(n) < cosFace then return false end
+				if math.abs((res.Position - p):Dot(n)) > c.flushTol then return false end
+				local sl = math.deg(math.acos(math.clamp(res.Normal:Dot(UP), -1, 1)))
+				if not ((sl <= c.maxSlope) or isClip(part)) then return false end
+			end
+		end
+		return true
 	end
 
 	local function collapseOK(iu: number, iv: number, k: number): boolean
@@ -945,6 +1006,8 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 		-- 4. terrain is invisible to a bounds query, so a hit forces the exact
 		--    path rather than being silently ignored.
 		if workspace:Raycast(p + n * 0.15, UP * col, rpTerrain) then return false end
+		-- 5. and on a face whose shape proves nothing, the surface itself.
+		if shaped and not faceIsWhole(iu, iv, k, p) then return false end
 		return true
 	end
 
