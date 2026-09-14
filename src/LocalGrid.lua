@@ -168,6 +168,23 @@ LocalGrid.partBudget = 25
 -- anything; it only decides where the pauses fall.
 LocalGrid.cellBudget = 4000
 
+-- Widest collapsed node, in CELLS, and a power of two so the descent bottoms out
+-- at exactly one cell.
+--
+-- 4, and the measurement is why. Timing fromFloor on case5 against the same
+-- stage 1-3 output, with the floor each one actually covers:
+--
+--     K=1   46.88s   200498 cells   covers 200498
+--     K=2   29.81s    87926 cells   covers 200498
+--     K=4   19.35s    62603 cells   covers 200498
+--     K=8   16.90s    57563 cells   covers 200114
+--     K=16  16.36s    56675 cells   covers 200114
+--
+-- 4 is the largest node that still reproduces the floor EXACTLY. 8 and 16 buy
+-- three more points of speed and pay 384 cells and a broken loop for them, which
+-- is the wrong trade for a stage whose output everything downstream describes.
+LocalGrid.maxNodeCells = 4
+
 local function fitOf(clearance: number, c: any): number
 	if clearance >= c.standHeight then return 3 end
 	if clearance >= c.crouchHeight then return 2 end
@@ -482,211 +499,329 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 	local onProgress = c.onProgress
 	local visited = 0
 
-	for iu = 0, nu - 1 do
-		for iv = 0, nv - 1 do
-			if onProgress then
-				visited += 1
-				if visited % LocalGrid.cellBudget == 0 then onProgress(visited, nil) end
-			end
-			local p = corner + u * ((iu + 0.5) * step) + v * ((iv + 0.5) * step)
-			local res = workspace:Raycast(p + n * castH, -n * castLen, rpPart)
-			if not res then continue end
-			local slope = math.deg(math.acos(math.clamp(res.Normal:Dot(UP), -1, 1)))
-			if not ((slope <= c.maxSlope) or isClip(part)) then continue end
-			-- This grid describes ONE face. Its lattice spans the part, so the ray
-			-- also lands on the part's other faces; without this those cells would
-			-- be built twice, once per face grid, and the duplicates would union
-			-- into regions of doubled size sitting on the same surface. A cell
-			-- more than faceAngle off this face belongs to another face, and that
-			-- face has a grid of its own to claim it.
-			if res.Normal:Dot(n) < cosFace then continue end
-			-- HEADROOM. Both of the probes this replaces could miss the solid
-			-- standing ON the cell, and case3 shipped `stand` nodes buried in
-			-- geometry because of it:
-			--
-			--   * a 0.05 needle through GetPartsInPart, which does not reliably
-			--     report a solid it sits inside -- it returned nothing for a
-			--     wooden pillar a 0.6 bounds box finds every time;
-			--   * an up-ray from 0.15 above the surface, which returns nothing
-			--     when that origin is INSIDE the cover. A pillar standing on
-			--     this floor and a slab whose underside IS the cell's plane both
-			--     swallow the origin, so the ray flew on and reported the next
-			--     thing up: 7.35 and 15.40 studs of "headroom" under solid.
-			--
-			-- Broad phase by bounds, because GetPartBoundsInBox is the one query
-			-- that sees every solid. Narrow phase per candidate, because bounds
-			-- alone would condemn the floor under an archway:
-			--
-			--   underside found  -> blocks only if it is inside the band
-			--   none, but the candidate occupies this column from above
-			--                    -> no underside above the cell means the cell is
-			--                       INSIDE it
-			--   neither          -> bounds overlap with nothing over the cell
-			-- THE WHOLE TILE, NOT ITS CENTRE COLUMN. A node is a place to stand,
-			-- so a wall that cuts any part of it deletes it. One centre sample
-			-- left 956 of case3's 9224 nodes standing in geometry -- every cell a
-			-- wall clipped without covering its middle.
-			-- THE BAND STARTS AT THE SURFACE, not at 0.1 above it. The 0.1
-			-- was a toe gap inherited from the needle probe, meant to keep the
-			-- probe off the floor it stands on -- but the grid's own part is
-			-- excluded by name anyway, so all the gap bought was a blind
-			-- sliver. A skirting plate 0.375 thick at the base of a wall,
-			-- 19 studs of it, rose 0.078 studs through the tread and sat
-			-- entirely inside that sliver: the nodes were visibly buried in it
-			-- and every probe reported clear.
-			local bandLo = 0.02
-			local bandH = c.minClearance - bandLo
-			-- CLIP THE TILE TO THE FACE IT SITS ON. The lattice rounds the cell
-			-- count up, so a tile at the rim overhangs the part by up to half a
-			-- step, and judging a node on that overhang judges it on floor it
-			-- does not own. A 1.75 stud stair tread is four rows deep and the
-			-- last row pokes 0.125 studs into the NEXT step: tested unclipped,
-			-- every tread lost its back row and pruneNarrow then took the whole
-			-- tread for being under minWidth. The stairs disappeared.
-			--
-			-- Clip to the PART, not to `uExt`/`vExt`: those are the lattice's
-			-- extents, already padded up to a whole number of steps (a 1.75 stud
-			-- tread reports 2.0), so clipping to them left the same 0.125 studs
-			-- of overhang and the same dead treads.
-			local du = (p - surfaceCenter):Dot(u)
-			local dv = (p - surfaceCenter):Dot(v)
-			local uLim = math.min(uExt, supportHalf(part, u))
-			local vLim = math.min(vExt, supportHalf(part, v))
-			local uLo = math.max(du - step * 0.5, -uLim)
-			local uHi = math.min(du + step * 0.5, uLim)
-			local vLo = math.max(dv - step * 0.5, -vLim)
-			local vHi = math.min(dv + step * 0.5, vLim)
-			local uW = math.max(uHi - uLo, 1e-3)
-			local vW = math.max(vHi - vLo, 1e-3)
-			local tileCtr = res.Position
-				+ u * ((uLo + uHi) * 0.5 - du)
-				+ v * ((vLo + vHi) * 0.5 - dv)
-			local hu, hv = uW * 0.49, vW * 0.49
-			local cols = {
-				tileCtr,
-				tileCtr + u * hu + v * hv,
-				tileCtr + u * hu - v * hv,
-				tileCtr - u * hu + v * hv,
-				tileCtr - u * hu - v * hv,
-			}
-			local tileCF = CFrame.fromMatrix(tileCtr + n * (bandLo + bandH * 0.5), u, n)
-			local tileSize = Vector3.new(uW, bandH, vW)
-			local killer: Instance? = nil
-			local probed, volHit = false, nil :: Instance?
-			for _, cand in ipairs(workspace:GetPartBoundsInBox(
-				CFrame.new(tileCtr + UP * (bandLo + bandH * 0.5)),
-				Vector3.new(uW, bandH, vW), op)) do
-				if cand ~= part then
-					if isBlock(cand) then
-						if boxOverlap(tileCF, tileSize, cand.CFrame, cand.Size) then
-							killer = cand
-							break
-						end
-						continue
+	-- Build ONE node covering cells [iu, iu+k-1] x [iv, iv+k-1]. k == 1 is the
+	-- ordinary cell and every test below runs exactly as it always has; k > 1 is
+	-- a collapsed interior node, reached only once `collapseOK` has PROVED that
+	-- nothing disturbs it, so the same tests all return the same answers over
+	-- the whole span.
+	local function emit(iu: number, iv: number, k: number)
+		if onProgress then
+			visited += k * k
+			if visited % LocalGrid.cellBudget < k * k then onProgress(visited, nil) end
+		end
+		local span = k * step
+		local p = corner + u * ((iu + k * 0.5) * step) + v * ((iv + k * 0.5) * step)
+		local res = workspace:Raycast(p + n * castH, -n * castLen, rpPart)
+		if not res then return end
+		local slope = math.deg(math.acos(math.clamp(res.Normal:Dot(UP), -1, 1)))
+		if not ((slope <= c.maxSlope) or isClip(part)) then return end
+		-- This grid describes ONE face. Its lattice spans the part, so the ray
+		-- also lands on the part's other faces; without this those cells would
+		-- be built twice, once per face grid, and the duplicates would union
+		-- into regions of doubled size sitting on the same surface. A cell
+		-- more than faceAngle off this face belongs to another face, and that
+		-- face has a grid of its own to claim it.
+		if res.Normal:Dot(n) < cosFace then return end
+		-- HEADROOM. Both of the probes this replaces could miss the solid
+		-- standing ON the cell, and case3 shipped `stand` nodes buried in
+		-- geometry because of it:
+		--
+		--   * a 0.05 needle through GetPartsInPart, which does not reliably
+		--     report a solid it sits inside -- it returned nothing for a
+		--     wooden pillar a 0.6 bounds box finds every time;
+		--   * an up-ray from 0.15 above the surface, which returns nothing
+		--     when that origin is INSIDE the cover. A pillar standing on
+		--     this floor and a slab whose underside IS the cell's plane both
+		--     swallow the origin, so the ray flew on and reported the next
+		--     thing up: 7.35 and 15.40 studs of "headroom" under solid.
+		--
+		-- Broad phase by bounds, because GetPartBoundsInBox is the one query
+		-- that sees every solid. Narrow phase per candidate, because bounds
+		-- alone would condemn the floor under an archway:
+		--
+		--   underside found  -> blocks only if it is inside the band
+		--   none, but the candidate occupies this column from above
+		--                    -> no underside above the cell means the cell is
+		--                       INSIDE it
+		--   neither          -> bounds overlap with nothing over the cell
+		-- THE WHOLE TILE, NOT ITS CENTRE COLUMN. A node is a place to stand,
+		-- so a wall that cuts any part of it deletes it. One centre sample
+		-- left 956 of case3's 9224 nodes standing in geometry -- every cell a
+		-- wall clipped without covering its middle.
+		-- THE BAND STARTS AT THE SURFACE, not at 0.1 above it. The 0.1
+		-- was a toe gap inherited from the needle probe, meant to keep the
+		-- probe off the floor it stands on -- but the grid's own part is
+		-- excluded by name anyway, so all the gap bought was a blind
+		-- sliver. A skirting plate 0.375 thick at the base of a wall,
+		-- 19 studs of it, rose 0.078 studs through the tread and sat
+		-- entirely inside that sliver: the nodes were visibly buried in it
+		-- and every probe reported clear.
+		local bandLo = 0.02
+		local bandH = c.minClearance - bandLo
+		-- CLIP THE TILE TO THE FACE IT SITS ON. The lattice rounds the cell
+		-- count up, so a tile at the rim overhangs the part by up to half a
+		-- step, and judging a node on that overhang judges it on floor it
+		-- does not own. A 1.75 stud stair tread is four rows deep and the
+		-- last row pokes 0.125 studs into the NEXT step: tested unclipped,
+		-- every tread lost its back row and pruneNarrow then took the whole
+		-- tread for being under minWidth. The stairs disappeared.
+		--
+		-- Clip to the PART, not to `uExt`/`vExt`: those are the lattice's
+		-- extents, already padded up to a whole number of steps (a 1.75 stud
+		-- tread reports 2.0), so clipping to them left the same 0.125 studs
+		-- of overhang and the same dead treads.
+		local du = (p - surfaceCenter):Dot(u)
+		local dv = (p - surfaceCenter):Dot(v)
+		local uLim = math.min(uExt, supportHalf(part, u))
+		local vLim = math.min(vExt, supportHalf(part, v))
+		local uLo = math.max(du - span * 0.5, -uLim)
+		local uHi = math.min(du + span * 0.5, uLim)
+		local vLo = math.max(dv - span * 0.5, -vLim)
+		local vHi = math.min(dv + span * 0.5, vLim)
+		local uW = math.max(uHi - uLo, 1e-3)
+		local vW = math.max(vHi - vLo, 1e-3)
+		local tileCtr = res.Position
+			+ u * ((uLo + uHi) * 0.5 - du)
+			+ v * ((vLo + vHi) * 0.5 - dv)
+		local hu, hv = uW * 0.49, vW * 0.49
+		local cols = {
+			tileCtr,
+			tileCtr + u * hu + v * hv,
+			tileCtr + u * hu - v * hv,
+			tileCtr - u * hu + v * hv,
+			tileCtr - u * hu - v * hv,
+		}
+		local tileCF = CFrame.fromMatrix(tileCtr + n * (bandLo + bandH * 0.5), u, n)
+		local tileSize = Vector3.new(uW, bandH, vW)
+		local killer: Instance? = nil
+		local probed, volHit = false, nil :: Instance?
+		for _, cand in ipairs(workspace:GetPartBoundsInBox(
+			CFrame.new(tileCtr + UP * (bandLo + bandH * 0.5)),
+			Vector3.new(uW, bandH, vW), op)) do
+			if cand ~= part then
+				if isBlock(cand) then
+					if boxOverlap(tileCF, tileSize, cand.CFrame, cand.Size) then
+						killer = cand
+						break
 					end
-					if isWedge(cand) then
-						if wedgeOverlap(tileCF, tileSize, cand) then
-							killer = cand
-							break
-						end
-						continue
+					continue
+				end
+				if isWedge(cand) then
+					if wedgeOverlap(tileCF, tileSize, cand) then
+						killer = cand
+						break
 					end
-					-- A mesh or a union has no box to test, so take the one
-					-- true positive that is cheap: GetPartsInPart misses solids
-					-- (that is what put nodes inside a pillar to begin with) but
-					-- it never invents one, so a hit here is a kill and a miss
-					-- falls through to the samples. Worth the call: it catches
-					-- the flare of a pillar base that all five columns thread.
-					if not probed then
-						probed = true
-						probe.Size = tileSize
-						probe.CFrame = tileCF
-						for _, h in ipairs(workspace:GetPartsInPart(probe, op)) do
-							if h ~= part then volHit = h; break end
-						end
+					continue
+				end
+				-- A mesh or a union has no box to test, so take the one
+				-- true positive that is cheap: GetPartsInPart misses solids
+				-- (that is what put nodes inside a pillar to begin with) but
+				-- it never invents one, so a hit here is a kill and a miss
+				-- falls through to the samples. Worth the call: it catches
+				-- the flare of a pillar base that all five columns thread.
+				if not probed then
+					probed = true
+					probe.Size = tileSize
+					probe.CFrame = tileCF
+					for _, h in ipairs(workspace:GetPartsInPart(probe, op)) do
+						if h ~= part then volHit = h; break end
 					end
-					if volHit then killer = volHit; break end
-					rpOne.FilterDescendantsInstances = { cand }
-					-- SWEEP THE TILE HORIZONTALLY. A vertical sample can only
-					-- miss a vertical wall, and a mesh panel 0.1 studs thick
-					-- threads all five columns: 72 case3 nodes stood inside
-					-- mesh walls that way. A ray ACROSS the tile crosses such a
-					-- panel whatever its thickness.
-					--
-					-- Fired from just outside each edge, and a hit counts only
-					-- if it lands strictly INSIDE the tile -- a wall flush with
-					-- the edge is what every floor does where it meets a wall,
-					-- and killing those is erosion, which is off.
-					local swept = false
-					for _, h in ipairs({ bandLo + 0.05, bandH * 0.5, bandH - 0.05 }) do
-						local base = tileCtr + n * h
-						for _, a in ipairs({ { u, uW }, { v, vW } }) do
-							local axis, w = a[1], a[2]
-							for _, sgn in ipairs({ 1, -1 }) do
-								local from = base - axis * sgn * (w * 0.5 + 0.05)
-								local hit = workspace:Raycast(from, axis * sgn * (w + 0.1), rpOne)
-								if hit then
-									local into = hit.Distance - 0.05
-									if into > 1e-3 and into < w - 1e-3 then
-										swept = true
-										break
-									end
+				end
+				if volHit then killer = volHit; break end
+				rpOne.FilterDescendantsInstances = { cand }
+				-- SWEEP THE TILE HORIZONTALLY. A vertical sample can only
+				-- miss a vertical wall, and a mesh panel 0.1 studs thick
+				-- threads all five columns: 72 case3 nodes stood inside
+				-- mesh walls that way. A ray ACROSS the tile crosses such a
+				-- panel whatever its thickness.
+				--
+				-- Fired from just outside each edge, and a hit counts only
+				-- if it lands strictly INSIDE the tile -- a wall flush with
+				-- the edge is what every floor does where it meets a wall,
+				-- and killing those is erosion, which is off.
+				local swept = false
+				for _, h in ipairs({ bandLo + 0.05, bandH * 0.5, bandH - 0.05 }) do
+					local base = tileCtr + n * h
+					for _, a in ipairs({ { u, uW }, { v, vW } }) do
+						local axis, w = a[1], a[2]
+						for _, sgn in ipairs({ 1, -1 }) do
+							local from = base - axis * sgn * (w * 0.5 + 0.05)
+							local hit = workspace:Raycast(from, axis * sgn * (w + 0.1), rpOne)
+							if hit then
+								local into = hit.Distance - 0.05
+								if into > 1e-3 and into < w - 1e-3 then
+									swept = true
+									break
 								end
 							end
-							if swept then break end
 						end
 						if swept then break end
 					end
-					if swept then killer = cand; break end
-					for _, p0 in ipairs(cols) do
-						local under = workspace:Raycast(p0 + UP * bandLo, UP * c.clearCap, rpOne)
-						local blocks
-						if under then
-							blocks = under.Distance + bandLo < c.minClearance
-						else
-							blocks = workspace:Raycast(p0 + UP * c.clearCap,
-								-UP * (c.clearCap - 0.05), rpOne) ~= nil
-						end
-						if blocks then killer = cand; break end
+					if swept then break end
+				end
+				if swept then killer = cand; break end
+				for _, p0 in ipairs(cols) do
+					local under = workspace:Raycast(p0 + UP * bandLo, UP * c.clearCap, rpOne)
+					local blocks
+					if under then
+						blocks = under.Distance + bandLo < c.minClearance
+					else
+						blocks = workspace:Raycast(p0 + UP * c.clearCap,
+							-UP * (c.clearCap - 0.05), rpOne) ~= nil
 					end
-					if killer then break end
+					if blocks then killer = cand; break end
 				end
+				if killer then break end
 			end
-			if killer then
-				kill(iu, iv, res.Position, killer)
-				continue
-			end
-			local upRes = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap, filterAll)
-			local clearance = upRes and upRes.Distance or c.clearCap
-			local cover: Instance? = upRes and upRes.Instance or nil
-			local tUp = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap, rpTerrain)
-			if tUp then
-				if tUp.Distance < clearance then
-					clearance = tUp.Distance
-					cover = workspace.Terrain
-				end
-			elseif workspace:Raycast(res.Position + UP * c.clearCap, -UP * (c.clearCap - 0.25), rpTerrain) then
-				clearance = 0
+		end
+		if killer then
+			kill(iu, iv, res.Position, killer)
+			return
+		end
+		local upRes = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap, filterAll)
+		local clearance = upRes and upRes.Distance or c.clearCap
+		local cover: Instance? = upRes and upRes.Instance or nil
+		local tUp = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), UP * c.clearCap, rpTerrain)
+		if tUp then
+			if tUp.Distance < clearance then
+				clearance = tUp.Distance
 				cover = workspace.Terrain
 			end
-			if clearance < c.minClearance then
-				kill(iu, iv, res.Position, cover)
-				continue
-			end
-			local cell: Cell = {
-				ui = iu, vi = iv, pos = res.Position, normal = res.Normal,
-				slope = slope, clearance = clearance, cover = cover,
-				-- The FOOTPRINT the kill test judged: the tile clipped to the
-				-- part. Kept so the drawing can show what was actually tested.
-				-- Without it the viz draws a full step tile for a rim cell and
-				-- the node appears to stand inside the wall it merely abuts,
-				-- which reads exactly like a bug in the kill test.
-				fpos = tileCtr, fu = uW, fv = vW,
-			}
-			grid.cells[#grid.cells + 1] = cell
-			grid.index[string.format("%d:%d", iu, iv)] = cell
+		elseif workspace:Raycast(res.Position + UP * c.clearCap, -UP * (c.clearCap - 0.25), rpTerrain) then
+			clearance = 0
+			cover = workspace.Terrain
+		end
+		if clearance < c.minClearance then
+			kill(iu, iv, res.Position, cover)
+			return
+		end
+		local cell: Cell = {
+			ui = iu, vi = iv, pos = res.Position, normal = res.Normal,
+			slope = slope, clearance = clearance, cover = cover,
+			-- The FOOTPRINT the kill test judged: the tile clipped to the
+			-- part. Kept so the drawing can show what was actually tested.
+			-- Without it the viz draws a full step tile for a rim cell and
+			-- the node appears to stand inside the wall it merely abuts,
+			-- which reads exactly like a bug in the kill test.
+			fpos = tileCtr, fu = uW, fv = vW,
+			-- How wide this node is. Absent on a plain cell would mean every
+			-- consumer has to know the grid's step, so it is always written;
+			-- `cellCovers` and the neighbour lookups key off it being > step.
+			su = span, sv = span,
+		}
+		grid.cells[#grid.cells + 1] = cell
+		grid.index[string.format("%d:%d", iu, iv)] = cell
+	end
+
+	-- ---- adaptive descent -------------------------------------------------
+	--
+	-- buildGrid is 78% of fromFloor and its cost is one batch of world queries
+	-- per lattice position, so a large flat face pays thousands of them to get
+	-- the same answer every time. Roughly nine tenths of a face is interior.
+	--
+	-- COLLAPSE IS PROVED, NOT SAMPLED. `GetPartBoundsInBox` is the one query the
+	-- kill test already trusts to see every solid (see the HEADROOM note above),
+	-- so running it over the WHOLE node's band and finding nothing but this part
+	-- proves that no geometry disturbs any cell inside it -- the same verdict
+	-- the per-cell tests would have reached, in one query instead of k*k. No
+	-- corner sampling is involved, and none would have been sound.
+	--
+	-- BLOCK FACES ONLY, and `isBlock` rather than `SVO.isBlockPart`: the face has
+	-- to BE the lattice rectangle for the extent test to be exact, and planar for
+	-- one centre raycast to speak for the whole node. A cylinder, a wedge, a
+	-- union or a mesh satisfies neither -- its floor is an arbitrary subset of
+	-- its bounding rectangle and its surface can curve -- so those keep the
+	-- uniform path.
+	local canCollapse = isBlock(part)
+	local uLimAll = math.min(uExt, supportHalf(part, u))
+	local vLimAll = math.min(vExt, supportHalf(part, v))
+	local bandLoN = 0.02
+	local bandHN = c.minClearance - bandLoN
+
+	-- World-axis half extents of an oriented box, so a bounds query over a node
+	-- on a tilted face cannot under-cover it.
+	local function aabbHalf(hu: number, hh: number, hv: number): Vector3
+		return Vector3.new(
+			math.abs(u.X) * hu + math.abs(n.X) * hh + math.abs(v.X) * hv,
+			math.abs(u.Y) * hu + math.abs(n.Y) * hh + math.abs(v.Y) * hv,
+			math.abs(u.Z) * hu + math.abs(n.Z) * hh + math.abs(v.Z) * hv)
+	end
+
+	local function clearBox(ctr: Vector3, half: Vector3): boolean
+		for _, cand in ipairs(workspace:GetPartBoundsInBox(CFrame.new(ctr), half * 2, op)) do
+			if cand ~= part then return false end
+		end
+		return true
+	end
+
+	local function collapseOK(iu: number, iv: number, k: number): boolean
+		if not canCollapse then return false end
+		if iu + k > nu or iv + k > nv then return false end
+		local span = k * step
+		local h = span * 0.5
+		-- EVERY TEST BELOW IS RUN OVER A ONE-CELL HALO, not over the node itself.
+		--
+		-- A coarse node emits ONE face per direction, spanning its whole edge, so
+		-- an edge that is half live floor and half killed strip has no right
+		-- answer: suppressing the face punches a hole in the boundary, emitting it
+		-- walls off floor that is there. The node has to be STRICTLY interior.
+		--
+		-- Proving the halo is clear and on the face proves every cell abutting the
+		-- node is live floor, so no edge of it can ever be exposed and it never
+		-- emits a face at all. That is what keeps the 0.5 ring at the border and
+		-- leaves Boundary's corner invariant untouched.
+		local ho = h + step
+		local p = corner + u * ((iu + k * 0.5) * step) + v * ((iv + k * 0.5) * step)
+		-- 1. the node AND its halo entirely over the part's own face. The lattice
+		--    rounds the cell count up, so a node at the rim would otherwise be
+		--    judged on floor the part does not own -- the trap the per-cell tile
+		--    clip already guards.
+		local du = (p - surfaceCenter):Dot(u)
+		local dv = (p - surfaceCenter):Dot(v)
+		if math.abs(du) + ho > uLimAll or math.abs(dv) + ho > vLimAll then return false end
+		-- 2. nothing standing in the headroom band over the node or its halo
+		if not clearBox(p + n * (bandLoN + bandHN * 0.5), aabbHalf(ho, bandHN * 0.5, ho)) then
+			return false
+		end
+		-- 3. nothing in the column up to standHeight. NOT clearCap: the node only
+		--    has to agree on its POSTURE BAND, which is what `fitOf` reads, and
+		--    demanding 20 clear studs would refuse every indoor floor. The stored
+		--    clearance is the centre cast's own -- exact there, and at least
+		--    standHeight everywhere else in the node.
+		local col = c.standHeight
+		local fh = aabbHalf(ho, 0, ho)
+		if not clearBox(p + UP * (col * 0.5), Vector3.new(fh.X, col * 0.5, fh.Z)) then
+			return false
+		end
+		-- 4. terrain is invisible to a bounds query, so a hit forces the exact
+		--    path rather than being silently ignored.
+		if workspace:Raycast(p + n * 0.15, UP * col, rpTerrain) then return false end
+		return true
+	end
+
+	local function descend(iu: number, iv: number, k: number)
+		if k == 1 then
+			if iu < nu and iv < nv then emit(iu, iv, 1) end
+			return
+		end
+		if collapseOK(iu, iv, k) then
+			emit(iu, iv, k)
+			return
+		end
+		local q = k // 2
+		descend(iu, iv, q)
+		descend(iu + q, iv, q)
+		descend(iu, iv + q, q)
+		descend(iu + q, iv + q, q)
+	end
+
+	local K = LocalGrid.maxNodeCells
+	for iu = 0, nu - 1, K do
+		for iv = 0, nv - 1, K do
+			descend(iu, iv, K)
 		end
 	end
+
 	return grid
 end
 
@@ -741,10 +876,42 @@ local function buildWorldIndex(grids: any)
 		if not b then b = {}; t[k] = b end
 		b[#b + 1] = v
 	end
+	-- A CELL GOES IN EVERY BUCKET IT COVERS, not just the one holding its centre.
+	--
+	-- Every lookup scans the 3x3 block of 1-stud buckets around the probe point,
+	-- which finds a 0.5 cell because its centre is never more than a stud away.
+	-- A coarse cell's centre can be four studs from its own edge, so bucketing it
+	-- by centre alone hides it from every cell it actually abuts -- and each one
+	-- then reports no neighbour and rings the node with a boundary it should not
+	-- have. Identical for a uniform cell, whose footprint spans one bucket.
+	local function pushCell(g: any, cell: any, v: any)
+		local su, sv = cell.su, cell.sv
+		if not su or not sv or (su <= g.step and sv <= g.step) then
+			push(live, cell.pos, v)
+			return
+		end
+		local hu, hv = su * 0.5, sv * 0.5
+		local gu = g.u or Vector3.xAxis
+		local gv = g.v or Vector3.zAxis
+		local ax = math.abs(gu.X) * hu + math.abs(gv.X) * hv
+		local az = math.abs(gu.Z) * hu + math.abs(gv.Z) * hv
+		local p = cell.pos
+		for bx = math.floor(p.X - ax), math.floor(p.X + ax) do
+			for bz = math.floor(p.Z - az), math.floor(p.Z + az) do
+				local k = bx .. ":" .. bz
+				local b = live[k]
+				if not b then b = {}; live[k] = b end
+				b[#b + 1] = v
+			end
+		end
+	end
+
 	for _, g in pairs(grids) do
 		-- `g` as well as `g.part`: a cell's footprint is measured in its own
 		-- grid's in-plane axes, and a coarse cell cannot be tested without them.
-		for _, cell in ipairs(g.cells) do push(live, cell.pos, { cell = cell, part = g.part, g = g }) end
+		for _, cell in ipairs(g.cells) do pushCell(g, cell, { cell = cell, part = g.part, g = g }) end
+		-- dead cells are always one step across: a node only collapses where
+		-- nothing kills it, so no coarse cell is ever killed.
 		for _, d in ipairs(g.dead) do push(dead, d.pos, { dead = d, part = g.part, g = g }) end
 	end
 	return live, dead
@@ -892,14 +1059,29 @@ function LocalGrid.pruneNarrow(data: any, cfg: Config?)
 		-- centred here fits, is what keeps the edge cells of a wide floor: their
 		-- footprint simply sits further in. The centred window is tried first
 		-- because that is the answer for open floor.
+		-- SAMPLE ON THE FINE LATTICE, WHATEVER SIZE THIS CELL IS.
+		--
+		-- The footprint is walked in `step` strides from the cell's position, which
+		-- for a one-step cell lands every probe exactly on a neighbouring cell's
+		-- CENTRE. A coarse cell's centre sits on a lattice VERTEX instead, so every
+		-- probe lands on a vertex too -- 0.354 studs from the nearest centre against
+		-- a 0.375 reach. Six percent of margin, which case5's rotated grids exceed
+		-- routinely: 15344 cells pruned against 560, and the cascade ran the pass
+		-- limit out at 8 instead of 2.
+		--
+		-- Shifting the anchor to the centre of the cell's first sub-cell puts the
+		-- probes back on centres. Zero shift for a one-step cell, so unchanged.
 		local function standable(u: Vector3, v: Vector3, cell: Cell): boolean
-			if footFits(u, v, cell.pos - u * (half * step) - v * (half * step)) then
+			local bu = cell.su and (cell.su - step) * 0.5 or 0
+			local bv = cell.sv and (cell.sv - step) * 0.5 or 0
+			local base = cell.pos - u * bu - v * bv
+			if footFits(u, v, base - u * (half * step) - v * (half * step)) then
 				return true
 			end
 			for a = 0, k - 1 do
 				for b = 0, k - 1 do
 					if (a ~= half or b ~= half)
-						and footFits(u, v, cell.pos - u * (a * step) - v * (b * step)) then
+						and footFits(u, v, base - u * (a * step) - v * (b * step)) then
 						return true
 					end
 				end

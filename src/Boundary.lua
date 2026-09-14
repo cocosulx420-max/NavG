@@ -64,7 +64,17 @@ local function liveRegions(data: any): { [number]: boolean }
 			if r and not out[r] then
 				local o = occ[r]
 				if not o then o = {}; occ[r] = o end
-				o[(cell.ui or 0) .. ":" .. (cell.vi or 0)] = true
+				-- EVERY INDEX THE CELL COVERS. The square below is counted in lattice
+				-- slots, so a coarse cell marking only its base index reads as a
+				-- scattering of lone slots -- and a region paved with them fails the
+				-- width gate and is never traced at all, however wide it really is.
+				local kc = math.max(1, math.floor((cell.su or step) / step + 0.5))
+				local u0, v0 = cell.ui or 0, cell.vi or 0
+				for a = 0, kc - 1 do
+					for b = 0, kc - 1 do
+						o[(u0 + a) .. ":" .. (v0 + b)] = true
+					end
+				end
 			end
 		end
 		for r, o in pairs(occ) do
@@ -137,7 +147,37 @@ end
 -- Returning nil leaves the far side unmarked, which can leave an asymmetric pair
 -- the walk has to close later. That is the cheaper failure by a wide margin:
 -- uncapped cost 1173 corners to save 21 asymmetric nodes.
-local function directionTo(g: any, cell: any, p: Vector3, r2: number): number?
+local function directionTo(g: any, cell: any, p: Vector3, r2: number, farCoarse: boolean?): number?
+	local su = cell.su or g.step
+	local sv = cell.sv or g.step
+	-- `farCoarse` says the cell we are pointing BACK at is itself coarse, so `p`
+	-- is its centre and sits far outside the cap however well the two abut.
+	-- Nearest-of-four then measures that distance and refuses every one of them:
+	-- 937 asymmetric pairs on case5, each an orphan face that shreds a rim.
+	if farCoarse or su > g.step or sv > g.step then
+		-- A COARSE CELL IS NOT PICKED BY NEAREST DIRECTION. It abuts many cells
+		-- along each edge, and all but the one facing its own centre are offset
+		-- laterally by up to half its width, so nearest-of-four measures the
+		-- offset rather than the side and the cap then rejects nearly all of
+		-- them -- 1626 asymmetric pairs on case5 where the uniform lattice had 21.
+		--
+		-- The question is only WHICH SIDE p lies past, which is a projection onto
+		-- the cell's own axes and needs no tolerance at all.
+		local d = p - cell.pos
+		local du, dv
+		if not g.fallback and g.u and g.v then
+			du, dv = d:Dot(g.u), d:Dot(g.v)
+		else
+			du, dv = d.X, d.Z
+		end
+		local exU = math.abs(du) - su * 0.5
+		local exV = math.abs(dv) - sv * 0.5
+		-- inside our own footprint: not a neighbour in any direction
+		if exU <= 0 and exV <= 0 then return nil end
+		-- DIR4 is {1,0} {0,1} {-1,0} {0,-1}
+		if exU >= exV then return (du > 0) and 1 or 3 end
+		return (dv > 0) and 2 or 4
+	end
 	local best, bd = nil, math.huge
 	for bit, d in ipairs(DIR4) do
 		local dd = (neighbourPos(g, cell, d) - p).Magnitude
@@ -167,12 +207,34 @@ function Boundary.faces(data: any)
 	-- world XZ buckets, so a neighbour is found without knowing which grid owns it
 	local keep = liveRegions(data)
 	local live: { [string]: {any} } = {}
+	-- EVERY BUCKET THE CELL COVERS. See LocalGrid.buildWorldIndex: the lookups
+	-- below scan the 3x3 block around the probe, so a coarse cell bucketed by its
+	-- centre alone is invisible to the cells along its own edges. Unchanged for a
+	-- uniform cell, whose footprint spans a single bucket.
 	for _, g in ipairs(data.grids) do
 		for _, cell in ipairs(g.cells) do
 			if cell.region and keep[cell.region] then
-				local k = math.floor(cell.pos.X) .. ":" .. math.floor(cell.pos.Z)
-				local b = live[k]; if not b then b = {}; live[k] = b end
-				b[#b + 1] = { cell = cell, g = g }
+				local e = { cell = cell, g = g }
+				local su, sv = cell.su, cell.sv
+				if not su or not sv or (su <= g.step and sv <= g.step) then
+					local k = math.floor(cell.pos.X) .. ":" .. math.floor(cell.pos.Z)
+					local b = live[k]; if not b then b = {}; live[k] = b end
+					b[#b + 1] = e
+				else
+					local hu, hv = su * 0.5, sv * 0.5
+					local gu = g.u or Vector3.xAxis
+					local gv = g.v or Vector3.zAxis
+					local ax = math.abs(gu.X) * hu + math.abs(gv.X) * hv
+					local az = math.abs(gu.Z) * hu + math.abs(gv.Z) * hv
+					local p = cell.pos
+					for bx = math.floor(p.X - ax), math.floor(p.X + ax) do
+						for bz = math.floor(p.Z - az), math.floor(p.Z + az) do
+							local k = bx .. ":" .. bz
+							local b = live[k]; if not b then b = {}; live[k] = b end
+							b[#b + 1] = e
+						end
+					end
+				end
 			end
 		end
 	end
@@ -213,7 +275,8 @@ function Boundary.faces(data: any)
 						stats.pairs_ += 1
 						mark(cell, bit)
 						-- the far side, in ITS own direction indexing
-						local back = directionTo(fg, found, cell.pos, r2)
+						local back = directionTo(fg, found, cell.pos, r2,
+							(cell.su or g.step) > g.step or (cell.sv or g.step) > g.step)
 						if back then mark(found, back) else stats.asymmetric += 1 end
 					end
 				end
