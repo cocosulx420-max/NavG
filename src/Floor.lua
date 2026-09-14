@@ -177,9 +177,49 @@ end
 -- Extract surfels from a prebuilt SVO over `parts`.
 function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 	local c = merged(cfg)
+
+	-- A FILTER LIST IS SCANNED PER QUERY, SO ITS LENGTH IS THE COST OF THE QUERY.
+	-- Measured on case6, one raycast: 0.95us with 1 entry in the list, 1.76us at
+	-- 100, 5.5us at 500, 169us at 2000, 527us at 18197 -- and this list held every
+	-- part of the map. That single number was most of the bake. The comment above
+	-- says a column costs "about 264 microseconds"; the geometry in a column is a
+	-- fraction of one, and the rest was the engine walking a 15773-entry filter.
+	--
+	-- So filter by the ROOT -- one entry -- and re-establish exactness in Lua.
+	-- `RespectCanCollide` reproduces gatherParts' CanCollide rule for free, and on
+	-- case6 that leaves just 49 parts the root admits and the gather rejects (44
+	-- character parts, 5 oversize slabs), so the re-cast below is a cold path.
+	local bake: { [Instance]: boolean } = {}
+	for _, p in ipairs(parts) do bake[p] = true end
 	local rp = RaycastParams.new()
 	rp.FilterType = Enum.RaycastFilterType.Include
-	rp.FilterDescendantsInstances = parts
+	rp.FilterDescendantsInstances = { c.root or workspace }
+	rp.RespectCanCollide = true
+
+	-- Nearest hit that is actually part of the bake. Anything else is stepped past
+	-- and the ray continues, which is exactly what an Include list of `parts`
+	-- did -- it let the ray through. `Distance` is rebuilt against the ORIGINAL
+	-- origin so callers cannot tell the difference.
+	local function castBake(origin: Vector3, dir: Vector3)
+		local len = dir.Magnitude
+		if len < 1e-6 then return nil end
+		local unit = dir / len
+		local travelled = 0
+		for _ = 1, 16 do
+			local res = workspace:Raycast(origin + unit * travelled, unit * (len - travelled), rp)
+			if not res then return nil end
+			if bake[res.Instance] then
+				if travelled == 0 then return res end
+				return {
+					Instance = res.Instance, Position = res.Position, Normal = res.Normal,
+					Material = res.Material, Distance = travelled + res.Distance,
+				}
+			end
+			travelled += res.Distance + 1e-3
+			if travelled >= len then return nil end
+		end
+		return nil
+	end
 
 	-- Embedded-origin probe: a thin invisible part spanning [0.1, minClearance]
 	-- above each candidate, tested with precise GetPartsInPart (see clearance
@@ -190,9 +230,12 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 	probe.Anchored = true; probe.CanCollide = false; probe.CanQuery = false; probe.CanTouch = false
 	probe.Transparency = 1
 	probe.Parent = workspace
+	-- Same reasoning, and easier: an overlap query returns a LIST, so exactness is
+	-- restored by skipping what is not in the bake -- no re-cast needed.
 	local op = OverlapParams.new()
 	op.FilterType = Enum.RaycastFilterType.Include
-	op.FilterDescendantsInstances = parts
+	op.FilterDescendantsInstances = { c.root or workspace }
+	op.RespectCanCollide = true
 	-- nil when the bake root has no terrain over it, which makes every terrain
 	-- cast below a no-op rather than a query. See Floor.hasTerrain.
 	local rpTerrain = nil
@@ -228,7 +271,7 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 				local cx = ctr.X - h + 0.5 + i
 				local cz = ctr.Z - h + 0.5 + j
 				if tree:isSolid(Vector3.new(cx, top + 0.5, cz)) then continue end
-				local res = workspace:Raycast(Vector3.new(cx, top + 1, cz), Vector3.new(0, -(edge + 2), 0), rp)
+				local res = castBake(Vector3.new(cx, top + 1, cz), Vector3.new(0, -(edge + 2), 0))
 				if not res then continue end
 				local n = res.Normal
 				local slope = math.deg(math.acos(math.clamp(n:Dot(UP), -1, 1)))
@@ -247,12 +290,12 @@ function Floor.extract(parts: {BasePart}, tree: any, cfg: Config?)
 				probe.CFrame = CFrame.new(res.Position + Vector3.new(0, 0.1 + (c.minClearance - 0.1) * 0.5, 0))
 				local blocked = false
 				for _, hit in ipairs(workspace:GetPartsInPart(probe, op)) do
-					if hit ~= res.Instance then blocked = true; break end
+					if hit ~= res.Instance and bake[hit] then blocked = true; break end
 				end
 				if blocked then
 					clearance = 0
 				else
-					local upRes = workspace:Raycast(res.Position + Vector3.new(0, 0.15, 0), Vector3.new(0, c.clearCap, 0), rp)
+					local upRes = castBake(res.Position + Vector3.new(0, 0.15, 0), Vector3.new(0, c.clearCap, 0))
 					clearance = upRes and upRes.Distance or c.clearCap
 					-- Terrain is not in `parts` (never walkable) but still blocks
 					-- headroom; overlap queries are parts-only, so use a terrain-only
