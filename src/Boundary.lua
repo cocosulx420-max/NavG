@@ -640,19 +640,34 @@ function Boundary.chain(faces: {any}, ids: {any}, cw: boolean?)
 
 	local used = {}
 	local loops, broken = {}, 0
+	-- THE SUCCESSOR IS GEOMETRY, NOT AVAILABILITY.
+	--
+	-- This used to filter to the UNUSED faces first and then take the best angle
+	-- among those. That makes the continuation depend on the order loops happen to
+	-- be walked in: where the geometrically correct one had already been consumed
+	-- by an earlier loop, the walk quietly took a different branch instead, and a
+	-- branch that is not the angular successor crosses the path the boundary has
+	-- already laid. 37 of case6's rings cross themselves, and 62 of its CDT
+	-- complaints are "the ring is not simple".
+	--
+	-- In a planar subdivision every directed edge has exactly ONE successor, fixed
+	-- by the angle and nothing else, and following it partitions the edges into
+	-- cycles on its own. So choose over ALL the candidates, and if the one the
+	-- geometry names is already used, STOP. That turns a silent wrong turn into an
+	-- honest broken loop, which `weld` and `bridge` can see and the trace reports.
 	local function pick(atKey: number, din: Vector3?, up: Vector3): number?
 		local cand = outAt[atKey]
 		if not cand then return nil end
-		local live = {}
-		for _, i in ipairs(cand) do
-			if not used[i] then live[#live + 1] = i end
+		if not din then
+			for _, i in ipairs(cand) do
+				if not used[i] then return i end
+			end
+			return nil
 		end
-		if #live == 0 then return nil end
-		if #live == 1 or not din then return live[1] end
 		-- a pinch: keep the diagonally touching cells together by turning as
 		-- little as possible
 		local best, bestAng = nil, nil
-		for _, i in ipairs(live) do
+		for _, i in ipairs(cand) do
 			local f = faces[i]
 			local dout = (f.b - f.a)
 			if dout.Magnitude > 1e-9 then
@@ -664,7 +679,8 @@ function Boundary.chain(faces: {any}, ids: {any}, cw: boolean?)
 				if bestAng == nil or ang > bestAng then bestAng = ang; best = i end
 			end
 		end
-		return best or live[1]
+		if best == nil or used[best] then return nil end
+		return best
 	end
 
 	for seed = 1, #faces do
