@@ -740,18 +740,98 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 
 	-- World-axis half extents of an oriented box, so a bounds query over a node
 	-- on a tilted face cannot under-cover it.
-	local function aabbHalf(hu: number, hh: number, hv: number): Vector3
+	local function aabbHalf(cf: CFrame, size: Vector3): Vector3
+		local h = size * 0.5
+		local x, y, z = cf.RightVector, cf.UpVector, cf.LookVector
 		return Vector3.new(
-			math.abs(u.X) * hu + math.abs(n.X) * hh + math.abs(v.X) * hv,
-			math.abs(u.Y) * hu + math.abs(n.Y) * hh + math.abs(v.Y) * hv,
-			math.abs(u.Z) * hu + math.abs(n.Z) * hh + math.abs(v.Z) * hv)
+			math.abs(x.X) * h.X + math.abs(y.X) * h.Y + math.abs(z.X) * h.Z,
+			math.abs(x.Y) * h.X + math.abs(y.Y) * h.Y + math.abs(z.Y) * h.Z,
+			math.abs(x.Z) * h.X + math.abs(y.Z) * h.Y + math.abs(z.Z) * h.Z)
+	end
+	-- orientation only, for sizing a footprint in the grid's own frame
+	local faceRot = CFrame.fromMatrix(Vector3.zero, u, n)
+
+	-- A BOUNDING BOX IS NOT GEOMETRY, and this test used to treat it as one:
+	-- anything `GetPartBoundsInBox` returned refused the collapse. That is a
+	-- broadphase query -- it reports every part whose AXIS-ALIGNED BOUNDS meet
+	-- the region -- so a mesh or a union vetoed nodes from studs away, its box
+	-- being mostly air: an archway, a railing, the flare of a lamp post. Those
+	-- nodes then split all the way to single cells and the per-cell tests they
+	-- split into accepted every one of them, because the per-cell path has had a
+	-- narrow phase since the kill test was fixed. The subdivision bought nothing
+	-- but time and a denser lattice than the floor deserves.
+	--
+	-- So the broad phase stays a bounds query -- it is the only one that sees
+	-- every solid -- and each candidate is then asked for real, by the same rules
+	-- the kill test uses:
+	--
+	--   block, wedge -> exact, by separating axis
+	--   mesh, union  -> one volume probe, then RAYS across the box on the cell
+	--                   lattice in all three axes. A ray hits real collision
+	--                   geometry, which is the whole point of the change, and a
+	--                   lattice at the cell pitch resolves what the per-cell
+	--                   tests would have resolved -- so a node collapses only
+	--                   where the cells inside it would have lived anyway.
+	--
+	-- ONE RAY LATTICE FOR ALL THE MESHES AT ONCE, not one per candidate: the
+	-- question is whether ANY of them is in the box, so they go into the filter
+	-- together and a crowded node costs the same as a lonely one.
+	--
+	-- Refusing is still the cheap direction -- it only subdivides -- so anything
+	-- the rays cannot answer keeps refusing.
+	local function raysHitBox(filter: {BasePart}, cf: CFrame, size: Vector3): boolean
+		rpOne.FilterDescendantsInstances = filter
+		local axis = { cf.RightVector, cf.UpVector, cf.LookVector }
+		local ext = { size.X, size.Y, size.Z }
+		local eps = 0.02
+		for i = 1, 3 do
+			local j, k = i % 3 + 1, (i + 1) % 3 + 1
+			local len = ext[i]
+			local nj = math.max(1, math.ceil(ext[j] / step - 1e-6))
+			local nk = math.max(1, math.ceil(ext[k] / step - 1e-6))
+			for a = 0, nj - 1 do
+				for b = 0, nk - 1 do
+					local mid = cf.Position
+						+ axis[j] * (((a + 0.5) / nj - 0.5) * ext[j])
+						+ axis[k] * (((b + 0.5) / nk - 0.5) * ext[k])
+					local from = mid - axis[i] * (len * 0.5 + eps)
+					if workspace:Raycast(from, axis[i] * (len + eps * 2), rpOne) then
+						return true
+					end
+				end
+			end
+		end
+		return false
 	end
 
-	local function clearBox(ctr: Vector3, half: Vector3): boolean
-		for _, cand in ipairs(workspace:GetPartBoundsInBox(CFrame.new(ctr), half * 2, op)) do
-			if cand ~= part then return false end
+	local function clearBox(cf: CFrame, size: Vector3): boolean
+		local meshes: {BasePart}? = nil
+		local half = aabbHalf(cf, size)
+		for _, cand in ipairs(workspace:GetPartBoundsInBox(CFrame.new(cf.Position), half * 2, op)) do
+			if cand ~= part then
+				if isBlock(cand) then
+					if boxOverlap(cf, size, cand.CFrame, cand.Size) then return false end
+				elseif isWedge(cand) then
+					if wedgeOverlap(cf, size, cand) then return false end
+				else
+					local m = meshes
+					if not m then m = {}; meshes = m end
+					m[#m + 1] = cand
+				end
+			end
 		end
-		return true
+		if not meshes then return true end
+		-- The cheap true positive first, exactly as the kill test takes it:
+		-- GetPartsInPart misses solids, so it cannot clear the box, but it never
+		-- invents one, so a hit ends the question without casting anything.
+		-- Blocks and wedges are already answered exactly above, so a report of
+		-- one here is noise -- flush contact -- and is ignored.
+		probe.Size = size
+		probe.CFrame = cf
+		for _, hit in ipairs(workspace:GetPartsInPart(probe, op)) do
+			if hit ~= part and not isBlock(hit) and not isWedge(hit) then return false end
+		end
+		return not raysHitBox(meshes, cf, size)
 	end
 
 	local function collapseOK(iu: number, iv: number, k: number): boolean
@@ -779,8 +859,13 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 		local du = (p - surfaceCenter):Dot(u)
 		local dv = (p - surfaceCenter):Dot(v)
 		if math.abs(du) + ho > uLimAll or math.abs(dv) + ho > vLimAll then return false end
-		-- 2. nothing standing in the headroom band over the node or its halo
-		if not clearBox(p + n * (bandLoN + bandHN * 0.5), aabbHalf(ho, bandHN * 0.5, ho)) then
+		-- 2. nothing standing in the headroom band over the node or its halo.
+		--    Tested in the GRID'S OWN FRAME, not as a world box: on a tilted face
+		--    the world box that contains this one is half again as wide, and every
+		--    stud of that surplus is a chance to meet something the node does not
+		--    touch. The bounds query inside still runs on the world box.
+		if not clearBox(CFrame.fromMatrix(p + n * (bandLoN + bandHN * 0.5), u, n),
+			Vector3.new(ho * 2, bandHN, ho * 2)) then
 			return false
 		end
 		-- 3. nothing in the column up to standHeight. NOT clearCap: the node only
@@ -788,9 +873,14 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, filterAll: Rayc
 		--    demanding 20 clear studs would refuse every indoor floor. The stored
 		--    clearance is the centre cast's own -- exact there, and at least
 		--    standHeight everywhere else in the node.
+		--
+		--    This one stays WORLD-AXIS on purpose: clearance is measured along UP,
+		--    so the column is the node's footprint projected onto the world axes,
+		--    not a box in the face's frame.
 		local col = c.standHeight
-		local fh = aabbHalf(ho, 0, ho)
-		if not clearBox(p + UP * (col * 0.5), Vector3.new(fh.X, col * 0.5, fh.Z)) then
+		local fh = aabbHalf(faceRot, Vector3.new(ho * 2, 0, ho * 2))
+		if not clearBox(CFrame.new(p + UP * (col * 0.5)),
+			Vector3.new(fh.X * 2, col, fh.Z * 2)) then
 			return false
 		end
 		-- 4. terrain is invisible to a bounds query, so a hit forces the exact
