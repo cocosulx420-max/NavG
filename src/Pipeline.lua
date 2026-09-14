@@ -1057,6 +1057,81 @@ end
 -- pathfinder walks and the reason it may not leave are the same drawing.
 -- `drawRawFaces` shows the same information at cell resolution on a curve that
 -- does not line up with the polygons.
+-- Draw the mesh SOLID rather than as a wireframe.
+--
+-- A convex polygon is a fan of triangles about its first vertex, and a triangle
+-- is TWO RIGHT-ANGLED WEDGES sharing the foot of an altitude -- the only way to
+-- put an arbitrary triangle on screen without an EditableMesh. Rotate the corners
+-- so the longest edge is the base, drop the altitude from the apex onto it, and
+-- each half is a WedgePart whose sloped face is one half of the triangle.
+--
+-- Semi-transparent and lifted clear of the floor, because the question this
+-- answers is what the mesh COVERS -- which needs the map visible underneath it.
+-- One hue per region, as the wireframe uses, so the two can be read together.
+--
+-- case6: 4243 polygons become 18116 wedges in 1.4 seconds.
+function Pipeline.drawFilled(result: any, opts: any?): (Instance, string)
+	local o = opts or {}
+	local lift = o.lift or 0.25
+	local thick = o.thickness or 0.12
+	local trans = o.transparency or 0.25
+	local mesh = Pipeline.mesh(result)
+
+	local dbg = workspace:FindFirstChild(Pipeline.debugName)
+	if not dbg then
+		dbg = Instance.new("Folder"); dbg.Name = Pipeline.debugName; dbg.Parent = workspace
+	end
+	local prev = dbg:FindFirstChild("Filled")
+	if prev then prev:Destroy() end
+	local root = Instance.new("Folder"); root.Name = "Filled"; root.Parent = dbg
+
+	local made = 0
+	local function tri(a: Vector3, b: Vector3, c: Vector3, colour: Color3, parent: Instance)
+		local ab, ac, bc = b - a, c - a, c - b
+		local d1, d2, d3 = ab:Dot(ab), ac:Dot(ac), bc:Dot(bc)
+		-- put the apex opposite the longest edge, so both halves are right-angled
+		if d1 > d2 and d1 > d3 then a, c = c, a
+		elseif d2 > d1 and d2 > d3 then a, b = b, a end
+		ab, ac, bc = b - a, c - a, c - b
+		local right = ac:Cross(ab)
+		if right.Magnitude < 1e-6 then return end
+		right = right.Unit
+		local up = bc:Cross(right).Unit
+		local back = bc.Unit
+		local h = math.abs(ab:Dot(up))
+		if h < 1e-4 then return end
+		local function wedge(sz: Vector3, cf: CFrame)
+			local w = Instance.new("WedgePart")
+			w.Anchored = true; w.CanCollide = false; w.CanQuery = false; w.CanTouch = false
+			w.Material = Enum.Material.SmoothPlastic
+			w.Color = colour; w.Transparency = trans
+			w.Size = sz; w.CFrame = cf; w.Parent = parent
+			made += 1
+		end
+		wedge(Vector3.new(thick, h, math.abs(ab:Dot(back))),
+			CFrame.fromMatrix((a + b) * 0.5, right, up, back))
+		wedge(Vector3.new(thick, h, math.abs(ac:Dot(back))),
+			CFrame.fromMatrix((a + c) * 0.5, -right, up, -back))
+	end
+
+	local folders = {}
+	for _, poly in ipairs(mesh.tris) do
+		local r = poly.region or 0
+		local f = folders[r]
+		if not f then
+			f = Instance.new("Folder"); f.Name = ("r%03d"):format(r); f.Parent = root
+			folders[r] = f
+		end
+		local colour = Color3.fromHSV((r * 0.61803398875) % 1, 0.85, 1)
+		local v, n = poly.verts, poly.n
+		local off = (poly.up or Vector3.yAxis) * lift
+		for i = 2, n - 1 do
+			tri(v[1] + off, v[i] + off, v[i + 1] + off, colour, f)
+		end
+	end
+	return root, ("filled %d polygons as %d wedges"):format(#mesh.tris, made)
+end
+
 function Pipeline.drawMeshKind(result: any, opts: any?): (Instance, string)
 	local o = opts or {}
 	local lift = o.lift or 0.35
