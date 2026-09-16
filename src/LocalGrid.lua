@@ -1150,7 +1150,19 @@ local function buildWorldIndex(grids: any)
 	for _, g in pairs(grids) do
 		-- `g` as well as `g.part`: a cell's footprint is measured in its own
 		-- grid's in-plane axes, and a coarse cell cannot be tested without them.
-		for _, cell in ipairs(g.cells) do pushCell(g, cell, { cell = cell, part = g.part, g = g }) end
+		-- `coarse` IS `cellCovers`' OWN GUARD, ANSWERED ONCE HERE.
+		--
+		-- Every neighbour lookup asks `cellCovers` about every entry whose centre
+		-- proximity test failed, and `cellCovers` opens by returning false for any
+		-- cell still one step across. On case6 that is 615 million calls of which
+		-- 86% are refused on that first line -- 13.6% of entries are coarse at all
+		-- -- and only 4.8% ever answer true. Carrying the flag on the entry skips
+		-- the call in exactly the cases it was going to refuse.
+		for _, cell in ipairs(g.cells) do
+			local su, sv = cell.su, cell.sv
+			local coarse = su ~= nil and sv ~= nil and (su > g.step or sv > g.step)
+			pushCell(g, cell, { cell = cell, part = g.part, g = g, coarse = coarse })
+		end
 		-- dead cells are always one step across: a node only collapses where
 		-- nothing kills it, so no coarse cell is ever killed.
 		for _, d in ipairs(g.dead) do push(dead, d.pos, { dead = d, part = g.part, g = g }) end
@@ -1303,7 +1315,7 @@ function LocalGrid.pruneNarrow(data: any, cfg: Config?)
 							found = true
 							break
 						end
-						if cellCovers(e.g, e.cell, p)
+						if e.coarse and cellCovers(e.g, e.cell, p)
 							and math.abs(heightAt(e.g, e.cell, p) - p.Y) <= tol then
 							found = true
 							break
@@ -1558,7 +1570,7 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 						for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
 							local q = e.cell.pos
 							local dx, dz = q.X - p.X, q.Z - p.Z
-							if dx * dx + dz * dz <= r2 or cellCovers(e.g, e.cell, p) then
+							if dx * dx + dz * dz <= r2 or (e.coarse and cellCovers(e.g, e.cell, p)) then
 								-- MEASURED AGAINST WHERE THIS SURFACE WOULD CONTINUE,
 								-- not against our own height. `p` lies on this grid's
 								-- own plane, so on a tilted slab the next cell along
@@ -1984,7 +1996,7 @@ function LocalGrid.regions(data: any, cfg: Config?)
 						for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
 							local q = e.cell
 							local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
-							if (dx * dx + dz * dz <= r2 or cellCovers(e.g, q, p))
+							if (dx * dx + dz * dz <= r2 or (e.coarse and cellCovers(e.g, q, p)))
 								and math.abs(heightAt(e.g, q, p) - p.Y) <= tol
 								and cell.normal:Dot(q.normal) >= cosTol
 								and q.fit == cell.fit then
@@ -2054,7 +2066,7 @@ function LocalGrid.regions(data: any, cfg: Config?)
 									if mine[q] and bandOf[q] == bandOf[cell]
 										and q.fit == cell.fit then
 										local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
-										if (dx * dx + dz * dz <= r2 or cellCovers(e.g, q, p))
+										if (dx * dx + dz * dz <= r2 or (e.coarse and cellCovers(e.g, q, p)))
 											and math.abs(q.pos.Y - p.Y) <= tol then
 											local ra, rb = bfind(cell), bfind(q)
 											if ra ~= rb then bup[ra] = rb end
