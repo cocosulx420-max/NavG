@@ -181,10 +181,19 @@ LocalGrid.cellBudget = 4000
 -- it pruned as narrow. Fixed; every K now reproduces the floor exactly, measured
 -- as a slot-for-slot diff rather than as an area.
 --
--- On case5, bake against the uniform lattice: K=1 31.1s / 200498 cells,
--- K=4 8.1s / 45035, K=16 7.2s / 38159. On case3 the difference between 4 and 16
--- is inside the noise -- it is a small dense map and finds only 19 nodes of 8
--- cells -- so 16 costs nothing there and pays on open ground.
+-- On case5 against the uniform lattice, re-measured 2026-09-16: K=1 66.6s /
+-- 200498 cells, K=16 7.7s / 37529, and EVERY DEFECT COUNT IS IDENTICAL at both
+-- -- same regions, loops, broken loops, missing and unforced boundary edges,
+-- non-simple rings and components, on case3 as well. The one real cost is area:
+-- K=16 claims 0.24% more floor on case3 (1819.0 against 1814.6 sq studs)
+-- because a collapsed node covers its whole rectangle. Any gate figure taken
+-- before this shipped is a K=1 figure and will not reproduce at 16.
+--
+-- K=1 has itself roughly doubled in cost per cell since 31.1s was measured, on
+-- identical cell counts, so the uniform lattice is no longer a cheap reference.
+-- On case3 the difference between 4 and 16 is inside the noise -- it is a small
+-- dense map and finds only 19 nodes of 8 cells -- so 16 costs nothing there and
+-- pays on open ground.
 LocalGrid.maxNodeCells = 16
 
 -- Collapse faces that are NOT blocks. ON, and it is the difference between the

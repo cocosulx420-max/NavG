@@ -539,6 +539,16 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 end
 
 -- Bake and simplify, and record what it took to do so.
+--
+-- WHAT A FULL BAKE COSTS, case6 measured end to end 2026-09-16: SVO 53s,
+-- Floor.extract 4.6s, LocalGrid.fromFloor 293s, Boundary.trace 80s,
+-- simplify 0.4s, CDT.build 233s, Portals.build 2.6s -- 14.6 min including the
+-- mesh and the portals. It was 29.5 min before the raycast-filter and adaptive
+-- grid work; `fromFloor` and CDT are still two thirds of it.
+--
+-- Pass `cfg.onProgress` from a coroutine for anything this size: it is what
+-- makes the four divisible stages yield. `Boundary.trace` and `CDT.build` do
+-- not yield at all and will block Studio for minutes apiece.
 function Pipeline.run(cfg: any?): any
 	local t0 = os.clock()
 	local data, bstats = Pipeline.bake(cfg)
@@ -657,6 +667,11 @@ end
 --
 -- `keep` is the filter that makes the second snapshot: given a cell, answer
 -- whether it survives. Pass nothing for the baseline.
+--
+-- NOT FREE, and not cached: with no `keep` this recomputes the very snapshot
+-- `Pipeline.portals` has already stored on `result.severance`. Measured at 105s
+-- on case6, a seventh of the whole bake, spent twice. Read `result.severance`
+-- instead unless a `keep` predicate makes it a genuinely different snapshot.
 function Pipeline.connectivity(result: any, keep: ((any) -> boolean)?): any
 	return Severance.snapshot(result.data, keep)
 end

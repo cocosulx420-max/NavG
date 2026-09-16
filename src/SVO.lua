@@ -289,7 +289,8 @@ SVO.probeBudget = 2000
 -- So the work is real and only the SHAPE of it can change. case6 has non-block
 -- parts of 146,000 cubic studs and this call, having no yield in it, blocked
 -- Studio's main thread for 45 minutes with nothing to show; case3's largest is
--- nowhere near, which is why it never showed up before.
+-- nowhere near, which is why it never showed up before. With the cheap reject
+-- below in place, case6's whole SVO stage measures 53s (2026-09-16).
 --
 -- `onYield` makes the work divisible: the unit is a probe budget rather than a
 -- spatial slice, which needs no geometry to divide and gives smooth progress.
