@@ -992,16 +992,21 @@ end
 -- on a plane through the rim: a ramp's rim corners and its interior sit at
 -- different heights, and fitting to the rim alone puts every interior point in
 -- the air.
-local function planeOffset(data: any, region: number, origin: Vector3, up: Vector3): number
-	if not data or not data.grids then return 0 end
+-- `bucket` is this region's cells, in the order the grids hold them. It used to
+-- be the whole bake, filtered by `cell.region` on every call -- regions TIMES
+-- cells, which is 2490 x 479460 on case6: 1.2 billion iterations, and 86% of
+-- this module's entire cost. Bucketing once costs one pass over the cells.
+--
+-- The cells arrive in the same order as the filtered scan produced them, so the
+-- sum accumulates in the same order and comes out bit-identical. That matters:
+-- reducing this to (sum of pos) . up - n * (origin . up) is the same number in
+-- algebra and a different one in floating point.
+local function planeOffset(bucket: { any }?, origin: Vector3, up: Vector3): number
+	if not bucket then return 0 end
 	local sum, n = 0, 0
-	for _, g in ipairs(data.grids) do
-		for _, cell in ipairs(g.cells) do
-			if cell.region == region then
-				sum += (cell.pos - origin):Dot(up)
-				n += 1
-			end
-		end
+	for _, cell in ipairs(bucket) do
+		sum += (cell.pos - origin):Dot(up)
+		n += 1
 	end
 	if n == 0 then return 0 end
 	return sum / n
@@ -1030,6 +1035,22 @@ function CDT.build(loops: { any }, data: any?): any
 		end
 		local g = byRegion[L.region]
 		g[#g + 1] = i
+	end
+
+	-- Every cell filed under its region, once, for the plane fit below.
+	local cellsOf: { [number]: { any } }? = nil
+	if data and data.grids then
+		cellsOf = {}
+		for _, g in ipairs(data.grids) do
+			for _, cell in ipairs(g.cells) do
+				local cr = cell.region
+				if cr then
+					local b = (cellsOf :: any)[cr]
+					if not b then b = {}; (cellsOf :: any)[cr] = b end
+					b[#b + 1] = cell
+				end
+			end
+		end
 	end
 
 	for _, r in ipairs(order) do
@@ -1220,7 +1241,7 @@ function CDT.build(loops: { any }, data: any?): any
 		-- Lift. Traced corners keep the exact Vector3 they were traced at, and
 		-- segment midpoints keep the interpolation of theirs; only interior
 		-- Steiner points are reconstructed, onto the region's own floor plane.
-		local h = planeOffset(data, r, origin, up)
+		local h = planeOffset(cellsOf and (cellsOf :: any)[r], origin, up)
 		local base = origin + up * h
 		local cache = {}
 		local function W(i: number): Vector3
