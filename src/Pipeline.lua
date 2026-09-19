@@ -299,12 +299,23 @@ end
 -- be wrong.
 --
 -- The span is half open, [a, b): the raw node at b belongs to the next edge.
+-- WHICH REPAIR TIER PUT AN EDGE THERE, alongside what kind of boundary it is.
+--
+-- `kind` and repair origin are different questions and the first cannot answer
+-- the second: `Boundary.bridge` stamps its chords `kind = "none"`, which is the
+-- SAME label a genuine "the floor runs out here" face carries, so an edge that
+-- the pipeline invented out of a nearest-neighbour pairing is indistinguishable
+-- by kind from real open boundary. Hence a second, separate label.
+--
+-- Read off the raw faces the edge spans, in the walk this function was already
+-- doing -- no second traversal. Worst wins, because one invented chord in a span
+-- is what matters: bridge > weld > invented > none.
 local function edgeKinds(entry: any, poly: {Vector3}, faceOf: {number},
-	rawIdx: {number}, pts: {Vector3}, closed: boolean): ({string}, {number})
+	rawIdx: {number}, pts: {Vector3}, closed: boolean): ({string}, {number}, {string})
 	local nRaw = #poly
 	local n = #pts
 	local last = closed and n or math.max(n - 1, 0)
-	local kinds, wallFrac = {}, {}
+	local kinds, wallFrac, repair = {}, {}, {}
 	for i = 1, last do
 		local a = rawIdx[i]
 		local b = rawIdx[(i % n) + 1]
@@ -314,8 +325,10 @@ local function edgeKinds(entry: any, poly: {Vector3}, faceOf: {number},
 		if a == nil or b == nil or nRaw == 0 then
 			kinds[i] = "invented"
 			wallFrac[i] = 0
+			repair[i] = "invented"
 		else
 			local tally, count, wall = {}, 0, 0
+			local sawBridge, sawWeld = false, false
 			local j = a
 			for _ = 1, nRaw do
 				if j == b then break end
@@ -325,9 +338,14 @@ local function edgeKinds(entry: any, poly: {Vector3}, faceOf: {number},
 					count += 1
 					tally[f.kind] = (tally[f.kind] or 0) + 1
 					if f.kind == "wall" then wall += 1 end
+					if f.bridged then sawBridge = true end
+					if f.welded then sawWeld = true end
 				end
 				j = (j % nRaw) + 1
 			end
+			repair[i] = sawBridge and "bridge"
+				or sawWeld and "weld"
+				or (count == 0 and "invented" or "none")
 			if count == 0 then
 				kinds[i] = "invented"
 				wallFrac[i] = 0
@@ -351,7 +369,7 @@ local function edgeKinds(entry: any, poly: {Vector3}, faceOf: {number},
 			end
 		end
 	end
-	return kinds, wallFrac
+	return kinds, wallFrac, repair
 end
 
 -- Every traced loop, simplified to corners. One loop in, one entry out; a loop
@@ -407,6 +425,7 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 	local stats = { loops = 0, open = 0, raw = 0, corners = 0,
 		holesHeld = 0, rescued = 0, collapsed = 0, degenerate = 0,
 		edges = 0, wallEdges = 0, openEdges = 0, mixedEdges = 0, inventedEdges = 0,
+		repair = {},
 		closedBy = { merge = 0, intersect = 0, straight = 0, ["already closed"] = 0 } }
 
 	-- Region order follows Boundary's table, which LocalGrid numbers largest
@@ -510,7 +529,7 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 				end
 			end
 
-			local kinds, wallFrac = edgeKinds(entry, poly, faceOf, rawIdx, pts, closed)
+			local kinds, wallFrac, repair = edgeKinds(entry, poly, faceOf, rawIdx, pts, closed)
 			for _, k in pairs(kinds) do
 				stats.edges += 1
 				if k == "wall" then stats.wallEdges += 1
@@ -518,11 +537,17 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 				elseif k == "invented" then stats.inventedEdges += 1
 				else stats.openEdges += 1 end
 			end
+			-- How much of the finished boundary a repair tier put there. Counted
+			-- separately from `kinds` because a bridge chord is `kind = "none"`
+			-- and would otherwise be filed as ordinary open boundary.
+			for _, k in pairs(repair) do
+				stats.repair[k] = (stats.repair[k] or 0) + 1
+			end
 
 			out[#out + 1] = { region = r, index = li, up = up,
 				poly = poly, pts = pts, closed = closed, closedBy = method,
 				faceOf = faceOf, rawIdx = rawIdx,
-				edgeKind = kinds, edgeWall = wallFrac }
+				edgeKind = kinds, edgeWall = wallFrac, edgeRepair = repair }
 			stats.loops += 1
 			stats.raw += #poly
 			stats.corners += #pts
@@ -1327,6 +1352,359 @@ function Pipeline.drawPortals(result: any, opts: any?): (Instance, string)
 	end
 
 	return root, Portals.report(res)
+end
+
+-- ATTRIBUTE A STRAIGHTENED RING'S EDGES BACK TO THE LOOP'S OWN EDGES.
+--
+-- CDT tests the ring AFTER `Triangulate.straighten`, so ring edge `i` is NOT
+-- loop edge `i`: straighten deletes collinear corners and every deletion shifts
+-- the rest. It only ever deletes, though, so each ring point is still one of
+-- `L.pts`, and matching on the float is exact rather than approximate -- these
+-- are the same numbers, not nearby ones. That is the same rule
+-- `Pipeline.simplify` uses to realign provenance across the closing pass, and it
+-- is safe for the same reason and no other.
+--
+-- A ring edge spans one or more loop edges, so worst wins, as in `edgeKinds`.
+local function ringRepair(L: any, src: { Vector3 }): { string }
+	local rep = {}
+	local nSrc, nPts = #src, #L.pts
+	local er = L.edgeRepair
+	if not er then
+		for i = 1, nSrc do rep[i] = "?" end
+		return rep
+	end
+	local at = {}
+	for k, p in ipairs(L.pts) do at[tostring(p)] = k end
+	for i = 1, nSrc do
+		local a0 = at[tostring(src[i])]
+		local b0 = at[tostring(src[i % nSrc + 1])]
+		if not a0 or not b0 then
+			rep[i] = "?"
+			continue
+		end
+		local best = "none"
+		local j = a0
+		for _ = 1, nPts do
+			if j == b0 then break end
+			local r = er[j]
+			if r == "bridge" then best = "bridge"; break end
+			if r == "weld" then best = "weld"
+			elseif r == "invented" and best == "none" then best = "invented" end
+			j = (j % nPts) + 1
+		end
+		rep[i] = best
+	end
+	return rep
+end
+
+-- WHERE A RING CROSSES ITSELF, drawn so it can be found.
+--
+-- CDT already says this out loud -- "r045 ring1: edge 3 crosses edge 11, the
+-- ring is not simple" -- but a complaint naming two edge numbers on a ring of
+-- several hundred corners is not something anyone can find in a workspace. 62 of
+-- case6's 97 complaints are that one sentence, and a crossing ring costs real
+-- output: `insertSegment` resolves a crossing by flipping, a constrained edge is
+-- never flipped, so the hole is never cut and polygons end up over ground their
+-- own cells do not claim.
+--
+-- THE TEST IS CDT'S OWN, OVER CDT'S OWN PROJECTION: the same outer-and-holes
+-- grouping, the same `Rings.basis` off the outer rim's up, the same origin, the
+-- same `Triangulate.straighten`, the same coincident-corner dedupe and the same
+-- ring order -- so `ring1` here is `ring1` in the complaint and the edge numbers
+-- agree. Reimplementing any of it would draw a different set of crossings from
+-- the one being complained about, which is worse than drawing none: the marker
+-- would be somewhere the mesh never objected to.
+--
+-- It does NOT build a mesh. A crossing is a property of the ring alone, so this
+-- reads `result.loops` straight off `Pipeline.run`.
+--
+-- Its own subfolder, cleared on its own, because the question is where the
+-- crossings sit relative to the polygons -- which needs the mesh drawing left
+-- standing.
+function Pipeline.drawCrossings(result: any, opts: any?): (Instance, string)
+	local o = opts or {}
+	local lift = o.lift or 0.5
+	local RING = o.ringColor or Color3.fromRGB(120, 120, 130)
+	local HOT = o.crossColor or Color3.fromRGB(255, 45, 45)
+	local MARK = o.markColor or Color3.fromRGB(255, 230, 40)
+	local REPAIR = {
+		bridge = Color3.fromRGB(255, 0, 255),
+		weld = Color3.fromRGB(255, 150, 40),
+		invented = Color3.fromRGB(60, 230, 255),
+	}
+	local tally = {}
+
+	local loops = result.loops
+	if not loops then return workspace, "no loops on this result" end
+
+	local function cross2(ax: number, ay: number, bx: number, by: number,
+		cx: number, cy: number): number
+		return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+	end
+
+	local root = workspace:FindFirstChild(Pipeline.debugName)
+	if not root then
+		root = Instance.new("Folder")
+		root.Name = Pipeline.debugName
+		root.Parent = workspace
+	end
+	local name = o.name or "crossings"
+	local prev = root:FindFirstChild(name)
+	if prev then prev:Destroy() end
+	local out = Instance.new("Folder")
+	out.Name = name
+	out.Parent = root
+
+	local byRegion, order = {}, {}
+	for i, L in ipairs(loops) do
+		if not byRegion[L.region] then
+			byRegion[L.region] = {}
+			order[#order + 1] = L.region
+		end
+		local g = byRegion[L.region]
+		g[#g + 1] = i
+	end
+
+	local nCross, nRings, nRegions = 0, 0, 0
+	local found = {}
+
+	for _, r in ipairs(order) do
+		local idxs = byRegion[r]
+		local outer, holes = nil, {}
+		for _, i in ipairs(idxs) do
+			local L = loops[i]
+			if L.kind == "outer" then
+				if outer then outer = false elseif outer == nil then outer = i end
+			elseif L.kind == "hole" then
+				holes[#holes + 1] = i
+			end
+		end
+		-- A region CDT never meshes is a region it never tested, so it is not
+		-- tested here either. This draws what CDT complains about, not what it
+		-- would have complained about had it got that far.
+		if outer == nil or outer == false then continue end
+
+		local up = loops[outer].regionUp or loops[outer].up
+		local e1, e2 = Rings.basis(up)
+		local origin = loops[outer].pts[1]
+		local rise = up * lift
+
+		local ringIdx, ringRep, uniq, seen = {}, {}, {}, {}
+		local function addRing(L: any)
+			local src = (CDT.collinear > 0)
+				and Triangulate.straighten(L.pts, CDT.collinear) or L.pts
+			local ring = {}
+			for _, p in ipairs(src) do
+				local d = p - origin
+				local x, y = d:Dot(e1), d:Dot(e2)
+				local key = ("%.5f,%.5f"):format(x, y)
+				local k = seen[key]
+				if not k then
+					uniq[#uniq + 1] = { x, y, p }
+					k = #uniq
+					seen[key] = k
+				end
+				ring[#ring + 1] = k
+			end
+			ringIdx[#ringIdx + 1] = ring
+			-- Computed per ring, against that ring's own loop. `uniq` is shared
+			-- across the region's rings and would hand a shared corner whichever
+			-- ring reached it first.
+			ringRep[#ringIdx] = ringRepair(L, src)
+		end
+		addRing(loops[outer])
+		for _, i in ipairs(holes) do addRing(loops[i]) end
+
+		local hits, bad = {}, {}
+		for ri, ring in ipairs(ringIdx) do
+			local n = #ring
+			for i = 1, n do
+				for j = i + 2, n do
+					if not (i == 1 and j == n) then
+						local a, b = uniq[ring[i]], uniq[ring[i % n + 1]]
+						local c, d = uniq[ring[j]], uniq[ring[j % n + 1]]
+						local d1 = cross2(c[1], c[2], d[1], d[2], a[1], a[2])
+						local d2 = cross2(c[1], c[2], d[1], d[2], b[1], b[2])
+						local d3 = cross2(a[1], a[2], b[1], b[2], c[1], c[2])
+						local d4 = cross2(a[1], a[2], b[1], b[2], d[1], d[2])
+						if ((d1 > 0) ~= (d2 > 0)) and ((d3 > 0) ~= (d4 > 0)) then
+							-- The meeting point, not a midpoint: `d3` and `d4`
+							-- are the signed areas that just disagreed, so the
+							-- zero between them lands exactly on AB.
+							local rep = ringRep[ri]
+							hits[#hits + 1] = { ri, i, j, a, b, c, d,
+								d3 / (d3 - d4),
+								rep and rep[i] or "?", rep and rep[j] or "?" }
+							bad[ri] = (bad[ri] or 0) + 1
+						end
+					end
+				end
+			end
+		end
+		if #hits == 0 then continue end
+
+		nRegions += 1
+		local fr = Instance.new("Folder")
+		fr.Name = ("r%03d_x%d"):format(r, #hits)
+		fr.Parent = out
+
+		for ri = 1, #ringIdx do
+			local cnt = bad[ri]
+			if not cnt then continue end
+			nRings += 1
+			local ring = ringIdx[ri]
+			local n = #ring
+			local fring = Instance.new("Folder")
+			fring.Name = ("ring%d_%dpts_x%d"):format(ri, n, cnt)
+			fring.Parent = fr
+
+			-- The whole ring in grey first, so the two red edges are read in the
+			-- context of the loop they belong to rather than as a floating X.
+			for i = 1, n do
+				segment(uniq[ring[i]][3] + rise, uniq[ring[i % n + 1]][3] + rise,
+					0.08, RING, ("e%d"):format(i), fring)
+			end
+
+			for _, h in ipairs(hits) do
+				if h[1] ~= ri then continue end
+				nCross += 1
+				local i, j = h[2], h[3]
+				local a, b, c, d, t = h[4], h[5], h[6], h[7], h[8]
+				local repI, repJ = h[9], h[10]
+				-- The colour IS the finding: a magenta edge is a bridge chord, an
+				-- orange one a welded seam, cyan a corner the closing pass
+				-- invented, red an edge real faces stand behind.
+				segment(a[3] + rise, b[3] + rise, 0.20, REPAIR[repI] or HOT,
+					("x_e%d_%s"):format(i, repI), fring)
+				segment(c[3] + rise, d[3] + rise, 0.20, REPAIR[repJ] or HOT,
+					("x_e%d_%s"):format(j, repJ), fring)
+				-- Worst of the two, because one invented chord is enough to
+				-- explain a crossing the other edge merely met.
+				local worst = (repI == "bridge" or repJ == "bridge") and "bridge"
+					or (repI == "weld" or repJ == "weld") and "weld"
+					or (repI == "invented" or repJ == "invented") and "invented"
+					or (repI == "?" or repJ == "?") and "?"
+					or "none"
+				tally[worst] = (tally[worst] or 0) + 1
+
+				local px = c[1] + (d[1] - c[1]) * t
+				local py = c[2] + (d[2] - c[2]) * t
+				local m = Instance.new("Part")
+				m.Anchored = true; m.CanCollide = false
+				m.CanQuery = false; m.CanTouch = false
+				m.Shape = Enum.PartType.Ball
+				m.Size = Vector3.new(1.2, 1.2, 1.2)
+				m.Color = MARK
+				m.Material = Enum.Material.Neon
+				m.CFrame = CFrame.new(origin + e1 * px + e2 * py + rise)
+				-- Named as CDT words the complaint, so the sentence in the
+				-- report can be pasted into the Explorer's search box. The
+				-- attribution is a SUFFIX for that reason -- a substring search
+				-- for the complaint still finds it.
+				m.Name = ("r%03d_ring%d_e%d_x_e%d_%s"):format(r, ri, i, j, worst)
+				m.Parent = fring
+				found[#found + 1] = m.Name
+			end
+		end
+	end
+
+	local head = ("%d crossings on %d rings in %d regions")
+		:format(nCross, nRings, nRegions)
+	if nCross == 0 then
+		return out, head .. " -- the rings are simple, nothing drawn"
+	end
+	-- THE ATTRIBUTION IS THE POINT OF THE DRAWING, so it leads the summary.
+	local by = {}
+	for _, k in ipairs({ "bridge", "weld", "invented", "none", "?" }) do
+		if tally[k] then by[#by + 1] = ("%s %d"):format(k, tally[k]) end
+	end
+	return out, head .. "  [" .. table.concat(by, ", ") .. "]\n"
+		.. table.concat(found, "\n")
+end
+
+-- EVERY RING TESTED FOR SELF-CROSSING, INDEPENDENTLY OF CLASSIFICATION.
+--
+-- `drawCrossings` mirrors CDT exactly, which means it inherits CDT's blind spot:
+-- CDT only tests a region that resolved to exactly ONE outer rim, and it only
+-- tests the rings it meshes. `Rings.classify` decides `outer` against `hole` on
+-- SIGNED AREA ALONE, and a self-crossing ring's two lobes carry opposite sign and
+-- partly cancel -- so a crossing ring can come back negative and be filed
+-- `hole`, or cancel below `Rings.minArea` and be filed `degenerate` and dropped.
+-- Neither raises a complaint. A ring that disappears that way is invisible to
+-- CDT, to the complaint list and to the drawing alike.
+--
+-- So this asks the question the other way round: test every CLOSED ring there
+-- is, then report what each crossing ring was labelled and whether its region
+-- was meshed at all. It says whether the 62 CDT reports is the number or a
+-- fraction of it.
+--
+-- REPORTS ONLY. It must not change how anything is classified -- if the answer
+-- is that classification is hiding rings, that is a finding to act on
+-- deliberately, not something to paper over from a debug call.
+--
+-- Uses each ring's OWN `up` for the projection rather than the region basis,
+-- because a ring filed `degenerate` may be the only ring its region has and
+-- there is then no outer rim to take a basis from. Self-crossing is a property
+-- of the ring in its own plane, so this is the honest frame for the question.
+function Pipeline.auditCrossings(result: any): any
+	local loops = result.loops
+	if not loops then return { error = "no loops on this result" } end
+
+	-- `CDT.build` returns its convex polygons under `tris`, not `polys`; the name
+	-- predates the merge step that stopped them being triangles.
+	local meshed = {}
+	if result.mesh and result.mesh.tris then
+		for _, p in ipairs(result.mesh.tris) do meshed[p.region] = true end
+	end
+
+	local out = { rings = 0, tested = 0, crossing = 0, pairs_ = 0,
+		byKind = {}, unmeshed = 0, worst = nil, regions = {} }
+
+	for _, L in ipairs(loops) do
+		out.rings += 1
+		local kind = L.kind or "unclassified"
+		if not L.closed or #L.pts < 4 then continue end
+		out.tested += 1
+
+		local up = L.regionUp or L.up
+		local e1, e2 = Rings.basis(up)
+		local origin = L.pts[1]
+		local src = (CDT.collinear > 0)
+			and Triangulate.straighten(L.pts, CDT.collinear) or L.pts
+		local xs, ys = {}, {}
+		for i, p in ipairs(src) do
+			local d = p - origin
+			xs[i], ys[i] = d:Dot(e1), d:Dot(e2)
+		end
+
+		local n = #src
+		local hits = 0
+		for i = 1, n do
+			for j = i + 2, n do
+				if not (i == 1 and j == n) then
+					local i2, j2 = i % n + 1, j % n + 1
+					local d1 = (xs[j2] - xs[j]) * (ys[i] - ys[j]) - (ys[j2] - ys[j]) * (xs[i] - xs[j])
+					local d2 = (xs[j2] - xs[j]) * (ys[i2] - ys[j]) - (ys[j2] - ys[j]) * (xs[i2] - xs[j])
+					local d3 = (xs[i2] - xs[i]) * (ys[j] - ys[i]) - (ys[i2] - ys[i]) * (xs[j] - xs[i])
+					local d4 = (xs[i2] - xs[i]) * (ys[j2] - ys[i]) - (ys[i2] - ys[i]) * (xs[j2] - xs[i])
+					if ((d1 > 0) ~= (d2 > 0)) and ((d3 > 0) ~= (d4 > 0)) then
+						hits += 1
+					end
+				end
+			end
+		end
+
+		if hits > 0 then
+			out.crossing += 1
+			out.pairs_ += hits
+			out.byKind[kind] = (out.byKind[kind] or 0) + 1
+			if not meshed[L.region] then out.unmeshed += 1 end
+			out.regions[#out.regions + 1] =
+				("r%03d l%d %s %dpts x%d%s"):format(L.region, L.index, kind,
+					#src, hits, meshed[L.region] and "" or " UNMESHED")
+		end
+	end
+	return out
 end
 
 function Pipeline.drawCompare(rawLoops: {any}, cutLoops: {any}, opts: any?): (Instance, string)

@@ -536,7 +536,14 @@ function Boundary.weld(faces: {any}, step: number)
 		end
 	end
 	if stitched > 0 then
-		for _, e in ipairs(ids) do
+		for i, e in ipairs(ids) do
+			-- BOOKKEEPING ONLY, and it has to be read before the remap is applied
+			-- because `remap` is keyed by the node that dies. A face incident to
+			-- a stitched node has had one of its ends DRAGGED onto the survivor,
+			-- which is the one thing weld does that moves boundary, so it says
+			-- so. `bridge` already stamps its own chords `bridged`; this is the
+			-- same admission for the tier that leaves no geometry behind.
+			if remap[e.a] or remap[e.b] then faces[i].welded = true end
 			e.a = remap[e.a] or e.a
 			e.b = remap[e.b] or e.b
 		end
