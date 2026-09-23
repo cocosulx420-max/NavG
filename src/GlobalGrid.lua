@@ -43,6 +43,14 @@ GlobalGrid.config = {
 	-- narrowest floor kept, as the current pipeline's minWidth (Cocosulx: keep
 	-- strips 3 cells thick at 0.5)
 	minWidth = 1.5,
+	-- how outlines are straightened: "simplify" (the current pipeline's tuned
+	-- simplifier) or "band" (the rubber band)
+	outline = "simplify",
+	-- studs; outline edges longer than this get evenly spaced points before
+	-- triangulation, against fans of thin polygons (0 to disable)
+	splitEdges = 8,
+	-- merge polygons across tile borders where the result stays convex
+	mergeTiles = true,
 }
 
 local UP = Vector3.yAxis
@@ -626,8 +634,31 @@ function GlobalGrid.build(cfg: any): any
 				end
 			end
 			local closed = pk(chain[#chain].b) == pk(chain[1].a)
+			-- THE DENSE RING the old outline simplifier was tuned on: one node per
+			-- cell edge, the edge's midpoint set half a cell into the floor
+			-- (Pipeline's polyline recipe). Cut stretches keep their exact lattice
+			-- points instead, so tile borders and layer seams stay on their lines.
+			local dense, dkinds = {}, {}
+			for ci2, s2 in ipairs(chain) do
+				if s2.kind == "cut" then
+					dense[#dense + 1] = s2.a
+					dkinds[#dkinds + 1] = "cut"
+					-- where a cut stretch hands over to floor edge, its exact end
+					-- point starts the bound stretch, so the two meet on the line
+					local nxt = chain[ci2 % #chain + 1]
+					if nxt.kind ~= "cut" then
+						dense[#dense + 1] = s2.b
+						dkinds[#dkinds + 1] = "bound"
+					end
+				else
+					local d = (s2.b - s2.a) * Vector3.new(1, 0, 1)
+					local left = d.Magnitude > 1e-9 and Vector3.new(d.Z, 0, -d.X).Unit or Vector3.zero
+					dense[#dense + 1] = (s2.a + s2.b) * 0.5 + left * (MIN * 0.5)
+					dkinds[#dkinds + 1] = "bound"
+				end
+			end
 			loops[#loops + 1] = { region = r, pts = pts, kinds = kinds, closed = closed,
-				tile = chain[1].cell.tile, raw = #chain }
+				tile = chain[1].cell.tile, raw = #chain, dense = dense, denseKinds = dkinds }
 		end
 	end
 	stats.loops = #loops
@@ -658,10 +689,193 @@ function GlobalGrid.mesh(g: any): any
 	local stats = { loops = 0, rawCorners = 0, corners = 0, polys = 0, shared = 0, tile = 0, layer = 0,
 		cellsInside = 0, cellsNearest = 0, cellsLost = 0, t = {} }
 
+	-- THE CURRENT PIPELINE'S OUTLINE SIMPLIFIER, per stretch between exact
+	-- points: fit, merge, dejog, collapse bevels, and clean corners on whole
+	-- rings -- with the same tuned settings (Pipeline.OVERRIDES) and the same
+	-- ray validator. Cut stretches are left exactly as they are, and a ring the
+	-- simplifier would shrink by more than keepArea falls back to the band.
+	local PathSimplify = require(script.Parent:WaitForChild("PathSimplify"))
+	local vrp = RaycastParams.new()
+	vrp.FilterType = Enum.RaycastFilterType.Exclude
+	do
+		local ex = {}
+		for _, nm in ipairs({ "NVGN_Debug", "NVGN_Path", "NVGN_GG", "NVGN_Grid", "PathStart", "PathEnd", "NVGN_Follower" }) do
+			local x = workspace:FindFirstChild(nm)
+			if x then ex[#ex + 1] = x end
+		end
+		vrp.FilterDescendantsInstances = ex
+	end
+	local LIFT, RISE, DROP = UP * 0.35, UP * 0.8, -UP * 1.8
+	local function clear(a: Vector3, b: Vector3): boolean
+		local d = b - a
+		if d.Magnitude < 1e-4 then return true end
+		return workspace:Raycast(a + LIFT, d, vrp) == nil
+	end
+	-- the simplifier works on flattened points; rays need the real heights back
+	local curFlat: { Vector3 }?, cur3: { Vector3 }? = nil, nil
+	local function real(v: Vector3): Vector3
+		if not curFlat or not cur3 then return v end
+		local best, bd = v, math.huge
+		for m, f in ipairs(curFlat) do
+			local d = (f.X - v.X) ^ 2 + (f.Z - v.Z) ^ 2
+			if d < bd then bd, best = d, cur3[m] end
+		end
+		return Vector3.new(v.X, best.Y, v.Z)
+	end
+	local function validate(p: Vector3, q: Vector3, r: Vector3?): boolean
+		p, q = real(p), real(q)
+		if r then r = real(r) end
+		if r == nil then return clear(p, q) end
+		if workspace:Raycast(p + RISE, DROP, vrp) == nil then return false end
+		return clear(q, p) and clear(p, r)
+	end
+	local base = { up = UP, validate = validate, mergeAngle = 30, mergeMin = 0.55, mergeMax = 1.2,
+		inwardMax = 1.0 }
+	local run2
+	-- IN PLAN. A layer can climb a staircase, and measured in 3D every tread's
+	-- rise read as a deviation the simplifier had to keep. Simplify the flattened
+	-- outline, then give each point back the height of the nearest real node.
+	local function run(poly3: { Vector3 }, closed: boolean): { Vector3 }
+		local poly = table.create(#poly3)
+		for k, v in ipairs(poly3) do poly[k] = Vector3.new(v.X, 0, v.Z) end
+		curFlat, cur3 = poly, poly3
+		local q = run2(poly, closed)
+		curFlat, cur3 = nil, nil
+		for k, v in ipairs(q) do
+			local best, bd = poly3[1], math.huge
+			for m, f in ipairs(poly) do
+				local d = (f - v).Magnitude
+				if d < bd then bd, best = d, poly3[m] end
+			end
+			q[k] = Vector3.new(v.X, best.Y, v.Z)
+		end
+		if not closed and #q >= 2 then q[1], q[#q] = poly3[1], poly3[#poly3] end
+		return q
+	end
+	run2 = function(poly: { Vector3 }, closed: boolean): { Vector3 }
+		local o = table.clone(base)
+		o.closed = closed
+		local p, i = PathSimplify.simplify(poly, o)
+		p, i = PathSimplify.merge(p, i, poly, o)
+		p, i = PathSimplify.dejog(p, i, poly, o)
+		local q = PathSimplify.collapseBevels(p, o)
+		if closed then
+			local idx = {}
+			for k = 1, #q do idx[k] = k end
+			q = PathSimplify.cleanCorners(q, idx, o)
+		elseif #q >= 2 then
+			q[1], q[#q] = poly[1], poly[#poly] -- the ends are pinned to the exact points
+		end
+		return q
+	end
+	local function area(pts: { Vector3 }): number
+		local a = 0
+		for k = 1, #pts do local p, q = pts[k], pts[k % #pts + 1]; a += p.X * q.Z - q.X * p.Z end
+		return math.abs(a) * 0.5
+	end
+	local function simplifyRing(L: any): ({ Vector3 }?, { string }?)
+		local P, K = L.dense, L.denseKinds
+		local n = #P
+		if n < 4 then return nil, nil end
+		local anyCut = false
+		for k = 1, n do if K[k] == "cut" then anyCut = true; break end end
+		local out, outK = {}, {}
+		if not anyCut then
+			out = run(P, true)
+			for k = 1, #out do outK[k] = "bound" end
+		else
+			-- start at the first point of a cut run
+			local start = 1
+			for k = 1, n do
+				if K[k] == "cut" and K[(k - 2) % n + 1] ~= "cut" then start = k; break end
+			end
+			local k, walked = start, 0
+			while walked < n do
+				if K[k] == "cut" then
+					out[#out + 1] = P[k]; outK[#outK + 1] = "cut"
+					k = k % n + 1; walked += 1
+				else
+					-- a bound stretch: its first node is the exact end of the cut
+					-- before it, and it runs to the exact start of the next cut
+					local poly = {}
+					while K[k] ~= "cut" and walked < n do
+						poly[#poly + 1] = P[k]
+						k = k % n + 1; walked += 1
+					end
+					poly[#poly + 1] = P[k]
+					local q = (#poly >= 3) and run(poly, false) or poly
+					for m = 1, #q - 1 do out[#out + 1] = q[m]; outK[#outK + 1] = "bound" end
+				end
+			end
+		end
+		-- drop the in-between points of every straight cut stretch
+		do
+			local keepP, keepK = {}, {}
+			local m = #out
+			for k = 1, m do
+				local pv, nx = out[(k - 2) % m + 1], out[k % m + 1]
+				local straight = false
+				if outK[k] == "cut" and outK[(k - 2) % m + 1] == "cut" then
+					local d1 = Vector3.new(out[k].X - pv.X, 0, out[k].Z - pv.Z)
+					local d2 = Vector3.new(nx.X - out[k].X, 0, nx.Z - out[k].Z)
+					straight = d1.Magnitude > 1e-6 and d2.Magnitude > 1e-6 and d1.Unit:Dot(d2.Unit) > 0.9999
+				end
+				if not straight then keepP[#keepP + 1] = out[k]; keepK[#keepK + 1] = outK[k] end
+			end
+			out, outK = keepP, keepK
+		end
+		if #out < 3 or area(out) < 0.7 * area(P) then return nil, nil end
+		return out, outK
+	end
+
 	local loops = {}
 	for li, L in ipairs(g.loops) do
 		if L.closed and #L.pts >= 3 then
-			local pts, kinds = RubberBand.pull(L.pts, L.kinds, c.minCell)
+			local pts, kinds
+			if c.outline == "band" then
+				pts, kinds = RubberBand.pull(L.pts, L.kinds, c.minCell)
+			else
+				pts, kinds = simplifyRing(L)
+				if not pts then
+					stats.bandFallback = (stats.bandFallback or 0) + 1
+					pts, kinds = RubberBand.pull(L.pts, L.kinds, c.minCell)
+				end
+			end
+			-- LONG EDGES ARE SPLIT. A Delaunay triangulation of an outline with few
+			-- corners along long straight edges fans every far corner out of one
+			-- vertex; a point every `splitEdges` studs gives it somewhere else to
+			-- go. The points are exactly on the edge, and merging removes the ones
+			-- that end up in the middle of a polygon's side.
+			if c.splitEdges and c.splitEdges > 0 then
+				local sp, sk = {}, {}
+				local n = #pts
+				local E = c.splitEdges
+				for k = 1, n do
+					local a, b = pts[k], pts[k % n + 1]
+					sp[#sp + 1] = a; sk[#sk + 1] = kinds[k]
+					if kinds[k] == "cut" then
+						-- cut edges lie on an axis line: split at fixed WORLD positions,
+						-- so the polygons on both sides of a border get the same corners
+						-- and can be merged across it
+						local axis = (math.abs(a.X - b.X) < 1e-4) and "Z" or "X"
+						local lo, hi = math.min(a[axis], b[axis]), math.max(a[axis], b[axis])
+						local ts = {}
+						for w = math.floor(lo / E) + 1, math.ceil(hi / E) - 1 do
+							local t = (w * E - a[axis]) / (b[axis] - a[axis])
+							if t > 1e-4 and t < 1 - 1e-4 then ts[#ts + 1] = t end
+						end
+						table.sort(ts)
+						for _, t in ipairs(ts) do sp[#sp + 1] = a:Lerp(b, t); sk[#sk + 1] = "cut" end
+					else
+						local len = Vector3.new(b.X - a.X, 0, b.Z - a.Z).Magnitude
+						local pieces = math.floor(len / E)
+						for j = 1, pieces do
+							sp[#sp + 1] = a:Lerp(b, j / (pieces + 1)); sk[#sk + 1] = kinds[k]
+						end
+					end
+				end
+				pts, kinds = sp, sk
+			end
 			stats.rawCorners += #L.pts
 			stats.corners += #pts
 			loops[#loops + 1] = { region = L.region, index = li, pts = pts, kinds = kinds, up = UP, closed = true,
@@ -725,19 +939,155 @@ function GlobalGrid.mesh(g: any): any
 	end
 	local t1 = os.clock()
 	stats.rings = Rings.classify(loops)
-	local mesh = CDT.build(loops, nil)
-	stats.polys = #mesh.tris
+	-- the outlines are already simplified, and the split points are exactly on
+	-- their edges, so CDT's own collinear straightening must not undo the split
+	local savedCol = CDT.collinear
+	if c.splitEdges and c.splitEdges > 0 then CDT.collinear = 0 end
+	local ok, mesh = pcall(CDT.build, loops, nil)
+	CDT.collinear = savedCol
+	if not ok then error(mesh) end
+	do
+		local tileOfR = {}
+		for _, cell in ipairs(g.cells) do tileOfR[cell.region] = cell.tile end
+		for r, subs in pairs(subOf) do for _, sr in ipairs(subs) do tileOfR[sr] = tileOfR[r] end end
+		for _, f in ipairs(mesh.tris) do f.tile = tileOfR[f.region] end
+	end
 	stats.t.cdt = os.clock() - t1
+
+	-- MERGE ACROSS TILE BORDERS. Tiles stay the unit of rebuilding, but where two
+	-- polygons meet across a border on an identical edge and together are still
+	-- convex, they become one -- so a border only shows where it has to. Greedy,
+	-- longest shared edge first, to a fixed point.
+	stats.tileMerges = 0
+	if c.mergeTiles then
+		local tris = mesh.tris
+		local function k2(v: Vector3): string return ("%.3f,%.3f"):format(v.X, v.Z) end
+		local function convex(v: { Vector3 }): boolean
+			local n = #v
+			for q = 1, n do
+				local a, b, cc = v[q], v[q % n + 1], v[(q + 1) % n + 1]
+				-- Y up, region on the left: a right turn is a reflex corner
+				local cr = (b.X - a.X) * (cc.Z - b.Z) - (b.Z - a.Z) * (cc.X - b.X)
+				if cr > 1e-6 then return false end
+			end
+			return true
+		end
+		for _ = 1, 50 do
+			local edgeOwner = {}
+			for fi, f in ipairs(tris) do
+				if f then
+					for q = 1, #f.verts do
+						local a, b = f.verts[q], f.verts[q % #f.verts + 1]
+						edgeOwner[k2(a) .. ">" .. k2(b)] = { fi, q }
+					end
+				end
+			end
+			local cand = {}
+			for fi, f in ipairs(tris) do
+				if f then
+					for q = 1, #f.verts do
+						local a, b = f.verts[q], f.verts[q % #f.verts + 1]
+						local o = edgeOwner[k2(b) .. ">" .. k2(a)]
+						if o and o[1] > fi then
+							local g2 = tris[o[1]]
+							if g2 and g2.tile ~= f.tile then
+								cand[#cand + 1] = { fi, q, o[1], o[2], Vector3.new(b.X - a.X, 0, b.Z - a.Z).Magnitude }
+							end
+						end
+					end
+				end
+			end
+			table.sort(cand, function(x, y) return x[5] > y[5] end)
+			local did = 0
+			for _, cd in ipairs(cand) do
+				local A, B = tris[cd[1]], tris[cd[3]]
+				if A and B and A.verts[cd[2]] and B.verts[cd[4]] then
+					-- SPLICE ALONG THE WHOLE SHARED RUN. Border points sit at fixed world
+					-- positions, so two polygons across a border share several edges in
+					-- a row; splicing along just one leaves the rest as a spur that runs
+					-- out and back, and the shape is no longer simple.
+					local av, bv = A.verts, B.verts
+					local na, nb = #av, #bv
+					local bEdge = {}
+					for q = 1, nb do bEdge[k2(bv[q]) .. ">" .. k2(bv[q % nb + 1])] = q end
+					local sharedA = {}
+					local count = 0
+					for q = 1, na do
+						if bEdge[k2(av[q % na + 1]) .. ">" .. k2(av[q])] then sharedA[q] = true; count += 1 end
+					end
+					local clean = nil
+					if count > 0 and count < na then
+						-- the run must be contiguous: exactly one shared edge whose
+						-- predecessor is not shared
+						local starts, s0 = 0, nil
+						for q = 1, na do
+							if sharedA[q] and not sharedA[(q - 2) % na + 1] then starts += 1; s0 = q end
+						end
+						if starts == 1 and s0 then
+							local runEnd = (s0 + count - 1) % na + 1 -- vertex index after the run
+							local merged = {}
+							-- A's own part: from the run's end vertex round to its start vertex
+							local q = runEnd
+							for _ = 1, na do
+								merged[#merged + 1] = av[q]
+								if q == s0 then break end
+								q = q % na + 1
+							end
+							-- B's own part, strictly between av[s0] and av[runEnd]
+							local jb = bEdge[k2(av[s0 % na + 1]) .. ">" .. k2(av[s0])] -- B edge matching A's first shared edge
+							-- B's run ends at the vertex equal to av[s0]; walk B forward from there
+							local startB = nil
+							for w = 1, nb do if k2(bv[w]) == k2(av[s0]) then startB = w; break end end
+							if startB and jb then
+								local w = startB % nb + 1
+								for _ = 1, nb do
+									if k2(bv[w]) == k2(av[runEnd]) then break end
+									merged[#merged + 1] = bv[w]
+									w = w % nb + 1
+								end
+								clean = {}
+								for z = 1, #merged do
+									if k2(merged[z]) ~= k2(merged[z % #merged + 1]) then clean[#clean + 1] = merged[z] end
+								end
+							end
+						end
+					end
+					if clean then
+						if #clean >= 3 and convex(clean) then
+							local ctr = Vector3.zero
+							for _, w in ipairs(clean) do ctr += w end
+							A.verts = clean
+							A.n = #clean
+							A.centre = ctr / #clean
+							A.area = (A.area or 0) + (B.area or 0)
+							A.regions = A.regions or { [A.region] = true }
+							for r2 in pairs(B.regions or { [B.region] = true }) do A.regions[r2] = true end
+							tris[cd[3]] = false
+							did += 1
+							stats.tileMerges += 1
+						end
+					end
+				end
+			end
+			if did == 0 then break end
+		end
+		local keep = {}
+		for _, f in ipairs(tris) do if f then keep[#keep + 1] = f end end
+		mesh.tris = keep
+	end
+	stats.polys = #mesh.tris
 
 	-- which tile a region lives in, and a region's polygons
 	local tileOfRegion, polysOf = {}, {}
 	for _, cell in ipairs(g.cells) do tileOfRegion[cell.region] = cell.tile end
 	for r, subs in pairs(subOf) do for _, sr in ipairs(subs) do tileOfRegion[sr] = tileOfRegion[r] end end
 	for i, f in ipairs(mesh.tris) do
-		local l = polysOf[f.region]
-		if not l then l = {}; polysOf[f.region] = l end
-		l[#l + 1] = i
-		f.tile = tileOfRegion[f.region]
+		for r2 in pairs(f.regions or { [f.region] = true }) do
+			local l = polysOf[r2]
+			if not l then l = {}; polysOf[r2] = l end
+			l[#l + 1] = i
+		end
+		f.tile = f.tile or tileOfRegion[f.region]
 	end
 
 	-- membership
@@ -798,7 +1148,7 @@ function GlobalGrid.mesh(g: any): any
 		for k = 1, f.n do
 			local A, B = f.verts[k], f.verts[k % f.n + 1]
 			local ka, kb = vk(A), vk(B)
-			local key = f.region .. "#" .. ((ka < kb) and (ka .. "|" .. kb) or (kb .. "|" .. ka))
+			local key = (ka < kb) and (ka .. "|" .. kb) or (kb .. "|" .. ka)
 			local prev = seen[key]
 			if prev and prev.poly ~= i then
 				links[#links + 1] = { kind = "shared", a = prev.poly, b = i, left = prev.a, right = prev.b,
@@ -813,14 +1163,29 @@ function GlobalGrid.mesh(g: any): any
 	-- kept exactly, lying on lattice lines, and the grid already proved the cells
 	-- either side connect. A polygon edge that lies on one of its own loop's cut
 	-- stretches is matched to the overlapping cut edge of the polygon across it.
+	-- consecutive collinear cut pieces are joined into one run first: a polygon
+	-- edge along a border spans many half-stud pieces of the dense ring
 	local cutsOf: { [number]: { any } } = {}
 	for _, L in ipairs(loops) do
 		local n = #L.pts
+		local l = cutsOf[L.region]
+		if not l then l = {}; cutsOf[L.region] = l end
+		local cur = nil
 		for k = 1, n do
 			if L.kinds and L.kinds[k] == "cut" then
-				local l = cutsOf[L.region]
-				if not l then l = {}; cutsOf[L.region] = l end
-				l[#l + 1] = { L.pts[k], L.pts[k % n + 1] }
+				local a, b = L.pts[k], L.pts[k % n + 1]
+				local d = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+				if cur and d.Magnitude > 1e-6 then
+					local cd = Vector3.new(cur[2].X - cur[1].X, 0, cur[2].Z - cur[1].Z)
+					if cd.Magnitude > 1e-6 and cd.Unit:Dot(d.Unit) > 0.9999 and (cur[2] - a).Magnitude < 1e-4 then
+						cur[2] = b
+						continue
+					end
+				end
+				cur = { a, b }
+				l[#l + 1] = cur
+			else
+				cur = nil
 			end
 		end
 	end
@@ -848,7 +1213,13 @@ function GlobalGrid.mesh(g: any): any
 			local key, along
 			if math.abs(A.X - B.X) < 1e-4 then key, along = ("x:%.3f"):format(A.X), "Z"
 			elseif math.abs(A.Z - B.Z) < 1e-4 then key, along = ("z:%.3f"):format(A.Z), "X" end
-			if key and onCut(f.region, A, B) then
+			local cutHere = false
+			if key then
+				for r2 in pairs(f.regions or { [f.region] = true }) do
+					if onCut(r2, A, B) then cutHere = true; break end
+				end
+			end
+			if cutHere then
 				local l = onLine[key]
 				if not l then l = {}; onLine[key] = l end
 				l[#l + 1] = { poly = i, a = A, b = B, along = along }
