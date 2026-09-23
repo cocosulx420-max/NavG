@@ -204,9 +204,9 @@ LocalGrid.maxNodeCells = 16
 
 -- THE SWITCH. false bakes the uniform 0.5 stud lattice everywhere (every node
 -- one cell), true collapses interior floor into nodes up to maxNodeCells wide.
--- OFF since 2026-09-23 (Cocosulx). Expect a much slower bake with it off: case5
+-- ON (Cocosulx). Expect a much slower bake with it off: case5
 -- measured 66.6s uniform against 7.7s adaptive.
-LocalGrid.adaptive = false
+LocalGrid.adaptive = true
 
 -- Collapse faces that are NOT blocks. ON, and it is the difference between the
 -- adaptive grid earning its keep on a dense map and doing nothing there.
