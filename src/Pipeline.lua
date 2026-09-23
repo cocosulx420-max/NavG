@@ -1773,56 +1773,101 @@ function Pipeline.drawPortals(result: any, opts: any?): (Instance, string)
 		shared = folder("shared"),
 		seam = folder("seam"),
 		bridge = folder("bridge"),
+		drop = folder("drop"),
+		jump = folder("jump"),
 	}
 
-	-- ONE COLOUR PER KIND, plus the one height fact a pathfinder must not miss.
-	-- Chosen clear of the outline drawing (cyan rims, pink holes, yellow
-	-- corners, green closures) so both can be shown at once:
+	-- ONE COLOUR PER KIND, chosen clear of the outline drawing (cyan rims, pink
+	-- holes, yellow corners, green closures):
 	--   blue    shared  -- the exact edge two polygons of one region share
 	--   green   seam    -- between regions, flush (height change <= 0.25)
-	--   orange  seam    -- between regions, a step (0.25 to 1.5)
+	--   orange  seam    -- between regions, a step up to the largest step
 	--   purple  bridge  -- across floor too narrow to trace
-	--   red     any kind changing height by more than the largest step (Agents)
+	--   red     drop    -- one-way, off an edge
+	--   teal    jump    -- one-way, up onto a ledge or across a gap
+	--   dark red        a walk link steeper than any step: should not exist
 	--   white   ball    -- a polygon with no link at all
+	-- A portal with two sides is drawn as TWO bars, the overlap on each edge,
+	-- with arrows between them: two for a two-way crossing, one for one-way.
 	local SHARED = o.sharedColor or Color3.fromRGB(40, 110, 255)
 	local FLUSH  = o.flushColor or Color3.fromRGB(60, 255, 90)
 	local STEP   = o.stepColor or Color3.fromRGB(255, 140, 20)
 	local BRIDGE = o.bridgeColor or Color3.fromRGB(170, 70, 255)
-	local STEEP  = o.steepColor or Color3.fromRGB(255, 30, 30)
+	local DROP   = o.dropColor or Color3.fromRGB(255, 40, 40)
+	local JUMP   = o.jumpColor or Color3.fromRGB(0, 230, 220)
+	local STEEP  = o.steepColor or Color3.fromRGB(140, 0, 0)
 	local STEPMAX = require(script.Parent:WaitForChild("Agents")).envelope().step
+
+	local function arrow(from: Vector3, to: Vector3, colour: Color3, parent: Instance)
+		local d = to - from
+		local len = d.Magnitude
+		if len < 0.05 then return end
+		local head = math.min(0.5, len * 0.45)
+		local dir = d / len
+		segment(from, to - dir * head * 0.5, 0.07, colour, "shaft", parent)
+		-- a V for the head, in the plane that holds the arrow and the world up
+		-- (or world X when the arrow is vertical, as a drop's is)
+		local side = dir:Cross(math.abs(dir.Y) > 0.9 and Vector3.xAxis or Vector3.yAxis)
+		if side.Magnitude < 1e-3 then side = Vector3.zAxis end
+		side = side.Unit
+		segment(to, to - dir * head + side * head * 0.6, 0.07, colour, "head", parent)
+		segment(to, to - dir * head - side * head * 0.6, 0.07, colour, "head", parent)
+	end
 
 	for i, L in ipairs(res.links) do
 		local into = byKind[L.kind] or byKind.seam
 		local up = mesh.tris[L.a].up
 		local off = up * lift
 		local g = Instance.new("Folder")
-		g.Name = ("p%04d_f%04d-f%04d_%.1fw_%+.2fdrop"):format(i, L.a, L.b, L.span, L.drop)
+		local rise = L.rise or -(L.drop or 0)
+		g.Name = ("%sp%04d_f%04d-f%04d_%.1fw_%+.2frise"):format(
+			(L.kind ~= "shared" and not (L.bLeft and L.bRight)) and "FITTED_" or "",
+			i, L.a, L.b, L.span, rise)
 		g.Parent = into
 
-		local d = math.abs(L.drop or 0)
+		local d = math.abs(rise)
 		local colour
-		if d > STEPMAX then colour = STEEP
-		elseif L.kind == "shared" then colour = SHARED
+		if L.kind == "shared" then colour = SHARED
+		elseif L.kind == "drop" then colour = DROP
+		elseif L.kind == "jump" then colour = JUMP
+		elseif d > STEPMAX then colour = STEEP
 		elseif L.kind == "bridge" then colour = BRIDGE
 		else colour = (d <= 0.25) and FLUSH or STEP end
-		if L.span > 1e-4 then
-			segment(L.left + off, L.right + off, 0.22, colour, "gate", g)
-		else
-			-- a one-cell-pair portal has no width to draw, and a missing bar
-			-- would read as a missing link
-			local b = Instance.new("Part")
-			b.Anchored = true; b.CanCollide = false; b.CanQuery = false; b.CanTouch = false
-			b.Shape = Enum.PartType.Ball
-			b.Size = Vector3.new(0.3, 0.3, 0.3)
-			b.Color = colour; b.Material = Enum.Material.Neon
-			b.CFrame = CFrame.new(L.centre + off)
-			b.Name = "gate"
-			b.Parent = g
+
+		local function bar(a: Vector3, b: Vector3, name: string)
+			if (b - a).Magnitude > 1e-4 then
+				segment(a + off, b + off, 0.2, colour, name, g)
+			else
+				-- a one-cell-pair portal has no width to draw, and a missing bar
+				-- would read as a missing link
+				local ball = Instance.new("Part")
+				ball.Anchored = true; ball.CanCollide = false; ball.CanQuery = false; ball.CanTouch = false
+				ball.Shape = Enum.PartType.Ball
+				ball.Size = Vector3.new(0.3, 0.3, 0.3)
+				ball.Color = colour; ball.Material = Enum.Material.Neon
+				ball.CFrame = CFrame.new(a + off)
+				ball.Name = name
+				ball.Parent = g
+			end
 		end
-		-- the two ends of the link, so the graph is visible and not just the gates
-		segment(mesh.tris[L.a].centre + off, L.centre + off, 0.07, colour, "a", g)
-		segment(mesh.tris[L.b].centre + mesh.tris[L.b].up * lift, L.centre + off,
-			0.07, colour, "b", g)
+		bar(L.left, L.right, "gateA")
+		if L.bLeft and L.bRight then
+			bar(L.bLeft, L.bRight, "gateB")
+			-- L.left pairs with L.bRight and L.right with L.bLeft (B's edge runs the
+			-- other way), so the point at fraction t on A faces 1 - t on B
+			local function at(t: number): (Vector3, Vector3)
+				return L.left:Lerp(L.right, t) + off, L.bRight:Lerp(L.bLeft, t) + off
+			end
+			if L.oneWay then
+				local pa, pb = at(0.5)
+				arrow(pa, pb, colour, g)
+			else
+				local pa, pb = at(1 / 3)
+				arrow(pa, pb, colour, g)
+				local qa, qb = at(2 / 3)
+				arrow(qb, qa, colour, g)
+			end
+		end
 	end
 
 	local orphans = 0

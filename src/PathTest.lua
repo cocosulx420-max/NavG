@@ -269,7 +269,38 @@ function PathTest.draw(result: any, path: any): Folder
 	f.Name = PathTest.folderName
 	local up = Vector3.yAxis * PathTest.lift
 	local pts = path.points
-	for k = 2, #pts do segment(pts[k - 1] + up, pts[k] + up, Color3.fromRGB(255, 255, 255), 0.3, f) end
+	-- ALONG THE SURFACES: a straight corner-to-corner line cuts through stair
+	-- treads and floats over ridges. Sample each stretch and put every sample on
+	-- the corridor polygon under it; the route itself is unchanged.
+	local mesh = result.mesh
+	local corridor = { path.from }
+	for _, st in ipairs(path.chain) do corridor[#corridor + 1] = st.e.to end
+	local function surfaceAt(p: Vector3): Vector3
+		for _, i in ipairs(corridor) do
+			local poly = mesh.tris[i]
+			local v = poly.verts
+			local n = #v
+			local inside = true
+			for k = 1, n do
+				local a2, b2 = v[k], v[k % n + 1]
+				if (b2.X - a2.X) * (p.Z - a2.Z) - (b2.Z - a2.Z) * (p.X - a2.X) > 1e-4 then inside = false; break end
+			end
+			if inside then
+				local c, u = poly.centre, poly.up or Vector3.yAxis
+				local h = c.Y
+				if math.abs(u.Y) > 1e-3 then h = c.Y - ((p.X - c.X) * u.X + (p.Z - c.Z) * u.Z) / u.Y end
+				return Vector3.new(p.X, h, p.Z)
+			end
+		end
+		return p
+	end
+	local trail = { pts[1] }
+	for k = 2, #pts do
+		local a2, b2 = pts[k - 1], pts[k]
+		local m = math.max(1, math.floor((b2 - a2).Magnitude / 0.5))
+		for j = 1, m do trail[#trail + 1] = surfaceAt(a2:Lerp(b2, j / m)) end
+	end
+	for k = 2, #trail do segment(trail[k - 1] + up, trail[k] + up, Color3.fromRGB(255, 255, 255), 0.3, f) end
 	-- the portals the path went through, black, so a bad one is visible where it bites
 	for _, st in ipairs(path.chain) do
 		local L = st.e.L
