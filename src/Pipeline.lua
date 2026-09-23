@@ -30,6 +30,9 @@ local FaceKind = require(script.Parent:WaitForChild("FaceKind"))
 local EdgeKind = require(script.Parent:WaitForChild("EdgeKind"))
 local Nodes = require(script.Parent:WaitForChild("Nodes"))
 local Portals = require(script.Parent:WaitForChild("Portals"))
+local Leaps = require(script.Parent:WaitForChild("Leaps"))
+-- drop and jump links (one-way), see Leaps
+Pipeline.leaps = true
 
 -- TUNING LIVES IN THE MODULES, NOT HERE. A number in OVERRIDES is a deliberate
 -- departure from a module's own default, and the module comment next to that
@@ -1613,8 +1616,129 @@ function Pipeline.portals(result: any): any
 			result.severance = snap
 		end
 		result.portals = Portals.build(mesh, result.data, snap)
+		if Pipeline.leaps then
+			-- rays must not hit our own drawings, markers or characters
+			local ex = {}
+			for _, n in ipairs({ Pipeline.debugName, "NVGN_Path", "PathStart", "PathEnd", "NVGN_Follower" }) do
+				local x = workspace:FindFirstChild(n)
+				if x then ex[#ex + 1] = x end
+			end
+			local root = result.data.config and result.data.config.root
+			if typeof(root) == "Instance" then
+				for _, h in ipairs(root:GetDescendants()) do
+					if h:IsA("Humanoid") and h.Parent then ex[#ex + 1] = h.Parent end
+				end
+			end
+			Leaps.build(mesh, result.data, result.portals, ex)
+		end
+		Pipeline.measure_(result)
 	end
 	return result.portals
+end
+
+-- MEASUREMENTS, NOT VERDICTS. One bake serves every NPC profile (see Agents),
+-- so each polygon and link carries what is actually there and a profile filters
+-- at path time:
+--   polygon  slope (deg), headroom (lowest clearance of any cell under it),
+--            width (twice the largest distance from a cell under it to a wall or
+--            drop: the widest NPC that fits anywhere in it; capped, since open
+--            floor has no bound)
+--   link     rise (signed height change a -> b), span (usable width), gap
+--            (horizontal distance crossed), type walk / step
+-- Drop and jump links (one-way) carry the same fields.
+Pipeline.widthCap = 64
+
+function Pipeline.measure_(result: any)
+	local mesh, res = result.mesh, result.portals
+	local data = result.data
+	-- WALLS ONLY. Distance to a drop or a step edge would make a 6.5 stud wide
+	-- staircase read 1.5 wide (the tread's own edge is 0.75 away) -- and a step
+	-- is walked across, not bumped into. A narrow ledge between a wall and a
+	-- drop is left to the stuck fallback.
+	if not data.wallDistMeasured then
+		Thickness.build(data, nil, { seedWallOnly = true, field = "wallDist" })
+		data.wallDistMeasured = true
+	end
+	local head, wide, n = {}, {}, {}
+	for cell, pi in pairs(res.polyOf) do
+		local c = cell.clearance or math.huge
+		if head[pi] == nil or c < head[pi] then head[pi] = c end
+		local t = cell.wallDist
+		if t and t ~= math.huge then
+			if wide[pi] == nil or t > wide[pi] then wide[pi] = t end
+		elseif t == math.huge then
+			wide[pi] = Pipeline.widthCap
+		end
+		n[pi] = (n[pi] or 0) + 1
+	end
+	-- PORTAL CLEARANCE is the width that decides whether a wide NPC gets
+	-- through, not a polygon's own width: triangulation cuts open floor into
+	-- thin triangles along walls, and a third of case6's polygons measured under
+	-- 2 studs by themselves while sitting in wide rooms. Along the portal, the
+	-- widest point to cross at is twice the largest wall distance of the cells
+	-- under it; a corridor is narrow at every point, a room is not.
+	local H = 1.0
+	local cellsAt: { [string]: { any } } = {}
+	for cell in pairs(res.polyOf) do
+		local p = cell.pos
+		local k = math.floor(p.X / H) .. ":" .. math.floor(p.Z / H)
+		local b = cellsAt[k]
+		if not b then b = {}; cellsAt[k] = b end
+		b[#b + 1] = cell
+	end
+	local function clearAt(p: Vector3, reach: number): number
+		local best = 0
+		local bx, bz = math.floor(p.X / H), math.floor(p.Z / H)
+		for dx = -1, 1 do
+			for dz = -1, 1 do
+				for _, cell in ipairs(cellsAt[(bx + dx) .. ":" .. (bz + dz)] or {}) do
+					local d = cell.pos - p
+					if Vector3.new(d.X, 0, d.Z).Magnitude <= reach and math.abs(d.Y) < 2.5 then
+						local t = cell.wallDist
+						if t == math.huge then return Pipeline.widthCap end
+						if t and t > best then best = t end
+					end
+				end
+			end
+		end
+		return best
+	end
+	for i, f in ipairs(mesh.tris) do
+		local up = f.up or Vector3.yAxis
+		f.slope = math.deg(math.acos(math.clamp(up.Y, -1, 1)))
+		f.headroom = head[i] or 0
+		f.width = math.min(Pipeline.widthCap, 2 * (wide[i] or 0))
+		f.cells = n[i] or 0
+	end
+	local step = require(script.Parent:WaitForChild("Agents")).envelope().step
+	-- height of a polygon's plane under a point
+	local function heightAt(f: any, p: Vector3): number
+		local c, up = f.centre, f.up or Vector3.yAxis
+		if math.abs(up.Y) < 1e-3 then return c.Y end
+		return c.Y - ((p.X - c.X) * up.X + (p.Z - c.Z) * up.Z) / up.Y
+	end
+	for _, L in ipairs(res.links) do
+		-- FROM GEOMETRY, a -> b. The Severance drop's sign follows whichever
+		-- polygon was numbered lower, so up a staircase it alternated +1/-1.
+		local pa = L.centre
+		local pb = (L.bLeft and L.bRight) and (L.bLeft + L.bRight) * 0.5 or L.centre
+		L.rise = heightAt(mesh.tris[L.b], pb) - heightAt(mesh.tris[L.a], pa)
+		L.gap = L.gap or 0
+		-- along the portal, both sides of it
+		local best = 0
+		local len = (L.right - L.left).Magnitude
+		local m = math.max(1, math.floor(len / 0.5))
+		for k = 0, m do
+			local t = k / m
+			best = math.max(best, clearAt(L.left:Lerp(L.right, t), 0.75))
+			if L.bLeft and L.bRight then best = math.max(best, clearAt(L.bRight:Lerp(L.bLeft, t), 0.75)) end
+			if best >= Pipeline.widthCap then break end
+		end
+		L.clear = math.min(Pipeline.widthCap, 2 * best)
+		local d = math.abs(L.rise)
+		L.type = L.type or ((d <= 0.25) and "walk" or (d <= step) and "step" or "steep")
+		L.oneWay = L.oneWay or false
+	end
 end
 
 -- A bar across every portal, plus the polygon centres it joins.
@@ -1658,13 +1782,14 @@ function Pipeline.drawPortals(result: any, opts: any?): (Instance, string)
 	--   green   seam    -- between regions, flush (height change <= 0.25)
 	--   orange  seam    -- between regions, a step (0.25 to 1.5)
 	--   purple  bridge  -- across floor too narrow to trace
-	--   red     any kind changing height by more than the 1.5 gate
+	--   red     any kind changing height by more than the largest step (Agents)
 	--   white   ball    -- a polygon with no link at all
 	local SHARED = o.sharedColor or Color3.fromRGB(40, 110, 255)
 	local FLUSH  = o.flushColor or Color3.fromRGB(60, 255, 90)
 	local STEP   = o.stepColor or Color3.fromRGB(255, 140, 20)
 	local BRIDGE = o.bridgeColor or Color3.fromRGB(170, 70, 255)
 	local STEEP  = o.steepColor or Color3.fromRGB(255, 30, 30)
+	local STEPMAX = require(script.Parent:WaitForChild("Agents")).envelope().step
 
 	for i, L in ipairs(res.links) do
 		local into = byKind[L.kind] or byKind.seam
@@ -1676,7 +1801,7 @@ function Pipeline.drawPortals(result: any, opts: any?): (Instance, string)
 
 		local d = math.abs(L.drop or 0)
 		local colour
-		if d > 1.5 then colour = STEEP
+		if d > STEPMAX then colour = STEEP
 		elseif L.kind == "shared" then colour = SHARED
 		elseif L.kind == "bridge" then colour = BRIDGE
 		else colour = (d <= 0.25) and FLUSH or STEP end

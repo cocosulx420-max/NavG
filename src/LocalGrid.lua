@@ -1,6 +1,9 @@
 --!strict
 
 local Floor = require(script.Parent:WaitForChild("Floor"))
+local Agents = require(script.Parent:WaitForChild("Agents"))
+-- the bake keeps everything ANY profile can use; see Agents
+local ENV = Agents.envelope()
 
 local LocalGrid = {}
 
@@ -61,9 +64,9 @@ export type Config = {
 
 local DEFAULT = {
 	step = 0.5,         -- local cell size (studs)
-	maxSlope = 65,      -- max walkable slope (deg); Cocosulx-tested
+	maxSlope = ENV.maxSlope, -- max walkable slope (deg); Cocosulx-tested 65, lives in Agents
 	clearCap = 20,      -- clearance raycast cap
-	minClearance = 1.5, -- below this a cell isn't standable floor (crawl minimum)
+	minClearance = ENV.prone, -- below this a cell isn't floor at all: the smallest profile's crawl height
 	-- How far a neighbouring surface may sit from where THIS grid's surface
 	-- would continue, and still count as the same floor. Not a step height: a
 	-- step up of any size is a wall now, and pathfinding deals with climbing it.
@@ -127,8 +130,11 @@ local DEFAULT = {
 	-- preferences: a crouch tunnel and the room it opens into are different
 	-- places to move through even where the floor runs straight between them,
 	-- so they are never the same region.
-	standHeight = 5,
-	crouchHeight = 3,
+	-- From the DEFAULT profile, not the envelope: these only split regions by
+	-- posture. Each profile's own headroom test runs at path time against the
+	-- polygon's measured headroom.
+	standHeight = Agents.get("default").height,
+	crouchHeight = Agents.get("default").crouch,
 	-- 4 or 8. See DIR4 above; 4 is what the boundary tracing needs.
 	connectivity = 4,
 }

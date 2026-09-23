@@ -45,6 +45,7 @@
 local Portals = {}
 
 local Rings = require(script.Parent:WaitForChild("Rings"))
+local Agents = require(script.Parent:WaitForChild("Agents"))
 
 -- How far outside a polygon a cell may sit and still be claimed by it, as a
 -- fraction of the grid step.
@@ -859,7 +860,7 @@ local function bridgeLinks(snap: any, of: { [any]: number }, data: any, step: nu
 				-- 2.0 step a Roblox humanoid climbs by default. Reported, never filtered:
 				-- it is a fine link to fall DOWN and the direction is the consumer's to
 				-- price, not ours to delete.
-				if math.abs(links[#links].drop) > 1.5 then
+				if math.abs(links[#links].drop) > Agents.envelope().step then
 					stats.bridgeSteep += 1
 					stats.bridgeSteepAt[#stats.bridgeSteepAt + 1] =
 						("f%04d-f%04d drop %+.2f over %d cells")
@@ -1188,8 +1189,8 @@ function Portals.report(res: any): string
 		lines[#lines + 1] = "  !  group is not a line: " .. s.bentAt[i]
 	end
 	if s.bridgeSteep > 0 then
-		lines[#lines + 1] = ("  !  %d bridges change height by more than the 1.5 gate -- two crossings chained:")
-			:format(s.bridgeSteep)
+		lines[#lines + 1] = ("  !  %d bridges change height by more than the %.1f step -- two crossings chained:")
+			:format(s.bridgeSteep, Agents.envelope().step)
 		for i = 1, math.min(#s.bridgeSteepAt, 6) do
 			lines[#lines + 1] = "     " .. s.bridgeSteepAt[i]
 		end

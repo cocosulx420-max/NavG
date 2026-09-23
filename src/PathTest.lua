@@ -17,6 +17,7 @@ local PathTest = {}
 
 PathTest.lift = 0.6         -- studs the drawn path floats above the floor
 PathTest.snapHeight = 4.0   -- how far below a marker a polygon may be and still hold it
+PathTest.snapReach = 3.0    -- studs off the mesh a point may be and still find its polygon
 PathTest.folderName = "NVGN_Path"
 
 local function flat(v: Vector3): Vector3 return Vector3.new(v.X, 0, v.Z) end
@@ -48,6 +49,28 @@ local function locate(mesh: any, p: Vector3): (number?, number)
 			end
 		end
 	end
+	if best then return best, bestDy end
+	-- NOT ON THE MESH, then the NEAREST polygon within reach, the way Detour's
+	-- findNearestPoly does. The mesh stops short of walls and rims, so a walking
+	-- NPC keeps stepping off it; without this it loses its place and stops.
+	local bestD = PathTest.snapReach
+	for i, f in ipairs(mesh.tris) do
+		local v = f.verts
+		local n = #v
+		for k = 1, n do
+			local a, b = v[k], v[k % n + 1]
+			local d = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+			local dd = d:Dot(d)
+			local q = Vector3.new(p.X - a.X, 0, p.Z - a.Z)
+			local t = dd > 1e-9 and math.clamp(q:Dot(d) / dd, 0, 1) or 0
+			local dist = (q - d * t).Magnitude
+			if dist < bestD then
+				local h = a.Y + (b.Y - a.Y) * t
+				local dy = p.Y - h
+				if dy > -1.0 and dy < PathTest.snapHeight then best, bestD, bestDy = i, dist, dy end
+			end
+		end
+	end
 	return best, (best and bestDy or 0)
 end
 
@@ -61,12 +84,44 @@ local function graph(res: any): { [number]: { any } }
 	end
 	for _, L in ipairs(res.links) do
 		add(L.a, L.b, L, false)
-		add(L.b, L.a, L, true)
+		-- a drop or a jump goes one way only
+		if not L.oneWay then add(L.b, L.a, L, true) end
 	end
 	return adj
 end
 
-local function astar(mesh: any, adj: any, s: number, g: number, sp: Vector3, gp: Vector3)
+-- CAN THIS PROFILE USE IT. The bake stores measurements (see Agents and
+-- Pipeline.measure_); here each NPC profile decides. `banned` is the stuck
+-- fallback: polygons or links a follower gave up on, for a while.
+local function usable(mesh: any, e: any, prof: any?, banned: any?): boolean
+	if banned and (banned[e.L] or banned[e.to]) then return false end
+	if not prof then return true end
+	local L, T = e.L, mesh.tris[e.to]
+	local w = 2 * (prof.radius or 0)
+	if T.headroom and T.headroom < (prof.prone or 0) then return false end
+	-- width by the PORTAL'S clearance (see Pipeline.measure_); a polygon's own
+	-- width misleads, a thin triangle along a wall can sit in a wide room
+	if L.clear and L.clear < w then return false end
+	local rise = L.rise or 0
+	if e.reverse then rise = -rise end
+	if L.kind == "drop" then
+		return -rise <= (prof.drop or math.huge)
+	elseif L.kind == "jump" then
+		return rise <= (prof.jump or 0) and (L.gap or 0) <= (prof.jumpDistance or 0)
+	end
+	return math.abs(rise) <= (prof.step or math.huge)
+end
+
+-- extra cost for moving somewhere cramped, so an upright route wins when there is one
+local function postureCost(T: any, prof: any?): number
+	if not prof or not T.headroom then return 1 end
+	if T.headroom < (prof.crouch or 0) then return 3 end
+	if T.headroom < (prof.height or 0) then return 1.6 end
+	return 1
+end
+
+local function astar(mesh: any, adj: any, s: number, g: number, sp: Vector3, gp: Vector3,
+	prof: any?, banned: any?)
 	local open, came, gs = { s }, {}, { [s] = 0 }
 	local pos = { [s] = sp }
 	local fs = { [s] = (gp - sp).Magnitude }
@@ -83,9 +138,10 @@ local function astar(mesh: any, adj: any, s: number, g: number, sp: Vector3, gp:
 		end
 		closed[cur] = true
 		for _, e in ipairs(adj[cur] or {}) do
-			if not closed[e.to] then
+			if not closed[e.to] and usable(mesh, e, prof, banned) then
 				local via = e.L.centre
-				local cost = gs[cur] + (via - pos[cur]).Magnitude
+				local leap = (e.L.kind == "jump" or e.L.kind == "drop") and 2 or 0
+				local cost = gs[cur] + (via - pos[cur]).Magnitude * postureCost(mesh.tris[e.to], prof) + leap
 				if gs[e.to] == nil or cost < gs[e.to] then
 					gs[e.to] = cost
 					pos[e.to] = via
@@ -180,7 +236,7 @@ local function segment(a: Vector3, b: Vector3, colour: Color3, thick: number, pa
 	p.Parent = parent
 end
 
-function PathTest.solve(result: any, sp: Vector3, gp: Vector3): (any, string)
+function PathTest.solve(result: any, sp: Vector3, gp: Vector3, prof: any?, banned: any?): (any, string)
 	local mesh, res = result.mesh, result.portals
 	result._pathAdj = result._pathAdj or graph(res)
 	local s, sdy = locate(mesh, sp)
@@ -188,7 +244,7 @@ function PathTest.solve(result: any, sp: Vector3, gp: Vector3): (any, string)
 	if not s then return nil, "PathStart is not above any polygon" end
 	if not g then return nil, "PathEnd is not above any polygon" end
 	local sFloor, gFloor = sp - Vector3.yAxis * sdy, gp - Vector3.yAxis * gdy
-	local chain = (s == g) and {} or astar(mesh, result._pathAdj, s, g, sp, gp)
+	local chain = (s == g) and {} or astar(mesh, result._pathAdj, s, g, sp, gp, prof, banned)
 	if not chain then
 		return nil, ("no path: polygon f%04d (r%03d) and f%04d (r%03d) are not connected")
 			:format(s, mesh.tris[s].region, g, mesh.tris[g].region)

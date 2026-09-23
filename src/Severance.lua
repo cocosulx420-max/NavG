@@ -42,8 +42,16 @@ local Severance = {}
 -- SYMMETRIC, on purpose: `math.abs` means a climb and a drop of the same size
 -- are the same link. A drop is the easier of the two in reality, so this is the
 -- conservative side of that asymmetry rather than the convenient one.
-Severance.stepPlane = 0.75
-Severance.stepNormal = 1.5
+--
+-- 2026-09-23: along the normal now comes from Agents -- the largest step any
+-- profile takes (2.0 for a Roblox character, which is what Cocosulx asked for).
+-- In plane goes 0.75 -> 1.0: a cell and its neighbour on another part's
+-- lattice can sit up to a step plus the lattice mismatch apart, and case6's
+-- right staircase came out unreachable because its bottom tread's cells were
+-- 0.76 from the floor's. 1.0 is still inside one cell of the next row.
+local Agents = require(script.Parent:WaitForChild("Agents"))
+Severance.stepPlane = 1.0
+Severance.stepNormal = Agents.envelope().step
 
 -- Bucket edge for the spatial hash. Must be at least the gate reach, or a
 -- neighbour could sit outside the 3x3x3 block that gets scanned.
