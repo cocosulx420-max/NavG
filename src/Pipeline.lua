@@ -1651,12 +1651,20 @@ function Pipeline.drawPortals(result: any, opts: any?): (Instance, string)
 		bridge = folder("bridge"),
 	}
 
-	-- Colour says HEIGHT, not kind -- the folder already says kind. A flush link
-	-- and a 1.38 stud step look nothing alike to anything that has to price them.
-	local SHARED = Color3.fromRGB(90, 220, 255)
-	local FLUSH  = Color3.fromRGB(120, 255, 140)
-	local STEP   = Color3.fromRGB(255, 205, 70)
-	local STEEP  = Color3.fromRGB(255, 90, 200)
+	-- ONE COLOUR PER KIND, plus the one height fact a pathfinder must not miss.
+	-- Chosen clear of the outline drawing (cyan rims, pink holes, yellow
+	-- corners, green closures) so both can be shown at once:
+	--   blue    shared  -- the exact edge two polygons of one region share
+	--   green   seam    -- between regions, flush (height change <= 0.25)
+	--   orange  seam    -- between regions, a step (0.25 to 1.5)
+	--   purple  bridge  -- across floor too narrow to trace
+	--   red     any kind changing height by more than the 1.5 gate
+	--   white   ball    -- a polygon with no link at all
+	local SHARED = o.sharedColor or Color3.fromRGB(40, 110, 255)
+	local FLUSH  = o.flushColor or Color3.fromRGB(60, 255, 90)
+	local STEP   = o.stepColor or Color3.fromRGB(255, 140, 20)
+	local BRIDGE = o.bridgeColor or Color3.fromRGB(170, 70, 255)
+	local STEEP  = o.steepColor or Color3.fromRGB(255, 30, 30)
 
 	for i, L in ipairs(res.links) do
 		local into = byKind[L.kind] or byKind.seam
@@ -1666,11 +1674,12 @@ function Pipeline.drawPortals(result: any, opts: any?): (Instance, string)
 		g.Name = ("p%04d_f%04d-f%04d_%.1fw_%+.2fdrop"):format(i, L.a, L.b, L.span, L.drop)
 		g.Parent = into
 
-		local colour = SHARED
-		if L.kind ~= "shared" then
-			local d = math.abs(L.drop)
-			colour = (d <= 0.25) and FLUSH or (d <= 1.5) and STEP or STEEP
-		end
+		local d = math.abs(L.drop or 0)
+		local colour
+		if d > 1.5 then colour = STEEP
+		elseif L.kind == "shared" then colour = SHARED
+		elseif L.kind == "bridge" then colour = BRIDGE
+		else colour = (d <= 0.25) and FLUSH or STEP end
 		if L.span > 1e-4 then
 			segment(L.left + off, L.right + off, 0.22, colour, "gate", g)
 		else
@@ -1699,21 +1708,105 @@ function Pipeline.drawPortals(result: any, opts: any?): (Instance, string)
 	end
 	for i, f in ipairs(mesh.tris) do
 		if not degree[i] then
-			if not fOrphan then fOrphan = folder("orphan") end
+			if not fOrphan then fOrphan = folder("NO_LINK_POLYGONS") end
 			orphans += 1
 			local b = Instance.new("Part")
 			b.Anchored = true; b.CanCollide = false; b.CanQuery = false; b.CanTouch = false
 			b.Shape = Enum.PartType.Ball
 			b.Size = Vector3.new(0.9, 0.9, 0.9)
-			b.Color = Color3.fromRGB(255, 60, 60)
+			b.Color = o.orphanColor or Color3.fromRGB(255, 255, 255)
 			b.Material = Enum.Material.Neon
 			b.CFrame = CFrame.new(f.centre + f.up * lift)
-			b.Name = ("f%04d_r%03d"):format(i, f.region)
+			-- searchable: type NOLINK in the Explorer filter
+			b.Name = ("NOLINK_f%04d_r%03d_%.0fsq"):format(i, f.region, f.area or 0)
 			b.Parent = fOrphan
 		end
 	end
 
 	return root, Portals.report(res)
+end
+
+-- QUALITY OF THE PORTALS, one line per defect class. Reports only.
+--   fragmented  more than one gate of one kind between the same two polygons
+--   off polygon a gate more than 1 stud from one of the polygons it joins
+--   along       a gate within 18 degrees of pointing the way you walk
+--   blocked     a chest-height ray from the gate to either polygon's centre
+--               hits geometry (2 studs up, so step risers do not count)
+--   narrow      under 1 stud wide -- description, not a defect
+function Pipeline.auditPortals(result: any): string
+	local mesh, links = Pipeline.mesh(result), Pipeline.portals(result).links
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	local dbg = workspace:FindFirstChild(Pipeline.debugName)
+	rp.FilterDescendantsInstances = dbg and { dbg } or {}
+	local function distToPoly(P: any, q: Vector3): number
+		local v, best = P.verts, math.huge
+		for i = 1, #v do
+			local a, b = v[i], v[i % #v + 1]
+			local d = b - a
+			local dd = d:Dot(d)
+			local t = dd > 1e-9 and math.clamp((q - a):Dot(d) / dd, 0, 1) or 0
+			best = math.min(best, (q - (a + d * t)).Magnitude)
+		end
+		return best
+	end
+	local byPair, kinds = {}, {}
+	local far, along, blocked, narrow, point = {}, {}, {}, 0, 0
+	local edgeN, fitN = 0, 0
+	for i, L in ipairs(links) do
+		kinds[L.kind] = (kinds[L.kind] or 0) + 1
+		if L.kind ~= "shared" then
+			if L.edge then edgeN += 1 else fitN += 1 end
+		end
+		local k = L.kind .. ":" .. L.a .. ":" .. L.b
+		local t = byPair[k]
+		if not t then t = {}; byPair[k] = t end
+		t[#t + 1] = i
+		local A, B = mesh.tris[L.a], mesh.tris[L.b]
+		local dA = math.min(distToPoly(A, L.left), distToPoly(A, L.right), distToPoly(A, L.centre))
+		local dB = math.min(distToPoly(B, L.left), distToPoly(B, L.right), distToPoly(B, L.centre))
+		if math.max(dA, dB) > 1.0 then far[#far + 1] = { math.max(dA, dB), i } end
+		if L.span > 0.5 then
+			local tr = B.centre - A.centre
+			tr -= A.up * tr:Dot(A.up)
+			if tr.Magnitude > 1e-3 and math.abs((L.right - L.left).Unit:Dot(tr.Unit)) > 0.95 then
+				along[#along + 1] = i
+			end
+		else
+			point += 1
+		end
+		if L.span < 1.0 then narrow += 1 end
+		local c = L.centre + A.up * 2.0
+		local h = workspace:Raycast(c, (A.centre + A.up * 2.0) - c, rp)
+			or workspace:Raycast(c, (B.centre + B.up * 2.0) - c, rp)
+		if h then blocked[#blocked + 1] = ("p%04d(%s)"):format(i, h.Instance.Name) end
+	end
+	local multi, extra, worst = 0, 0, {}
+	for k, t in pairs(byPair) do
+		if #t > 1 then
+			multi += 1
+			extra += #t - 1
+			worst[#worst + 1] = { #t, k }
+		end
+	end
+	table.sort(worst, function(x, y) return x[1] > y[1] end)
+	table.sort(far, function(x, y) return x[1] > y[1] end)
+	local ws = {}
+	for i = 1, math.min(6, #worst) do ws[#ws + 1] = ("%s x%d"):format(worst[i][2], worst[i][1]) end
+	local bs = {}
+	for i = 1, math.min(8, #blocked) do bs[#bs + 1] = blocked[i] end
+	return table.concat({
+		("links     %d (shared %d, seam %d, bridge %d); of seam+bridge %d on polygon edges, %d still fitted")
+			:format(#links, kinds.shared or 0, kinds.seam or 0, kinds.bridge or 0, edgeN, fitN),
+		("fragment  %d polygon pairs with more than one gate of one kind, %d extra gates; worst %s")
+			:format(multi, extra, table.concat(ws, ", ")),
+		("off poly  %d gates more than 1 stud from a polygon they join%s")
+			:format(#far, #far > 0 and (", worst p%04d at %.1f studs"):format(far[1][2], far[1][1]) or ""),
+		("along     %d gates within 18 deg of the direction of travel"):format(#along),
+		("blocked   %d gates with geometry between them and a polygon centre at chest height%s")
+			:format(#blocked, #bs > 0 and (": " .. table.concat(bs, " ")) or ""),
+		("narrow    %d gates under 1 stud wide, %d of them single cell pairs"):format(narrow, point),
+	}, "\n")
 end
 
 -- ATTRIBUTE A STRAIGHTENED RING'S EDGES BACK TO THE LOOP'S OWN EDGES.

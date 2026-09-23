@@ -468,8 +468,130 @@ local function noteFit(stats: any, kind: string, lo: number, hi: number,
 	end
 end
 
+-- PORTALS ON THE POLYGONS' OWN EDGES. Severance says WHETHER two polygons
+-- connect; this says WHERE, and the answer is geometry the mesh already has.
+--
+-- The fitted gates below were lines drawn through cell-pair midpoints, so they
+-- floated up to two studs off both polygons, pointed along travel wherever the
+-- cells ran that way (399 on case6) and came apart into dashed rows. A blue
+-- shared portal has none of that because it IS an edge. This makes seams and
+-- bridges edges too: take A's edges and B's edges that FACE each other --
+-- antiparallel, B on A's outer side, within `gap` -- project one onto the other,
+-- and walk the overlap. Where Severance's evidence for this pair (its cell-pair
+-- midpoints, or the untraced cells of a bridge) lies within reach, the run is
+-- open; where it stops -- a pillar, a rail -- the portal is cut. The gate is the
+-- open run ON A's EDGE, and the matching stretch of B's edge rides along as
+-- bLeft/bRight, so a funnel has both sides of the step.
+Portals.edgeMatch = true
+Portals.edgeAngle = 20    -- degrees off antiparallel two facing edges may be
+Portals.seamGap = 2.5     -- studs in plane between facing edges of a seam
+Portals.bridgeGap = 4.0   -- and of a bridge, which spans an untraced strip
+Portals.edgeSample = 0.25 -- studs between verdict samples along the overlap
+
+local function edgePortals(mesh: any, e: any, kind: string, gapMax: number,
+	step: number, links: { any }, stats: any): number
+	local A, B = mesh.tris[e.lo], mesh.tris[e.hi]
+	if not A or not B then return 0 end
+	local up = A.up or Vector3.yAxis
+	local function flat(v: Vector3): Vector3 return v - up * v:Dot(up) end
+	local cosTol = math.cos(math.rad(Portals.edgeAngle))
+
+	-- the evidence, hashed in plane
+	local H = 1.0
+	local grid: { [string]: { number } } = {}
+	for i, m in ipairs(e.mids) do
+		local f = flat(m)
+		local k = math.floor(f.X / H) .. ":" .. math.floor(f.Z / H)
+		local b = grid[k]
+		if not b then b = {}; grid[k] = b end
+		b[#b + 1] = i
+	end
+	local used = {}
+	local function evidence(p: Vector3, reach: number): { number }
+		local f = flat(p)
+		local bx, bz = math.floor(f.X / H), math.floor(f.Z / H)
+		local out = {}
+		local rc = math.ceil(reach / H)
+		for dx = -rc, rc do
+			for dz = -rc, rc do
+				for _, i in ipairs(grid[(bx + dx) .. ":" .. (bz + dz)] or {}) do
+					if (flat(e.mids[i]) - f).Magnitude <= reach then out[#out + 1] = i end
+				end
+			end
+		end
+		return out
+	end
+
+	local made = 0
+	local nA, nB = #A.verts, #B.verts
+	for i = 1, nA do
+		local a1, a2 = A.verts[i], A.verts[i % nA + 1]
+		local da = flat(a2 - a1)
+		local la = da.Magnitude
+		if la < 1e-3 then continue end
+		local ua = da / la
+		local outward = ua:Cross(up) -- floor is left of travel; this points away
+		for j = 1, nB do
+			local b1, b2 = B.verts[j], B.verts[j % nB + 1]
+			local db = flat(b2 - b1)
+			if db.Magnitude < 1e-3 or ua:Dot(db.Unit) > -cosTol then continue end
+			local o1, o2 = flat(b1 - a1):Dot(outward), flat(b2 - a1):Dot(outward)
+			local gap = (o1 + o2) * 0.5
+			if gap < -0.1 or gap > gapMax then continue end
+			local t1, t2 = flat(b1 - a1):Dot(ua), flat(b2 - a1):Dot(ua)
+			local lo, hi = math.max(0, math.min(t1, t2)), math.min(la, math.max(t1, t2))
+			if hi - lo < Portals.edgeSample then continue end
+
+			local reach = math.max(step * 1.5, gap * 0.5 + step)
+			local ds = Portals.edgeSample
+			local runStart, runDrops = nil, {}
+			local function onB(p: Vector3): Vector3
+				local d = b2 - b1
+				local t = math.clamp((p - b1):Dot(d) / d:Dot(d), 0, 1)
+				return b1 + d * t
+			end
+			local function emit(ts: number, te: number)
+				if te - ts < ds * 0.5 then return end
+				local aL, aR = a1 + (a2 - a1) * (ts / la), a1 + (a2 - a1) * (te / la)
+				local dsum, dn = 0, 0
+				for _, k in ipairs(runDrops) do dsum += e.drops[k]; dn += 1 end
+				links[#links + 1] = {
+					kind = kind, a = e.lo, b = e.hi,
+					left = aL, right = aR, bLeft = onB(aR), bRight = onB(aL),
+					centre = (aL + aR) * 0.5, span = (aR - aL).Magnitude,
+					drop = dn > 0 and dsum / dn or 0, gap = gap,
+					count = dn, residual = 0, fitted = true, edge = true,
+				}
+				made += 1
+				stats.edgeLinks += 1
+			end
+			local t = lo
+			while t <= hi + 1e-6 do
+				local pA = a1 + (a2 - a1) * (t / la)
+				local ev = evidence(pA + outward * (gap * 0.5), reach)
+				if #ev > 0 then
+					if not runStart then runStart = t; runDrops = {} end
+					for _, k in ipairs(ev) do
+						if not used[k] then used[k] = true; runDrops[#runDrops + 1] = k end
+					end
+				elseif runStart then
+					emit(math.max(lo, runStart - ds * 0.5), math.min(hi, t - ds * 0.5))
+					runStart = nil
+				end
+				t += ds
+			end
+			if runStart then emit(math.max(lo, runStart - ds * 0.5), hi) end
+		end
+	end
+	local nUsed = 0
+	for _ in pairs(used) do nUsed += 1 end
+	stats.edgeEvidence += #e.mids
+	stats.edgeEvidenceUsed += nUsed
+	return made
+end
+
 local function seamLinks(snap: any, of: { [any]: number }, step: number,
-	links: { any }, stats: any)
+	links: { any }, stats: any, mesh: any)
 
 	local buckets: { [string]: any } = {}
 	for _, pr in ipairs(snap.pairs) do
@@ -512,6 +634,12 @@ local function seamLinks(snap: any, of: { [any]: number }, step: number,
 
 	for _, k in ipairs(keys) do
 		local e = buckets[k]
+		if Portals.edgeMatch then
+			local made = edgePortals(mesh, e, "seam", Portals.seamGap, step, links, stats)
+			stats.seam += made
+			if made > 0 then continue end
+			stats.edgeFallback += 1
+		end
 		for _, members in ipairs(groupsOf(e.mids, step * Portals.groupReach)) do
 			local gates = {}
 			fitAll(e.mids, e.dirs, e.up, members, step, gates)
@@ -566,7 +694,7 @@ end
 -- one-cell-wide ridge satisfies and r018's two-row strip does not, for no reason
 -- an agent stepping over either of them would recognise.
 local function bridgeLinks(snap: any, of: { [any]: number }, data: any, step: number,
-	links: { any }, stats: any)
+	links: { any }, stats: any, mesh: any)
 
 	local limit = Portals.crossLimit or data.config.traceMinWidth
 		or data.config.minWidth or (step * 3)
@@ -701,6 +829,12 @@ local function bridgeLinks(snap: any, of: { [any]: number }, data: any, step: nu
 
 	for _, k in ipairs(keys) do
 		local e = buckets[k]
+		if Portals.edgeMatch then
+			local made = edgePortals(mesh, e, "bridge", Portals.bridgeGap, step, links, stats)
+			stats.bridge += made
+			if made > 0 then continue end
+			stats.edgeFallback += 1
+		end
 		for _, members in ipairs(groupsOf(e.mids, step * Portals.groupReach)) do
 			local gates = {}
 			fitAll(e.mids, e.dirs, e.up, members, step, gates)
@@ -737,6 +871,111 @@ local function bridgeLinks(snap: any, of: { [any]: number }, data: any, step: nu
 end
 
 -- ------------------------------------------------------------ components
+
+-- ONE DOORWAY, ONE GATE. Seam and bridge gates are fitted per contiguity
+-- group, and where two grids meet at a slight angle the cell pairs along one
+-- opening come out with gaps just past `groupReach`, so a single doorway is cut
+-- into a dashed row of short gates between the SAME two polygons -- Cocosulx
+-- spotted rows of them on case6's steps. groupReach itself stays tight: it is
+-- what keeps two doorways either side of a pillar apart.
+--
+-- So merge afterwards, and only what is provably one opening: same polygon
+-- pair and kind, parallel (within mergeAngle), on one line (off it by at most
+-- a step), the same height change (within mergeDrop), the gap between them at
+-- most mergeGap -- and that gap clear at chest height, which is the pillar
+-- test the contiguity rule was standing in for.
+Portals.merge = true
+Portals.mergeAngle = 10  -- degrees
+Portals.mergeGap = 2.0   -- studs of gap along the gate line
+Portals.mergeDrop = 0.25 -- studs of height-change difference
+Portals.mergeLift = 2.0  -- studs above the gate the pillar ray runs
+
+local function mergeGates(links: { any }, mesh: any, step: number, stats: any): { any }
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	local dbg = workspace:FindFirstChild("NVGN_Debug")
+	rp.FilterDescendantsInstances = dbg and { dbg } or {}
+	local cosTol = math.cos(math.rad(Portals.mergeAngle))
+
+	local out, groups, order = {}, {}, {}
+	for _, L in ipairs(links) do
+		-- an edge gate was cut where the evidence stopped, on purpose; merging it
+		-- back across a rail lower than the pillar ray would undo exactly that
+		if L.kind == "shared" or L.edge or L.span < 1e-4 then
+			out[#out + 1] = L
+		else
+			local k = L.kind .. ":" .. L.a .. ":" .. L.b
+			local g = groups[k]
+			if not g then g = {}; groups[k] = g; order[#order + 1] = k end
+			g[#g + 1] = L
+		end
+	end
+	for _, k in ipairs(order) do
+		local g = groups[k]
+		if #g == 1 then out[#out + 1] = g[1]; continue end
+		-- one axis for the pair, from the longest gate, oriented left->right
+		local ref = g[1]
+		for _, L in ipairs(g) do if L.span > ref.span then ref = L end end
+		local ax = (ref.right - ref.left).Unit
+		local up = mesh.tris[ref.a].up
+		local o0 = ref.left
+		local items = {}
+		for _, L in ipairs(g) do
+			local d = (L.right - L.left).Unit
+			local lo, hi = L.left, L.right
+			if d:Dot(ax) < 0 then lo, hi = hi, lo end
+			items[#items + 1] = { L = L, t0 = (lo - o0):Dot(ax), t1 = (hi - o0):Dot(ax), lo = lo, hi = hi,
+				par = math.abs(d:Dot(ax)) >= cosTol }
+		end
+		table.sort(items, function(x, y) return x.t0 < y.t0 end)
+		local cur = nil
+		local function flush()
+			if cur then out[#out + 1] = cur.L end
+		end
+		for _, it in ipairs(items) do
+			local ok = false
+			if cur and cur.par and it.par then
+				local gap = it.t0 - cur.t1
+				-- distance of the next gate off the current one's line
+				local v = it.lo - cur.lo
+				local lateral = (v - ax * v:Dot(ax) - up * v:Dot(up)).Magnitude
+				if gap <= Portals.mergeGap and lateral <= step
+					and math.abs((it.L.drop or 0) - (cur.L.drop or 0)) <= Portals.mergeDrop then
+					ok = true
+					if gap > 0 then
+						local a = cur.hi + up * Portals.mergeLift
+						local b = it.lo + up * Portals.mergeLift
+						if workspace:Raycast(a, b - a, rp) then ok = false; stats.mergeBlocked += 1 end
+					end
+				end
+			end
+			if ok then
+				local A, B = cur.L, it.L
+				local na, nb = A.count or 1, B.count or 1
+				local hi = (it.t1 > cur.t1) and it.hi or cur.hi
+				local t1 = math.max(it.t1, cur.t1)
+				cur.L = {
+					kind = A.kind, a = A.a, b = A.b,
+					left = cur.lo, right = hi,
+					centre = (cur.lo + hi) * 0.5,
+					span = (hi - cur.lo).Magnitude,
+					drop = ((A.drop or 0) * na + (B.drop or 0) * nb) / (na + nb),
+					count = na + nb,
+					residual = math.max(A.residual or 0, B.residual or 0),
+					travel = (A.travel or Vector3.zero) + (B.travel or Vector3.zero),
+					fitted = A.fitted and B.fitted, merged = (A.merged or 1) + (B.merged or 1),
+				}
+				cur.hi, cur.t1 = hi, t1
+				stats.gatesMerged += 1
+			else
+				flush()
+				cur = { L = it.L, lo = it.lo, hi = it.hi, t1 = it.t1, par = it.par }
+			end
+		end
+		flush()
+	end
+	return out
+end
 
 local function components(nPoly: number, links: { any }): ({ number }, number)
 	local parent = table.create(nPoly)
@@ -781,6 +1020,8 @@ function Portals.build(mesh: any, data: any, snap: any): any
 		bridgeSteep = 0, bridgeSteepAt = {}, gatesSplit = 0, gatesFromTravel = 0,
 		bentGroups = 0, bentAt = {}, worstResidual = 0, worstResidualAt = "none",
 		orphans = {}, pieces = 0, sevPieces = 0, sevSplit = {},
+		gatesMerged = 0, mergeBlocked = 0,
+		edgeLinks = 0, edgeFallback = 0, edgeEvidence = 0, edgeEvidenceUsed = 0,
 		sevNarrow = 0, sevNarrowAt = {},
 		seconds = 0,
 	}
@@ -788,8 +1029,15 @@ function Portals.build(mesh: any, data: any, snap: any): any
 	local links: { any } = {}
 	sharedLinks(mesh, links, stats)
 	local of = claimCells(mesh, data, stats)
-	seamLinks(snap, of, step, links, stats)
-	bridgeLinks(snap, of, data, step, links, stats)
+	seamLinks(snap, of, step, links, stats, mesh)
+	bridgeLinks(snap, of, data, step, links, stats, mesh)
+	if Portals.merge then
+		links = mergeGates(links, mesh, step, stats)
+		stats.seam, stats.bridge = 0, 0
+		for _, L in ipairs(links) do
+			if L.kind == "seam" then stats.seam += 1 elseif L.kind == "bridge" then stats.bridge += 1 end
+		end
+	end
 
 	local degree = table.create(stats.polys, 0)
 	for _, L in ipairs(links) do
@@ -896,6 +1144,11 @@ function Portals.report(res: any): string
 			:format(s.pieces, s.sevPieces),
 		("  worst gate residual %.2f (%s), %d extra gates from cutting bent groups, %d gates squared to travel")
 			:format(s.worstResidual, s.worstResidualAt, s.gatesSplit, s.gatesFromTravel),
+		("  %d gates merged into their neighbours along one opening, %d merges refused by the pillar ray")
+			:format(s.gatesMerged or 0, s.mergeBlocked or 0),
+		("  edge-matched %d gates; %d polygon pairs fell back to fitting; %.0f%% of the crossing evidence lies on an edge gate")
+			:format(s.edgeLinks or 0, s.edgeFallback or 0,
+				100 * (s.edgeEvidenceUsed or 0) / math.max(1, s.edgeEvidence or 0)),
 	}
 	if s.overshared > 0 then
 		lines[#lines + 1] = ("  !! %d edges owned by more than two polygons -- NOT A SURFACE")
