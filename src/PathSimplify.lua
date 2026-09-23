@@ -300,6 +300,40 @@ local function spanDev(orig: {Vector3}, nOrig: number, from: number, to: number,
 	return worst
 end
 
+-- The same walk, SIGNED against the floor. Faces are wound region-on-the-left,
+-- so a raw node LEFT of the chord means the chord passes outside the floor, and
+-- one RIGHT of it means the chord cuts into the floor. Returns the worst of each.
+local function spanDevSigned(orig: {Vector3}, nOrig: number, from: number, to: number,
+	closed: boolean, up: Vector3): (number, number)
+	local A = orig[from]
+	local ab = orig[to] - A
+	local len = ab.Magnitude
+	if len < 1e-6 then
+		local d = math.sqrt(spanDev(orig, nOrig, from, to, closed))
+		return d, d
+	end
+	local side = ab:Cross(up).Unit -- points to the RIGHT of travel
+	local out, inw = 0, 0
+	local i, guard = from, 0
+	while i ~= to and guard <= nOrig do
+		local s = (orig[i] - A):Dot(side)
+		if s < 0 then
+			if -s > out then out = -s end
+		elseif s > inw then
+			inw = s
+		end
+		if closed then i = (i % nOrig) + 1 else i += 1; if i > nOrig then break end end
+		guard += 1
+	end
+	return out, inw
+end
+
+-- ONE-SIDED DRIFT, opt-in by `inwardMax`. A line straightened INTO the floor
+-- costs floor along the border and can never put an edge nearer a wall, so it
+-- may drift up to inwardMax and round convex corners up to inwardAngle. Drift
+-- OUTWARD keeps the tight clamp. Nil keeps the symmetric test bit for bit.
+PathSimplify.inwardAngle = 45 -- degrees; sharpest convex turn an inward cut may round
+
 function PathSimplify.merge(pts: {Vector3}, idx: {number}, orig: {Vector3}, opts: any?)
 	local o = opts or {}
 	local closed = o.closed == true
@@ -310,6 +344,11 @@ function PathSimplify.merge(pts: {Vector3}, idx: {number}, orig: {Vector3}, opts
 	local validate = o.validate
 	local cosTol = math.cos(math.rad(angleTol))
 	local cos2 = cosTol * cosTol
+	local inwardMax = o.inwardMax
+	local up: Vector3? = o.up
+	local oneSided = inwardMax ~= nil and up ~= nil
+	local cosIn = math.cos(math.rad(o.inwardAngle or PathSimplify.inwardAngle))
+	local cosIn2 = cosIn * cosIn
 	local nOrig = #orig
 	local m = #pts
 	local stats = { input = m, merged = 0, refusedDrift = 0, refusedRay = 0 }
@@ -346,7 +385,10 @@ function PathSimplify.merge(pts: {Vector3}, idx: {number}, orig: {Vector3}, opts
 				if d > 0 then
 					local lu = ux * ux + uy * uy + uz * uz
 					local lw = wx * wx + wy * wy + wz * wz
-					if d * d >= cos2 * lu * lw then
+					-- a convex floor corner turns LEFT, and only it can be cut inward
+					local convex = oneSided
+						and Vector3.new(ux, uy, uz):Cross(Vector3.new(wx, wy, wz)):Dot(up :: Vector3) > 0
+					if d * d >= cos2 * lu * lw or (convex and d * d >= cosIn2 * lu * lw) then
 						-- flatter than the threshold; rank by how flat
 						local q = (lu * lw > 0) and (d * d / (lu * lw)) or 0
 						if q > bestCos then bestCos = q; bestAt = v end
@@ -359,8 +401,13 @@ function PathSimplify.merge(pts: {Vector3}, idx: {number}, orig: {Vector3}, opts
 			local p, n = prev[v], nxt[v]
 			local chord = (pts[n] - pts[p]).Magnitude
 			local tol = math.clamp(relTol * chord, minTol, maxTol)
-			local dev = spanDev(orig, nOrig, idx[p], idx[n], closed)
-			local ok = dev <= tol * tol
+			local ok
+			if oneSided then
+				local out, inw = spanDevSigned(orig, nOrig, idx[p], idx[n], closed, up :: Vector3)
+				ok = out <= tol and inw <= math.max(tol, inwardMax :: number)
+			else
+				ok = spanDev(orig, nOrig, idx[p], idx[n], closed) <= tol * tol
+			end
 			if not ok then
 				stats.refusedDrift += 1
 			elseif validate and not validate(pts[p], pts[n]) then
@@ -846,6 +893,237 @@ function PathSimplify.visualize(original: {Vector3}, simplified: {Vector3}, opts
 		b.Parent = cornF
 	end
 	return root, nO, nS
+end
+
+-- CORNER CLEANUP on a finished CLOSED ring, run to a fixed point. Three shapes
+-- the earlier passes leave behind at a corner, each with its own rule:
+--
+--   crossing  two edges of the ring cross. Cut out the smaller sub-loop at the
+--             crossing -- its edges are pieces of edges already there, so no
+--             new geometry needs proving. Refused past crossCutMax, where the
+--             smaller lobe is real floor rather than a knot.
+--   spike     the line doubles back (turn sharper than spikeAngle) over a
+--             triangle under spikeArea. The tip goes.
+--   cluster   three or more consecutive corners inside clusterRadius of the
+--             first. They become ONE corner, the candidate furthest onto the
+--             floor side of the chord that `validate` accepts.
+--
+-- Floor is LEFT of travel (faces are wound region-on-the-left), holes included.
+-- `idx` rides along so provenance stays attached; a crossing point takes the
+-- index of the corner it follows.
+PathSimplify.clusterRadius = 1.0  -- studs
+PathSimplify.spikeAngle = 160     -- degrees of turn; sharper is doubling back
+PathSimplify.spikeArea = 1.0      -- square studs; a bigger triangle is real floor
+PathSimplify.crossCutMax = 4.0    -- square studs; largest lobe a crossing may cut
+-- notch  a short bay biting INTO the floor (every corner of it left of the
+--        mouth) with a narrow mouth, nothing standing in it and floor under
+--        it: cells went missing there, so the mouth becomes the edge. The
+--        border's half of the gap fill; holes are Pipeline.gapFill's.
+PathSimplify.notchMouth = 2.0     -- studs across the mouth
+PathSimplify.notchArea = 4.0      -- square studs of bay
+PathSimplify.notchCorners = 8     -- longest run of corners a bay may span
+
+function PathSimplify.cleanCorners(pts: {Vector3}, idx: {number}, opts: any?)
+	local o = opts or {}
+	local stats = { crossCut = 0, crossRefused = 0, spikes = 0, clusters = 0, clusterRefused = 0, notches = 0 }
+	local up: Vector3? = o.up
+	if not o.closed or not up or #pts < 4 then return pts, idx, stats end
+	local validate = o.validate
+	local R = o.clusterRadius or PathSimplify.clusterRadius
+	local cosSpike = math.cos(math.rad(o.spikeAngle or PathSimplify.spikeAngle))
+	local spikeArea = o.spikeArea or PathSimplify.spikeArea
+	local cutMax = o.crossCutMax or PathSimplify.crossCutMax
+	local mouthMax = o.notchMouth or PathSimplify.notchMouth
+	local bayMax = o.notchArea or PathSimplify.notchArea
+	local bayCorners = o.notchCorners or PathSimplify.notchCorners
+
+	local U = up :: Vector3
+	local e1 = (math.abs(U.X) < 0.9 and Vector3.xAxis or Vector3.zAxis):Cross(U).Unit
+	local e2 = U:Cross(e1)
+	local P, I = table.clone(pts), table.clone(idx)
+	local function xy(p: Vector3): (number, number) return p:Dot(e1), p:Dot(e2) end
+	local function area(list: {Vector3}): number
+		local s, n = 0, #list
+		for k = 1, n do
+			local ax, ay = xy(list[k])
+			local bx, by = xy(list[k % n + 1])
+			s += ax * by - bx * ay
+		end
+		return math.abs(s) * 0.5
+	end
+
+	-- first crossing between non-adjacent edges, with the parameter along edge i
+	local function findCross(): (number?, number?, number?)
+		local n = #P
+		for i = 1, n do
+			local ax, ay = xy(P[i]); local bx, by = xy(P[i % n + 1])
+			for j = i + 2, n do
+				if not (i == 1 and j == n) then
+					local cx, cy = xy(P[j]); local dx, dy = xy(P[j % n + 1])
+					local rx, ry, sx, sy = bx - ax, by - ay, dx - cx, dy - cy
+					local den = rx * sy - ry * sx
+					if math.abs(den) > 1e-9 then
+						local t = ((cx - ax) * sy - (cy - ay) * sx) / den
+						local u = ((cx - ax) * ry - (cy - ay) * rx) / den
+						if t > 1e-6 and t < 1 - 1e-6 and u > 1e-6 and u < 1 - 1e-6 then
+							return i, j, t
+						end
+					end
+				end
+			end
+		end
+		return nil, nil, nil
+	end
+
+	local refusedCross: { [string]: boolean } = {}
+	local refusedCluster: { [string]: boolean } = {}
+	for _ = 1, 4 * #pts do
+		local changed = false
+		local n = #P
+		if n < 4 then break end
+
+		-- crossings
+		local i, j, t = findCross()
+		if i and j and t then
+			local key = tostring(P[i]) .. tostring(P[j])
+			if not refusedCross[key] then
+				local X = P[i]:Lerp(P[i % n + 1], t)
+				local A, AI = { X }, { I[i] }        -- X, P[i+1..j]
+				for k = i + 1, j do A[#A + 1] = P[k]; AI[#AI + 1] = I[k] end
+				local B, BI = {}, {}                -- P[j+1..n], P[1..i], X
+				for k = j + 1, n do B[#B + 1] = P[k]; BI[#BI + 1] = I[k] end
+				for k = 1, i do B[#B + 1] = P[k]; BI[#BI + 1] = I[k] end
+				B[#B + 1] = X; BI[#BI + 1] = I[i]
+				local aA, aB = area(A), area(B)
+				local keepA = aA > aB
+				local small = keepA and aB or aA
+				local kept = keepA and A or B
+				if small <= cutMax and #kept >= 3 then
+					if keepA then P, I = A, AI else P, I = B, BI end
+					stats.crossCut += 1
+					changed = true
+				else
+					refusedCross[key] = true
+					stats.crossRefused += 1
+				end
+			end
+		end
+
+		-- spikes
+		if not changed then
+			for v = 1, n do
+				local a, b = P[(v - 2) % n + 1], P[v % n + 1]
+				local u1, u2 = P[v] - a, b - P[v]
+				local l1, l2 = u1.Magnitude, u2.Magnitude
+				if l1 > 1e-6 and l2 > 1e-6 and u1:Dot(u2) / (l1 * l2) < cosSpike
+					and u1:Cross(u2).Magnitude * 0.5 < spikeArea
+					and (not validate or validate(a, b)) then
+					table.remove(P, v); table.remove(I, v)
+					stats.spikes += 1
+					changed = true
+					break
+				end
+			end
+		end
+
+		-- clusters
+		if not changed then
+			for s = 1, n do
+				local run = 1
+				while run < n - 2 and (P[(s + run - 1) % n + 1] - P[s]).Magnitude <= R do
+					run += 1
+				end
+				if run >= 3 then
+					local prevP = P[(s - 2) % n + 1]
+					local nextP = P[(s + run - 1) % n + 1]
+					local chord = nextP - prevP
+					local right = chord.Magnitude > 1e-6 and chord:Cross(U).Unit or nil
+					local cands = {}
+					for k = 0, run - 1 do cands[#cands + 1] = (s + k - 1) % n + 1 end
+					table.sort(cands, function(x, y)
+						if not right then return x < y end
+						-- floor is LEFT, so the most negative right-offset is deepest onto it
+						return (P[x] - prevP):Dot(right) < (P[y] - prevP):Dot(right)
+					end)
+					local pick
+					for _, c in ipairs(cands) do
+						if not validate or validate(P[c], prevP, nextP) then pick = c; break end
+					end
+					if pick then
+						local keepP, keepI = P[pick], I[pick]
+						local NP, NI = {}, {}
+						local drop = {}
+						for k = 0, run - 1 do drop[(s + k - 1) % n + 1] = true end
+						for k = 1, n do
+							if k == pick then NP[#NP + 1] = keepP; NI[#NI + 1] = keepI
+							elseif not drop[k] then NP[#NP + 1] = P[k]; NI[#NI + 1] = I[k] end
+						end
+						if #NP >= 3 then
+							P, I = NP, NI
+							stats.clusters += 1
+							changed = true
+							break
+						end
+					end
+					refusedCluster[tostring(P[s])] = true
+				end
+			end
+		end
+
+		-- notches
+		if not changed and validate then
+			local refusedNotch = refusedCluster -- same lifetime, distinct keys
+			for s = 1, n do
+				for len = 2, math.min(bayCorners + 1, n - 2) do
+					local e = (s + len - 1) % n + 1
+					local A, B = P[s], P[e]
+					local mouth = B - A
+					local ml = mouth.Magnitude
+					local key = "n" .. tostring(A) .. tostring(B)
+					if ml > 1e-6 and ml <= mouthMax and not refusedNotch[key] then
+						local right = mouth:Cross(U).Unit
+						local bay = { A }
+						local inside = true
+						for k = 1, len - 1 do
+							local q = P[(s + k - 1) % n + 1]
+							-- left of the mouth = onto the floor side
+							if (q - A):Dot(right) > -1e-3 then inside = false; break end
+							bay[#bay + 1] = q
+						end
+						bay[#bay + 1] = B
+						if inside then
+							local ba = area(bay)
+							if ba <= bayMax then
+								local c = Vector3.zero
+								for _, q in ipairs(bay) do c += q end
+								c /= #bay
+								if validate(A, B) and validate(c, A, B) and validate((A + B) * 0.5, A, B) then
+									local NP, NI = {}, {}
+									local drop = {}
+									for k = 1, len - 1 do drop[(s + k - 1) % n + 1] = true end
+									for k = 1, n do
+										if not drop[k] then NP[#NP + 1] = P[k]; NI[#NI + 1] = I[k] end
+									end
+									P, I = NP, NI
+									stats.notches += 1
+									changed = true
+									break
+								end
+								refusedNotch[key] = true
+							end
+						end
+					end
+				end
+				if changed then break end
+			end
+		end
+
+		if not changed then break end
+	end
+	for k in pairs(refusedCluster) do
+		if k:sub(1, 1) ~= "n" then stats.clusterRefused += 1 end
+	end
+	return P, I, stats
 end
 
 return PathSimplify

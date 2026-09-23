@@ -68,6 +68,13 @@ Pipeline.OVERRIDES = {
 	-- gate exists to keep are narrower than shoulders by definition. case5's is
 	-- 1.5 studs across, so at 2.0 it was discarded and its loop never drawn.
 	traceMinWidth = 1.5,
+	-- 1.5, a 3-cell footprint. Cocosulx's call 2026-09-23: keep strips 3 cells
+	-- thick and wider. Stair treads (1.5 deep) come back one region each; 1 stud
+	-- rails and wall caps stay pruned.
+	minWidth = 1.5,
+	-- Cleaner lines, paid for in floor along the border, never toward a wall.
+	-- case6: 13590 -> 13135 corners at 1.0; 1.5 buys only 19 more.
+	inwardMax = 1.0,
 } :: { [string]: any }
 
 -- The parameters each stage reads. Used to snapshot what a run actually used,
@@ -83,6 +90,8 @@ local SIMPLIFY_KEYS = {
 	"jogMax", "jogParallel",
 	"bevelMax", "bevelSquare", "bevelRunRatio", "bevelRunMin", "bevelTravel",
 	"closeMaxGap", "closeAngleMin", "closeTravel", "closeMergeMax", "closeMergeRun",
+	"inwardMax", "inwardAngle",
+	"clusterRadius", "spikeAngle", "spikeArea", "crossCutMax",
 }
 
 -- How the raycast validator probes. These belong to the pipeline rather than to
@@ -410,6 +419,259 @@ Pipeline.holeTight = true
 -- is not a simplification, it is a deletion, and it gets refused.
 Pipeline.keepArea = 0.7
 
+-- Knots, spikes and self-crossings at corners, cleaned after collapseBevels.
+-- See PathSimplify.cleanCorners; every move it makes passes the validator.
+Pipeline.cleanCorners = true
+
+-- A SMALL HOLE WITH NOTHING IN IT IS A GAP, NOT AN OBSTACLE. Rows of them sit
+-- along seams where a few cells went missing, and each one is a hole CDT has to
+-- cut around. A hole is filled only when it is small AND proven empty:
+--   * every chord between two of its corners is clear at ankle height (the
+--     validator's own ray), so no post, panel or pillar stands inside it; and
+--   * floor lies under its centre and under every chord midpoint, so it is not
+--     a pit.
+-- A pillar fails the first test and a hole in the floor fails the second.
+Pipeline.gapFill = true
+-- Loosened 2026-09-23 on request. The emptiness test is what keeps it honest:
+-- of case6's small holes left at the tighter limits, 77 had a solid inside.
+Pipeline.gapArea = 4.0      -- square studs; any hole this small qualifies
+Pipeline.gapWidth = 1.5     -- studs; or one this narrow in its own plane...
+Pipeline.gapAreaMax = 16.0  -- ...up to this area, so a long seam sliver qualifies
+Pipeline.gapMaxCorners = 24 -- chords are n^2; a bigger ring is not a sliver
+
+-- OPEN PIECES OF ONE REGION ARE ONE BOUNDARY. When the trace breaks a rim it
+-- breaks it into several open chains, and `close` only ever joins a chain to
+-- ITSELF -- so two halves of one rim 5 studs apart both stay open. Join a
+-- piece's end to another piece's start (winding says which end meets which)
+-- when they are within joinMax, the gap is ray-clear and floor lies under its
+-- middle; a chain whose own ends then meet within joinMax is closed.
+Pipeline.joinOpen = true
+Pipeline.joinMax = 6.0 -- studs
+
+-- AN END THAT OVERSHOOTS ITS OWN START. The trace can run a tail back along
+-- the rim it began on, so the ends look 6 studs apart while the path passed
+-- within a cell of its start: r001's rim came back to 0.63 studs, then ran on
+-- 6.6 studs over its own first edge. Trim each end by at most trimMax of path
+-- to the pair of raw nodes that meet, and close there.
+Pipeline.trimMax = 8.0  -- studs of path either end may lose
+Pipeline.trimMeet = 1.0 -- studs; how close the trimmed ends must come
+
+local function trimOverlap(entry: any, faces: { number }, step: number,
+	gapOK: (Vector3, Vector3) -> boolean): ({ number }, boolean)
+	local pts, _, faceOf = polyline(entry, { faces = faces, closed = false }, step)
+	local n = #pts
+	if n < 8 then return faces, false end
+	local head, tail = { 1 }, { n }
+	local run = 0
+	for i = 2, n do
+		run += (pts[i] - pts[i - 1]).Magnitude
+		if run > Pipeline.trimMax then break end
+		head[#head + 1] = i
+	end
+	run = 0
+	for i = n - 1, 1, -1 do
+		run += (pts[i + 1] - pts[i]).Magnitude
+		if run > Pipeline.trimMax then break end
+		tail[#tail + 1] = i
+	end
+	local best, bh, bt = Pipeline.trimMeet, nil, nil
+	for _, h in ipairs(head) do
+		for _, t in ipairs(tail) do
+			if t - h > 4 then
+				local d = (pts[t] - pts[h]).Magnitude
+				if d <= best then best, bh, bt = d, h, t end
+			end
+		end
+	end
+	if not bh or not bt or not gapOK(pts[bt], pts[bh]) then return faces, false end
+	local pos = {}
+	for k, fi in ipairs(faces) do if pos[fi] == nil then pos[fi] = k end end
+	local from, to = pos[faceOf[bh]], pos[faceOf[bt]]
+	if not from or not to or to <= from then return faces, false end
+	return table.move(faces, from, to, 1, {}), true
+end
+
+-- A SHADOW IS NOT A BOUNDARY. The top of a thin part (a 0.4 to 1 stud wall or
+-- panel) sitting flush with a floor and overlapping its edge joins the floor's
+-- region, and its own rim is traced a fraction of a stud inside the floor's
+-- rim, running the same way. Nothing connects to its ends, so it can never
+-- close. Every open piece left on case6 after joining was one of these: r002's
+-- wall, r046/r049's panels, r198's, r221's DestructibleWallTest. An open piece
+-- whose faces mostly run beside a same-direction face of one of the region's
+-- CLOSED rings is dropped before joining, so it is never joined into a ring
+-- that does not fit either.
+Pipeline.shadowGap = 0.3   -- studs between a face and the rim face it shadows
+Pipeline.shadowShare = 0.5 -- share of the piece's faces that must shadow
+
+local function isShadow(entry: any, L: any, closedIdx: { [string]: { any } }): boolean
+	local n, hit = 0, 0
+	for _, fi in ipairs(L.faces) do
+		local f = entry.faces[fi]
+		local d = f.b - f.a
+		if d.Magnitude > 1e-9 then
+			n += 1
+			d = d.Unit
+			local m = (f.a + f.b) * 0.5
+			local bx, bz = math.floor(m.X), math.floor(m.Z)
+			local found = false
+			for ox = -1, 1 do
+				for oz = -1, 1 do
+					for _, g in ipairs(closedIdx[(bx + ox) .. ":" .. (bz + oz)] or {}) do
+						if (g.m - m).Magnitude <= Pipeline.shadowGap and g.d:Dot(d) > 0.9 then
+							found = true
+							break
+						end
+					end
+					if found then break end
+				end
+				if found then break end
+			end
+			if found then hit += 1 end
+		end
+	end
+	return n > 0 and hit >= Pipeline.shadowShare * n
+end
+
+local function joinOpen(entry: any, step: number, debugRoot: Instance?): ({ any }, number, number, number)
+	local open, out = {}, {}
+	for _, L in ipairs(entry.loops) do
+		if L.closed then out[#out + 1] = L else open[#open + 1] = L end
+	end
+	if #open == 0 then return entry.loops, 0, 0, 0 end
+	local shadows = 0
+	do
+		local idx: { [string]: { any } } = {}
+		for _, L in ipairs(out) do
+			for _, fi in ipairs(L.faces) do
+				local f = entry.faces[fi]
+				local d = f.b - f.a
+				if d.Magnitude > 1e-9 then
+					local m = (f.a + f.b) * 0.5
+					local k = math.floor(m.X) .. ":" .. math.floor(m.Z)
+					local b = idx[k]
+					if not b then b = {}; idx[k] = b end
+					b[#b + 1] = { m = m, d = d.Unit }
+				end
+			end
+		end
+		local keep = {}
+		for _, L in ipairs(open) do
+			if #out > 0 and isShadow(entry, L, idx) then shadows += 1 else keep[#keep + 1] = L end
+		end
+		open = keep
+	end
+	if #open == 0 then return out, 0, 0, shadows end
+	local chains = {}
+	for _, L in ipairs(open) do
+		local pts, up = polyline(entry, L, step)
+		if #pts >= 1 then
+			chains[#chains + 1] = { faces = table.clone(L.faces), a = pts[1], b = pts[#pts], up = up, n = 1 }
+		end
+	end
+	local joined, closedN = 0, 0
+	local check = Pipeline.validator(chains[1] and chains[1].up or Vector3.yAxis, debugRoot)
+	local function gapOK(p: Vector3, q: Vector3): boolean
+		return check((p + q) * 0.5, p, q)
+	end
+	local refused = {}
+	while true do
+		local best, bi, bj = Pipeline.joinMax, nil, nil
+		for i, A in ipairs(chains) do
+			for j, B in ipairs(chains) do
+				if i ~= j then
+					local d = (B.a - A.b).Magnitude
+					if d <= best and not refused[tostring(A.b) .. tostring(B.a)] then
+						best, bi, bj = d, i, j
+					end
+				end
+			end
+		end
+		if not bi then break end
+		local A, B = chains[bi], chains[bj]
+		if gapOK(A.b, B.a) then
+			for _, f in ipairs(B.faces) do A.faces[#A.faces + 1] = f end
+			A.b = B.b
+			A.n += B.n
+			table.remove(chains, bj)
+			joined += 1
+		else
+			refused[tostring(A.b) .. tostring(B.a)] = true
+		end
+	end
+	for _, C in ipairs(chains) do
+		-- a lone piece whose gap `close` can handle is left to `close`, which
+		-- recovers the corner rather than drawing a chord
+		local gap = (C.a - C.b).Magnitude
+		local closed = gap <= Pipeline.joinMax
+			and (C.n > 1 or gap > PathSimplify.closeMaxGap)
+			and gapOK(C.b, C.a)
+		local faces = C.faces
+		if not closed and gap > PathSimplify.closeMaxGap then
+			faces, closed = trimOverlap(entry, faces, step, gapOK)
+		end
+		if closed then closedN += 1 end
+		out[#out + 1] = { faces = faces, closed = closed, joined = closed }
+	end
+	return out, joined, closedN, shadows
+end
+
+-- Narrowest extent of a ring in its plane, over a 15 degree caliper sweep.
+local function ringWidth(pts: { Vector3 }, up: Vector3): number
+	local e1, e2 = Rings.basis(up)
+	local best = math.huge
+	for a = 0, 165, 15 do
+		local r = math.rad(a)
+		local ax = e1 * math.cos(r) + e2 * math.sin(r)
+		local lo, hi = math.huge, -math.huge
+		for _, p in ipairs(pts) do
+			local d = p:Dot(ax)
+			if d < lo then lo = d end
+			if d > hi then hi = d end
+		end
+		if hi - lo < best then best = hi - lo end
+	end
+	return best
+end
+
+-- "filled", a reason it was kept, or nil when the hole is not small enough to ask.
+local function gapVerdict(poly: { Vector3 }, up: Vector3, rawArea: number, debugRoot: Instance?): string?
+	local a = math.abs(rawArea)
+	if a > Pipeline.gapAreaMax then return nil end
+	if a > Pipeline.gapArea and ringWidth(poly, up) > Pipeline.gapWidth then return nil end
+	-- corners, not raw nodes: a raw hole ring is a staircase of half-step faces
+	local pts = PathSimplify.simplify(poly, { closed = true })
+	if #pts < 3 then pts = poly end
+	if #pts > Pipeline.gapMaxCorners then return "too many corners" end
+
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	rp.FilterDescendantsInstances = debugRoot and { debugRoot } or {}
+	rp.IgnoreWater = true
+	local lift = up * VALIDATE.rayLift
+	local rise, drop = up * VALIDATE.floorRise, -up * VALIDATE.floorDrop
+	local function floorAt(p: Vector3): boolean
+		return workspace:Raycast(p + rise, drop, rp) ~= nil
+	end
+
+	local c = Vector3.zero
+	for _, p in ipairs(pts) do c += p end
+	c /= #pts
+	if not floorAt(c) then return "no floor" end
+	local n = #pts
+	for i = 1, n do
+		for j = i + 1, n do
+			local p, q = pts[i], pts[j]
+			if (q - p).Magnitude > 1e-3 then
+				if workspace:Raycast(p + lift, q - p, rp) then return "solid" end
+				if j ~= i + 1 and not (i == 1 and j == n) and not floorAt((p + q) * 0.5) then
+					return "no floor"
+				end
+			end
+		end
+	end
+	return "filled"
+end
+
 function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 	local c = resolve(cfg)
 	local o = {}
@@ -424,6 +686,9 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 	local out = {}
 	local stats = { loops = 0, open = 0, raw = 0, corners = 0,
 		holesHeld = 0, rescued = 0, collapsed = 0, degenerate = 0,
+		gapFilled = 0, gapKept = {},
+		clean = { crossCut = 0, crossRefused = 0, spikes = 0, clusters = 0, clusterRefused = 0, reverted = 0, notches = 0 },
+		joined = 0, joinClosed = 0, shadows = 0,
 		edges = 0, wallEdges = 0, openEdges = 0, mixedEdges = 0, inventedEdges = 0,
 		repair = {},
 		closedBy = { merge = 0, intersect = 0, straight = 0, ["already closed"] = 0 } }
@@ -436,7 +701,15 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 
 	for _, r in ipairs(regions) do
 		local entry = data.boundary[r]
-		for li, L in ipairs(entry.loops) do
+		local loopsIn = entry.loops
+		if Pipeline.joinOpen then
+			local j, jc, sh
+			loopsIn, j, jc, sh = joinOpen(entry, step, debugRoot)
+			stats.joined += j
+			stats.joinClosed += jc
+			stats.shadows += sh
+		end
+		for li, L in ipairs(loopsIn) do
 			local poly, up, faceOf = polyline(entry, L, step)
 			local rawArea = ringArea(poly, up)
 			local isHole = L.closed and rawArea < 0
@@ -457,6 +730,16 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 				continue
 			end
 
+			if isHole and Pipeline.gapFill then
+				local verdict = gapVerdict(poly, up, rawArea, debugRoot)
+				if verdict == "filled" then
+					stats.gapFilled += 1
+					continue
+				elseif verdict then
+					stats.gapKept[verdict] = (stats.gapKept[verdict] or 0) + 1
+				end
+			end
+
 			-- `ri` is the third return: the raw node each finished corner came
 			-- from. Threaded rather than recovered, because collapseBevels can
 			-- replace two corners with one and no amount of counting afterwards
@@ -467,17 +750,36 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 				opts.up = up
 				opts.validate = Pipeline.validator(up, debugRoot)
 				local p, i = PathSimplify.simplify(poly, opts)
-				p, i = PathSimplify.merge(p, i, poly, opts)
-				p, i = PathSimplify.dejog(p, i, poly, opts)
+				-- `merge` and `dejog` BOTH return a third value saying what they
+				-- refused and why, and it was being dropped on the floor here.
+				-- A jog this pipeline saw and declined is invisible in every
+				-- report unless it is carried out, and that refusal is exactly
+				-- what a one-cell notch surviving into the output looks like.
+				local ms, js
+				p, i, ms = PathSimplify.merge(p, i, poly, opts)
+				p, i, js = PathSimplify.dejog(p, i, poly, opts)
 				local q, _, map = PathSimplify.collapseBevels(p, opts)
 				local ri = table.create(#q)
 				for j = 1, #q do ri[j] = i[map[j]] end
-				return q, opts, ri
+				local cs
+				if Pipeline.cleanCorners then
+					-- a cleanup that deletes the ring is not a cleanup: undone whole
+					local cq, cri
+					cq, cri, cs = PathSimplify.cleanCorners(q, ri, opts)
+					local before = math.abs(ringArea(q, up))
+					if before < 1e-6 or math.abs(ringArea(cq, up)) >= Pipeline.keepArea * before then
+						q, ri = cq, cri
+					else
+						cs = { crossCut = 0, crossRefused = 0, spikes = 0, clusters = 0,
+							clusterRefused = 0, reverted = 1 }
+					end
+				end
+				return q, opts, ri, { merge = ms, jog = js, clean = cs }
 			end
 
 			local opts
-			local pts, rawIdx
-			pts, opts, rawIdx = run((isHole and Pipeline.holeTight) and tight or o)
+			local pts, rawIdx, simpStats
+			pts, opts, rawIdx, simpStats = run((isHole and Pipeline.holeTight) and tight or o)
 			if isHole and Pipeline.holeTight then stats.holesHeld += 1 end
 
 			-- Refuse a simplification that deleted the ring rather than
@@ -487,10 +789,10 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 			if L.closed and math.abs(rawArea) > 1e-6 then
 				local kept = math.abs(ringArea(pts, up)) / math.abs(rawArea)
 				if #pts < 3 or kept < Pipeline.keepArea then
-					local retry, ropts, rri = run(tight)
+					local retry, ropts, rri, rss = run(tight)
 					local rkept = math.abs(ringArea(retry, up)) / math.abs(rawArea)
 					if #retry >= 3 and rkept > kept then
-						pts, opts, rawIdx = retry, ropts, rri
+						pts, opts, rawIdx, simpStats = retry, ropts, rri, rss
 						stats.rescued += 1
 					else
 						stats.collapsed += 1
@@ -527,6 +829,25 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 					for j, p in ipairs(pts) do moved[j] = at[tostring(p)] end
 					rawIdx = moved
 				end
+				-- A ring the closing pass just closed never had its corners
+				-- cleaned: cleanCorners only takes closed rings. The knot sits
+				-- exactly at the join, so clean it now.
+				if closed and Pipeline.cleanCorners then
+					local co = table.clone(opts)
+					co.closed = true
+					local cq, cri, cs2 = PathSimplify.cleanCorners(pts, rawIdx, co)
+					local a0 = math.abs(ringArea(pts, up))
+					if a0 < 1e-6 or math.abs(ringArea(cq, up)) >= Pipeline.keepArea * a0 then
+						pts, rawIdx = cq, cri
+						simpStats = simpStats or {}
+						local prior = simpStats.clean
+						if prior then
+							for k, v in pairs(cs2) do prior[k] = (prior[k] or 0) + v end
+						else
+							simpStats.clean = cs2
+						end
+					end
+				end
 			end
 
 			local kinds, wallFrac, repair = edgeKinds(entry, poly, faceOf, rawIdx, pts, closed)
@@ -546,8 +867,12 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 
 			out[#out + 1] = { region = r, index = li, up = up,
 				poly = poly, pts = pts, closed = closed, closedBy = method,
-				faceOf = faceOf, rawIdx = rawIdx,
-				edgeKind = kinds, edgeWall = wallFrac, edgeRepair = repair }
+				faceOf = faceOf, rawIdx = rawIdx, rawArea = rawArea,
+				edgeKind = kinds, edgeWall = wallFrac, edgeRepair = repair,
+				simp = simpStats, joined = L.joined and closed or nil }
+			if simpStats and simpStats.clean then
+				for k, v in pairs(simpStats.clean) do stats.clean[k] += v end
+			end
 			stats.loops += 1
 			stats.raw += #poly
 			stats.corners += #pts
@@ -559,6 +884,30 @@ function Pipeline.simplify(data: any, cfg: any?): ({any}, any)
 	-- `measure` is optional and reports on a result, this WRITES the structure
 	-- the offset and the triangulation both read.
 	stats.rings = Rings.classify(out)
+
+	-- A JOIN THAT PRODUCED A RING THAT DOES NOT FIT IS UNDONE. A second outer
+	-- rim in its region, or a hole inside no rim, means the chord closed the
+	-- wrong thing; the piece goes back to open, as it was before the join.
+	local reopened = 0
+	local outersOf = {}
+	for _, L in ipairs(out) do
+		if L.kind == "outer" then outersOf[L.region] = (outersOf[L.region] or 0) + 1 end
+	end
+	for _, L in ipairs(out) do
+		if L.joined and ((L.kind == "outer" and outersOf[L.region] > 1)
+			or (L.kind == "hole" and L.parent == nil)) then
+			if L.kind == "outer" then outersOf[L.region] -= 1 end
+			L.closed = false
+			L.joined = nil
+			reopened += 1
+		end
+	end
+	if reopened > 0 then
+		stats.joinReopened = reopened
+		stats.joinClosed -= reopened
+		stats.open += reopened
+		stats.rings = Rings.classify(out)
+	end
 
 	return out, stats
 end
@@ -739,6 +1088,7 @@ function Pipeline.draw(result: any, opts: any?): Instance
 	local simp = Instance.new("Folder")
 	simp.Name = "Simplify"
 	simp.Parent = root
+	local openF: Folder? = nil
 
 	for _, L in ipairs(result.loops) do
 		local pts, up = L.pts, L.up
@@ -749,7 +1099,19 @@ function Pipeline.draw(result: any, opts: any?): Instance
 		f.Name = ("r%03d_loop%d_%s_%dto%d%s"):format(L.region, L.index,
 			L.kind or "unlabelled", #L.poly, n,
 			L.closedBy and ("_CLOSED_" .. L.closedBy) or (L.closed and "" or "_OPEN"))
-		f.Parent = simp
+		-- open loops get their own folder and a prefix, so the Explorer finds
+		-- the few that matter among thousands of closed ones
+		if L.closed then
+			f.Parent = simp
+		else
+			if not openF then
+				openF = Instance.new("Folder")
+				openF.Name = "OPEN_LOOPS"
+				openF.Parent = root
+			end
+			f.Name = "OPEN_" .. f.Name
+			f.Parent = openF
+		end
 		local lines = Instance.new("Folder"); lines.Name = "line"; lines.Parent = f
 		for i = 1, (L.closed and n or n - 1) do
 			-- a merged closure moved the edges either side of its node; an
@@ -1707,6 +2069,172 @@ function Pipeline.auditCrossings(result: any): any
 	return out
 end
 
+-- WHAT KIND OF DEFECT EACH SELF-CROSSING RING IS, in one table.
+--
+-- Every fact below was already being computed and none of it was ever read.
+-- `closedBy` has been stored per loop since the closing pass was written;
+-- `merge` and `dejog` each return a refusal count that `Pipeline.simplify` threw
+-- away. The 62 crossings were treated as one defect through two failed passes
+-- because nothing ever asked whether they were the same SHAPE of defect.
+--
+-- They are not. Measured off the drawing, three signatures separate cleanly:
+--
+--   A  a tiny steep fragment, 2-3 studs across at 20-37 degrees, whose ring is
+--      longer than the patch perimeter -- a scribble, not an outline
+--   B  a one-cell notch on a huge FLAT region: two ~0.5 stud edges then a long
+--      run back across them, repeating. `dejog` exists to remove exactly this
+--      and `jogMax` is 1.5, so it SAW these and refused them
+--   C  a closure chord: `close` joins two ends with an absolute cap that is
+--      reasonable on an 800 stud rim and is a third of the whole ring on a small
+--      one. r2370's crossing edge is 3.00 studs against `closeMaxGap` of 3.0
+--
+-- REPORTS ONLY. It resolves nothing; the point is to stop guessing which fix is
+-- worth writing.
+function Pipeline.auditRings(result: any): any
+	local loops = result.loops
+	if not loops then return { error = "no loops on this result" } end
+
+	local byRegion = {}
+	for _, L in ipairs(loops) do
+		local g = byRegion[L.region]
+		if not g then g = {}; byRegion[L.region] = g end
+		g[#g + 1] = L
+	end
+
+	local rows, tot = {}, { rings = 0, crossings = 0,
+		closedBy = {}, jogRefused = 0, mergeRefused = 0, rescued = 0 }
+
+	for _, L in ipairs(loops) do
+		if not L.closed or #L.pts < 4 then continue end
+		local up = L.regionUp or L.up
+		local e1, e2 = Rings.basis(up)
+		local origin = L.pts[1]
+		local src = (CDT.collinear > 0)
+			and Triangulate.straighten(L.pts, CDT.collinear) or L.pts
+		local xs, ys = {}, {}
+		for i, p in ipairs(src) do
+			local d = p - origin
+			xs[i], ys[i] = d:Dot(e1), d:Dot(e2)
+		end
+		local n = #src
+		local hits = 0
+		for i = 1, n do
+			for j = i + 2, n do
+				if not (i == 1 and j == n) then
+					local i2, j2 = i % n + 1, j % n + 1
+					local d1 = (xs[j2] - xs[j]) * (ys[i] - ys[j]) - (ys[j2] - ys[j]) * (xs[i] - xs[j])
+					local d2 = (xs[j2] - xs[j]) * (ys[i2] - ys[j]) - (ys[j2] - ys[j]) * (xs[i2] - xs[j])
+					local d3 = (xs[i2] - xs[i]) * (ys[j] - ys[i]) - (ys[i2] - ys[i]) * (xs[j] - xs[i])
+					local d4 = (xs[i2] - xs[i]) * (ys[j2] - ys[i]) - (ys[i2] - ys[i]) * (xs[j2] - xs[i])
+					if ((d1 > 0) ~= (d2 > 0)) and ((d3 > 0) ~= (d4 > 0)) then hits += 1 end
+				end
+			end
+		end
+		if hits == 0 then continue end
+
+		-- Extent and slope in WORLD axes, the same frame the drawing was
+		-- measured in, so a row here and a folder in the workspace agree.
+		local lo, hi = L.pts[1], L.pts[1]
+		local perim, longest = 0, 0
+		local m = #L.pts
+		for i = 1, m do
+			lo = lo:Min(L.pts[i]); hi = hi:Max(L.pts[i])
+			local len = (L.pts[i % m + 1] - L.pts[i]).Magnitude
+			perim += len
+			if len > longest then longest = len end
+		end
+		local d = hi - lo
+		local flat = math.max(d.X, d.Z)
+		local slope = math.deg(math.atan2(d.Y, math.max(flat, 1e-6)))
+		-- A box around the ring is the SHORTEST any honest outline of it could
+		-- be, so perimeter over box perimeter above ~1.5 means the ring doubles
+		-- back on itself rather than going round.
+		local box = 2 * (d.X + d.Z)
+		local waste = box > 1e-6 and perim / box or 0
+
+		local jog = L.simp and L.simp.jog
+		local mrg = L.simp and L.simp.merge
+		local jr = jog and (jog.refusedDrift + jog.refusedRay) or 0
+		local mr = mrg and (mrg.refusedDrift + mrg.refusedRay) or 0
+		tot.jogRefused += jr
+		tot.mergeRefused += mr
+		tot.rings += 1
+		tot.crossings += hits
+		local cb = L.closedBy or "traced"
+		tot.closedBy[cb] = (tot.closedBy[cb] or 0) + 1
+
+		rows[#rows + 1] = { hits, ("r%03d x%-2d %3dpts raw%-5d %6.1fx%-6.1f slope%3.0f  perim%7.1f waste%4.1f  longest%6.2f (%2.0f%%)  closedBy:%-10s jogRef %d/%d  mergeRef %d/%d")
+			:format(L.region, hits, m, #L.poly, flat, math.max(d.X, d.Z) == d.X and d.Z or d.X,
+				slope, perim, waste, longest, 100 * longest / math.max(perim, 1e-6),
+				cb, jr, jog and jog.input or 0, mr, mrg and mrg.input or 0) }
+	end
+
+	table.sort(rows, function(a, b) return a[1] > b[1] end)
+	local out = {}
+	for _, r in ipairs(rows) do out[#out + 1] = r[2] end
+	local cbs = {}
+	for k, v in pairs(tot.closedBy) do cbs[#cbs + 1] = ("%s=%d"):format(k, v) end
+	table.sort(cbs)
+	return { rows = out, totals = ("%d rings, %d crossings | closedBy[%s] | jog refusals %d, merge refusals %d")
+		:format(tot.rings, tot.crossings, table.concat(cbs, " "),
+			tot.jogRefused, tot.mergeRefused) }
+end
+
+-- WHAT A HIGHER `traceMinWidth` WOULD COST, before anyone sets one.
+--
+-- `Boundary.liveRegions` keeps a region only if a solid k-by-k square of lattice
+-- slots fits inside it, k = ceil(traceMinWidth / step). At the shipped
+-- minWidth of 2 and step 0.5 that is k = 4, a 2x2 stud square -- which a ragged
+-- 2.4 stud scribble passes by a hair while being useless to an agent.
+--
+-- Raising it DELETES FLOOR, so this says how much, per candidate value, without
+-- changing anything. Counted on the finished rings rather than the lattice: a
+-- region whose outer rim's shorter extent is under the candidate would not have
+-- survived the gate.
+function Pipeline.traceWidthCost(result: any, values: {number}?): any
+	local loops = result.loops
+	if not loops then return { error = "no loops on this result" } end
+	local vals = values or { 2.0, 2.5, 3.0, 3.5 }
+
+	local outerOf = {}
+	for _, L in ipairs(loops) do
+		if L.kind == "outer" then
+			local r = L.region
+			if outerOf[r] == nil then outerOf[r] = L else outerOf[r] = false end
+		end
+	end
+
+	local lines = {}
+	for _, v in ipairs(vals) do
+		local drop, area, crossDrop = 0, 0, 0
+		for r, L in pairs(outerOf) do
+			if L then
+				-- IN THE REGION'S OWN PLANE, not world X/Z. A ramp or a
+				-- wall-like surface has a small world footprint on one axis
+				-- while being wide on the surface an agent actually walks, and
+				-- measuring it in world axes reported those as narrow.
+				local e1, e2 = Rings.basis(L.regionUp or L.up)
+				local o = L.pts[1]
+				local loU, hiU, loV, hiV = math.huge, -math.huge, math.huge, -math.huge
+				for _, p in ipairs(L.pts) do
+					local d = p - o
+					local u, w = d:Dot(e1), d:Dot(e2)
+					if u < loU then loU = u end
+					if u > hiU then hiU = u end
+					if w < loV then loV = w end
+					if w > hiV then hiV = w end
+				end
+				if math.min(hiU - loU, hiV - loV) < v then
+					drop += 1
+					area += math.abs(L.area or 0)
+				end
+			end
+		end
+		lines[#lines + 1] = ("traceMinWidth %.1f -> drops %d regions, %.0f sq studs"):format(v, drop, area)
+	end
+	return table.concat(lines, "\n")
+end
+
 function Pipeline.drawCompare(rawLoops: {any}, cutLoops: {any}, opts: any?): (Instance, string)
 	local o = opts or {}
 	local lift = o.lift or 0.3
@@ -1949,6 +2477,19 @@ function Pipeline.report(result: any): string
 	if s.rescued > 0 or s.collapsed > 0 or s.holesHeld > 0 then
 		lines[#lines + 1] = ("  %d holes held tight, %d rings rescued, %d still collapsed")
 			:format(s.holesHeld, s.rescued, s.collapsed)
+	end
+	if s.gapFilled then
+		local kept = {}
+		for k, v in pairs(s.gapKept) do kept[#kept + 1] = ("%s %d"):format(k, v) end
+		table.sort(kept)
+		lines[#lines + 1] = ("gaps      %d filled, kept: %s"):format(s.gapFilled,
+			#kept > 0 and table.concat(kept, ", ") or "none")
+	end
+	if s.clean then
+		local cl = s.clean
+		lines[#lines + 1] = ("corners   %d crossings cut (%d refused), %d spikes, %d clusters (%d refused), %d notches filled, %d rings reverted")
+			:format(cl.crossCut, cl.crossRefused, cl.spikes, cl.clusters, cl.clusterRefused, cl.notches, cl.reverted)
+		lines[#lines + 1] = ("joins     %d shadow pieces dropped, %d open pieces joined, %d rings closed by a join, %d reopened"):format(s.shadows or 0, s.joined or 0, s.joinClosed or 0, s.joinReopened or 0)
 	end
 	lines[#lines + 1] = ("closing   %s, %d still open"):format(#by > 0 and table.concat(by, ", ") or "nothing to close", s.open)
 	if s.edges and s.edges > 0 then
