@@ -7,35 +7,46 @@
 -- drop the graph could not express. These links fill that in.
 --
 -- Walked along every polygon edge that is the region's boundary, one sample per
--- `sample` studs, looking just past the rim:
+-- `sample` studs. From each sample the body walks OUTWARD, distance by distance
+-- (`tries`), and at each distance two questions are asked:
 --
---   drop         a ray straight down lands on another polygon more than a step
---                lower. One-way, rim -> landing, with its measured depth.
---   jump up      the reverse of a drop no deeper than the envelope jump.
---                One-way, landing -> rim.
---   jump across  nothing to land on straight down, so look outward up to the
---                envelope jumpDistance for a landing no higher than the jump,
---                with a clear line at chest height. One-way.
+--   PASS   the lowest height the body can cross from the rim to here at: rays
+--          at its feet, middle and head (`body`, the smallest crouch of any
+--          profile) all clear, and the column over the rim clear up to it. Up
+--          to the envelope jump; nothing passes -> a wall, stop.
+--   FALL   from that height, straight down. What it finds decides:
+--            a lip or cornice off the mesh within a step    keep going out
+--            the same floor or a walkable neighbour         a seam's job, stop
+--            a lower polygon                                DROP (over a rail if
+--                                                           the pass was high)
+--            a polygon up to the jump above, or across a    JUMP
+--            gap
+--          and an UP ray from the landing back to the fall's start must hit
+--          nothing -- a ray that starts inside a part flies through it
+--          (Cocosulx's gateA_bad).
 --
--- MEASUREMENTS, NOT VERDICTS: every link carries rise, gap and span, and the
--- limits used here are the ENVELOPE (Agents), so each NPC profile decides at
--- path time whether it can use one. Consecutive samples on one edge that land on
--- the same polygon at a similar height become one gate, drawn on both sides.
+-- Every drop records `vault`, the height it had to clear first (0 for a plain
+-- step off), so a profile that cannot jump that high refuses it; a jump records
+-- its rise and gap. The ENVELOPE (Agents) decides what is looked for, each
+-- profile what it uses. Consecutive samples on one edge that land on the same
+-- polygon at a similar height become one gate, drawn on both sides, with `via`
+-- the path the body takes between them, so the arrow goes over what it clears.
 
 local Leaps = {}
 
 local Agents = require(script.Parent:WaitForChild("Agents"))
 
 Leaps.sample = 1.0      -- studs between samples along a rim
-Leaps.past = 0.6        -- studs past the rim the down ray starts
 Leaps.dropCap = 300     -- deepest a ray looks when drop is unlimited
 Leaps.landTol = 0.75    -- how far a hit may sit off a polygon's plane
-Leaps.chest = 2.0       -- height of the clear-line test for jumps
 Leaps.groupRise = 0.75  -- samples merge while their landing heights agree this well
--- How far out past the rim a drop may start. The first that lands on the mesh
--- wins, so a cornice or a lip under the rim is stepped past rather than landed on.
-Leaps.pastTries = { 0.6, 1.5, 2.5, 3.5 }
-Leaps.knee = 0.5        -- height of the low clear-line test
+-- Distances out from the rim the body is tried at. Up to dropReach it steps (or
+-- vaults) off and falls; beyond it, it has to jump the distance.
+Leaps.tries = { 0.6, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5 }
+Leaps.dropReach = 3.5
+Leaps.jumpStep = 0.5    -- studs between the tries past dropReach, out to jumpDistance
+Leaps.passStep = 0.5    -- studs between the heights the pass is tried at
+Leaps.lift = 0.3        -- studs off a surface a ray runs, clear of the surface itself
 
 local function vkey(p: Vector3): string
 	return ("%.3f,%.3f,%.3f"):format(p.X, p.Y, p.Z)
@@ -59,10 +70,12 @@ end
 
 function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?): any
 	local env = Agents.envelope()
-	local stats = { rims = 0, samples = 0, drops = 0, jumpsUp = 0, jumpsAcross = 0,
-		dropSamples = 0, jumpSamples = 0, offMesh = 0, duplicate = 0, seconds = 0 }
+	local stats = { rims = 0, samples = 0, drops = 0, jumpsUp = 0, jumpsAcross = 0, vaults = 0,
+		dropSamples = 0, jumpSamples = 0, offMesh = 0, duplicate = 0, walls = 0, rays = 0, seconds = 0 }
 	local t0 = os.clock()
 	local tris = mesh.tris
+	local body = env.crouch
+	if body == math.huge then body = 3 end
 
 	-- polygons hashed by plan bounds, 4 stud buckets
 	local B = 4
@@ -79,15 +92,13 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 			end
 		end
 	end
-	local function locate(p: Vector3, skip: number?): number?
+	local function locate(p: Vector3): number?
 		local best, bd = nil, math.huge
 		for _, i in ipairs(bucket[math.floor(p.X / B) .. ":" .. math.floor(p.Z / B)] or {}) do
-			if i ~= skip then
-				local f = tris[i]
-				if inPlan(f, p) then
-					local d = math.abs(heightAt(f, p) - p.Y)
-					if d < Leaps.landTol and d < bd then best, bd = i, d end
-				end
+			local f = tris[i]
+			if inPlan(f, p) then
+				local d = math.abs(heightAt(f, p) - p.Y)
+				if d < Leaps.landTol and d < bd then best, bd = i, d end
 			end
 		end
 		return best
@@ -105,6 +116,98 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 	rp.IgnoreWater = true
 	local UP = Vector3.yAxis
 	local depth = math.min(env.drop, Leaps.dropCap)
+	local function ray(o: Vector3, d: Vector3): RaycastResult?
+		stats.rays += 1
+		return workspace:Raycast(o, d, rp)
+	end
+
+	-- Can the body go from over the rim `p` to over `q` with its feet at
+	-- p.Y + h? Feet, middle and head clear along the way, and the column over
+	-- the rim clear up to the head.
+	local function passes(p: Vector3, q: Vector3, h: number): boolean
+		local d = q - p
+		for _, y in ipairs({ h + Leaps.lift, h + body * 0.5, h + body - 0.1 }) do
+			if ray(p + UP * y, d) then return false end
+		end
+		return true
+	end
+	local function lowestPass(p: Vector3, q: Vector3): number?
+		local h = 0
+		while h <= env.jump + 1e-6 do
+			-- a ceiling over the rim lower than the head: no higher pass either
+			if h > 0 and ray(p + UP * 0.1, UP * (h + body)) then return nil end
+			if passes(p, q, h) then return h end
+			h += Leaps.passStep
+		end
+		return nil
+	end
+
+	-- the tries, out to the envelope's jump distance
+	local tries = table.clone(Leaps.tries)
+	do
+		local d = Leaps.dropReach + Leaps.jumpStep
+		while d <= env.jumpDistance + 1e-6 do tries[#tries + 1] = d; d += Leaps.jumpStep end
+	end
+
+	-- One sample: walk outward from rim point `p` on polygon `i`.
+	-- Returns target polygon, kind ("drop" | "up" | "across"), landing, the
+	-- point the body passes through, and the height it cleared.
+	local function probe(p: Vector3, outward: Vector3, i: number): (number?, string?, Vector3?, { Vector3 }?, number)
+		local gapSeen = false
+		for _, past in ipairs(tries) do
+			local q = p + outward * past
+			local h = lowestPass(p, q)
+			if not h then stats.walls += 1; return nil, nil, nil, nil, 0 end
+			local from = q + UP * (h + Leaps.lift)
+			local hit = ray(from, -UP * (h + Leaps.lift + depth))
+			if not hit then gapSeen = true; continue end
+			local rel = hit.Position.Y - p.Y
+			local j = locate(hit.Position)
+			if j == i then
+				-- still our own floor: nothing to leave yet
+				if gapSeen then return nil, nil, nil, nil, 0 end
+				continue
+			end
+			if rel >= -env.step and rel <= env.step then
+				if j then
+					if not gapSeen then
+						-- walkable onto the neighbour: a seam's job
+						stats.duplicate += 1
+						return nil, nil, nil, nil, 0
+					end
+				else
+					stats.offMesh += 1 -- a lip, a cornice, a rail's top: keep going out
+					continue
+				end
+			elseif rel < -env.step then
+				gapSeen = true
+				if not j then stats.offMesh += 1; continue end
+			elseif not j then
+				-- something high and off the mesh we got over: keep going out
+				continue
+			end
+			-- a landing on polygon j: the way down must be open
+			local land = hit.Position
+			if ray(land + UP * 0.05, from - (land + UP * 0.05)) then return nil, nil, nil, nil, 0 end
+			if joined[math.min(i, j) .. ":" .. math.max(i, j)] then
+				stats.duplicate += 1
+				return nil, nil, nil, nil, 0
+			end
+			-- THE PATH THE CHECKS PROVED: up the column over the rim to the pass
+			-- height, across at it, then down the fall column. Drawn as is, so an
+			-- arrow never cuts a corner the body does not.
+			local apex = h + Leaps.lift
+			local via = (h > 0) and { p + UP * apex, q + UP * apex } or { q + UP * apex }
+			if rel < -env.step and past <= Leaps.dropReach + 1e-6 then
+				return j, "drop", land, via, h
+			elseif rel > env.step and past <= Leaps.dropReach + 1e-6 then
+				return j, "up", land, via, h
+			else
+				return j, "across", land, via, h
+			end
+		end
+		return nil, nil, nil, nil, 0
+	end
 
 	-- boundary edges: an edge key used once inside its region
 	local uses: { [string]: number } = {}
@@ -128,18 +231,29 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 			centre = (first.from + last.from) * 0.5,
 			span = (last.from - first.from).Magnitude,
 			rise = 0, gap = 0, count = #run, residual = 0, fitted = true, edge = true,
-			oneWay = oneWay, type = kind,
+			oneWay = oneWay, type = kind, vault = 0,
 		}
 		local rs, gs = 0, 0
 		for _, s in ipairs(run) do
 			rs += s.to.Y - s.from.Y
 			gs += Vector3.new(s.to.X - s.from.X, 0, s.to.Z - s.from.Z).Magnitude
+			if (s.vault or 0) > L.vault then L.vault = s.vault end
 		end
 		L.rise, L.gap = rs / #run, gs / #run
-		-- the point in the air just past the rim, for a forward-then-down arrow
-		local ov, no = Vector3.zero, 0
-		for _, s2 in ipairs(run) do if s2.over then ov += s2.over; no += 1 end end
-		if no > 0 then L.over = ov / no end
+		-- the path the body takes, averaged over samples that share its shape
+		local nv = run[1].via and #run[1].via or 0
+		if nv > 0 then
+			local acc, cnt = table.create(nv, Vector3.zero), 0
+			for _, s2 in ipairs(run) do
+				if s2.via and #s2.via == nv then
+					for k2 = 1, nv do acc[k2] += s2.via[k2] end
+					cnt += 1
+				end
+			end
+			for k2 = 1, nv do acc[k2] /= cnt end
+			L.via = acc
+			L.over = acc[nv]
+		end
 		L.drop = -L.rise
 		out[#out + 1] = L
 	end
@@ -159,25 +273,27 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 			local ua = d / len
 			local outward = ua:Cross(UP) -- floor is left of travel
 			local m = math.max(1, math.floor(len / Leaps.sample))
-			-- runs per target, per kind: { target, kind, samples }
 			local cur: any = nil
 			local function flush()
 				if cur then
 					if cur.kind == "drop" then
 						emit("drop", i, cur.target, cur.samples, true)
 						stats.drops += 1
+						if cur.vaulted then stats.vaults += 1 end
 						if cur.canJumpUp then
 							local rev = {}
 							for s = #cur.samples, 1, -1 do
 								local q = cur.samples[s]
-								rev[#rev + 1] = { from = q.to, to = q.from, over = q.over }
+								local rv = {}
+								for k2 = #(q.via or {}), 1, -1 do rv[#rv + 1] = q.via[k2] end
+								rev[#rev + 1] = { from = q.to, to = q.from, via = rv }
 							end
 							emit("jump", cur.target, i, rev, true)
 							stats.jumpsUp += 1
 						end
 					else
 						emit("jump", i, cur.target, cur.samples, true)
-						stats.jumpsAcross += 1
+						if cur.kind == "up" then stats.jumpsUp += 1 else stats.jumpsAcross += 1 end
 					end
 					cur = nil
 				end
@@ -186,80 +302,23 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 				local t = (s + 0.5) / m
 				local p = a:Lerp(b, t)
 				stats.samples += 1
-				local target, kind, land, over = nil, nil, nil, nil
-				-- THE WAY DOWN MUST BE OPEN. A ray that starts inside a part flies
-				-- straight through it, so a probe just past the top edge of a roof
-				-- panel -- already inside the building -- "landed" on the floor
-				-- inside, 10.6 studs down (Cocosulx's gateA_bad). Every drop now
-				-- needs the step off the rim clear at knee and chest height, and an
-				-- UP ray from the landing back to the start that hits nothing: no
-				-- roof, no ceiling in between.
-				local lastHit = nil
-				for _, past in ipairs(Leaps.pastTries) do
-					local q = p + outward * past
-					if workspace:Raycast(p + UP * Leaps.knee, outward * past, rp)
-						or workspace:Raycast(p + UP * Leaps.chest, outward * past, rp) then
-						break -- a wall or a parapet: no stepping off here
-					end
-					local hit = workspace:Raycast(q + UP * 0.25, -UP * (depth + 0.25), rp)
-					lastHit = hit
-					if not hit then break end
-					local h = p.Y - hit.Position.Y
-					if h <= env.step then break end -- walkable, a seam's job
-					local up = (q + UP * 0.25) - (hit.Position + UP * 0.05)
-					if workspace:Raycast(hit.Position + UP * 0.05, up, rp) then break end
-					local j = locate(hit.Position, i)
-					if j and not joined[math.min(i, j) .. ":" .. math.max(i, j)] then
-						target, kind, land, over = j, "drop", hit.Position, q
-						break
-					elseif j then
-						stats.duplicate += 1
-						break
-					end
-					stats.offMesh += 1 -- a lip or a cornice: try further out
-				end
-				if not target and (not lastHit or (p.Y - lastHit.Position.Y) > env.step) then
-					-- nothing to step down onto: try a jump outward
-					local chest = p + UP * Leaps.chest
-					for dist = 1.0, env.jumpDistance, 0.5 do
-						local o2 = p + outward * dist
-						if workspace:Raycast(chest, outward * dist, rp) then break end
-						local top = o2 + UP * (env.jump + 0.25)
-						local h2 = workspace:Raycast(top, -UP * (env.jump + env.step + 0.5), rp)
-						if h2 then
-							local rise = h2.Position.Y - p.Y
-							if rise <= env.jump and rise >= -env.step then
-								-- head room over the take-off and a clear column over the
-								-- landing: no jumping through a ceiling
-								local clearTake = not workspace:Raycast(p + UP * 0.1, UP * (math.max(rise, 0) + Leaps.chest + 1), rp)
-								local clearLand = not workspace:Raycast(h2.Position + UP * 0.05, top - (h2.Position + UP * 0.05), rp)
-								local clearLine = not workspace:Raycast(chest + UP * math.max(rise, 0),
-									(h2.Position + UP * Leaps.chest) - (chest + UP * math.max(rise, 0)), rp)
-								local j = (clearTake and clearLand and clearLine) and locate(h2.Position, i) or nil
-								if j and j ~= i then
-									if not joined[math.min(i, j) .. ":" .. math.max(i, j)] then
-										target, kind, land, over = j, "across", h2.Position, nil
-									else
-										stats.duplicate += 1
-									end
-								end
-								break
-							end
-						end
-					end
-				end
-				if target then
+				local target, kind, land, via, vault = probe(p, outward, i)
+				if target and land then
 					if kind == "drop" then stats.dropSamples += 1 else stats.jumpSamples += 1 end
-					local sample = { from = p, to = land, over = over }
-					local canUp = kind == "drop" and (p.Y - land.Y) <= env.jump
+					local sample = { from = p, to = land, via = via, vault = vault }
+					-- a plain step off can be jumped back up; a vault over a rail
+					-- cannot be reversed by the same jump
+					local canUp = kind == "drop" and (p.Y - land.Y) <= env.jump and vault <= env.step
 					if cur and cur.target == target and cur.kind == kind
-						and math.abs((land.Y - p.Y) - (cur.last.to.Y - cur.last.from.Y)) <= Leaps.groupRise then
+						and math.abs((land.Y - p.Y) - (cur.last.to.Y - cur.last.from.Y)) <= Leaps.groupRise
+						and (vault > env.step) == cur.vaulted then
 						cur.samples[#cur.samples + 1] = sample
 						cur.last = sample
 						cur.canJumpUp = cur.canJumpUp and canUp
 					else
 						flush()
-						cur = { target = target, kind = kind, samples = { sample }, last = sample, canJumpUp = canUp }
+						cur = { target = target, kind = kind, samples = { sample }, last = sample,
+							canJumpUp = canUp, vaulted = vault > env.step }
 					end
 				else
 					flush()
@@ -269,15 +328,27 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 		end
 	end
 
-	for _, L in ipairs(out) do res.links[#res.links + 1] = L end
+	-- a ledge found from below and as the reverse of a drop from above is one jump
+	local kept: { [string]: boolean } = {}
+	for _, L in ipairs(out) do
+		local c = L.centre
+		local key = L.kind .. ":" .. L.a .. ":" .. L.b .. ":" .. math.floor(c.X / 2) .. ":" .. math.floor(c.Z / 2)
+		if kept[key] then
+			stats.duplicate += 1
+		else
+			kept[key] = true
+			res.links[#res.links + 1] = L
+		end
+	end
 	stats.seconds = os.clock() - t0
 	res.leaps = stats
 	return stats
 end
 
 function Leaps.report(s: any): string
-	return ("leaps     %d rim edges, %d samples: %d drops, %d jumps up, %d jumps across (%d drop samples, %d jump samples); %d landed off the mesh, %d already walkable  (%.1fs)")
-		:format(s.rims, s.samples, s.drops, s.jumpsUp, s.jumpsAcross, s.dropSamples, s.jumpSamples, s.offMesh, s.duplicate, s.seconds)
+	return ("leaps     %d rim edges, %d samples: %d drops (%d over a rail), %d jumps up, %d jumps across (%d drop samples, %d jump samples); %d off the mesh, %d already walkable, %d walls; %d rays  (%.1fs)")
+		:format(s.rims, s.samples, s.drops, s.vaults, s.jumpsUp, s.jumpsAcross, s.dropSamples, s.jumpSamples,
+			s.offMesh, s.duplicate, s.walls, s.rays, s.seconds)
 end
 
 return Leaps

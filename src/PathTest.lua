@@ -105,7 +105,8 @@ local function usable(mesh: any, e: any, prof: any?, banned: any?): boolean
 	local rise = L.rise or 0
 	if e.reverse then rise = -rise end
 	if L.kind == "drop" then
-		return -rise <= (prof.drop or math.huge)
+		-- over a rail first: the vault is a jump
+		return -rise <= (prof.drop or math.huge) and (L.vault or 0) <= (prof.jump or 0)
 	elseif L.kind == "jump" then
 		return rise <= (prof.jump or 0) and (L.gap or 0) <= (prof.jumpDistance or 0)
 	end
