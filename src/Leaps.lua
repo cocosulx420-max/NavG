@@ -47,6 +47,14 @@ Leaps.dropReach = 3.5
 Leaps.jumpStep = 0.5    -- studs between the tries past dropReach, out to jumpDistance
 Leaps.passStep = 0.5    -- studs between the heights the pass is tried at
 Leaps.lift = 0.3        -- studs off a surface a ray runs, clear of the surface itself
+-- THE FALL IS AS WIDE AS THE BODY. A ray down the centre slipped past an eave
+-- slab 0.9 studs away and "landed" 50 studs below, straight through the
+-- overhang the body would hit (Cocosulx's dropoffbad). Rays at this share of
+-- the smallest radius, out and to both sides, must reach the landing too.
+Leaps.fallRadius = 0.9
+Leaps.detour = 2.0      -- a walk bridge must save a way round longer than this x the walk...
+Leaps.detourSlack = 3.0 -- ...plus this many studs
+Leaps.walkMin = 2       -- samples (studs of rim) a walk bridge needs
 
 local function vkey(p: Vector3): string
 	return ("%.3f,%.3f,%.3f"):format(p.X, p.Y, p.Z)
@@ -71,7 +79,8 @@ end
 function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?): any
 	local env = Agents.envelope()
 	local stats = { rims = 0, samples = 0, drops = 0, jumpsUp = 0, jumpsAcross = 0, vaults = 0,
-		dropSamples = 0, jumpSamples = 0, offMesh = 0, duplicate = 0, walls = 0, rays = 0, seconds = 0 }
+		dropSamples = 0, jumpSamples = 0, offMesh = 0, duplicate = 0, walls = 0, rays = 0, seconds = 0,
+		caught = 0, walks = 0 }
 	local t0 = os.clock()
 	local tris = mesh.tris
 	local body = env.crouch
@@ -106,8 +115,37 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 
 	-- links that already join a pair, either way
 	local joined: { [string]: boolean } = {}
+	local adj: { [number]: { any } } = {}
 	for _, L in ipairs(res.links) do
 		joined[math.min(L.a, L.b) .. ":" .. math.max(L.a, L.b)] = true
+		adj[L.a] = adj[L.a] or {}; table.insert(adj[L.a], { to = L.b, at = L.centre })
+		adj[L.b] = adj[L.b] or {}; table.insert(adj[L.b], { to = L.a, at = L.centre })
+	end
+	-- A WALK BRIDGE MUST SAVE A DETOUR. Over unmeshed floor between two polygons
+	-- the walk links already join a short way round, it adds a gate and no
+	-- route; kept only when the way round is longer than detour x the straight
+	-- walk plus detourSlack. Measured through the link centres, bounded.
+	local function detour(i: number, j: number, from: Vector3, to: Vector3): boolean
+		local direct = (to - from).Magnitude
+		local limit = Leaps.detour * direct + Leaps.detourSlack
+		local best: { [number]: number } = { [i] = 0 }
+		local at: { [number]: Vector3 } = { [i] = from }
+		local open = { i }
+		while #open > 0 do
+			local k, bi = nil, 0
+			for n2, x in ipairs(open) do if not k or best[x] < best[k] then k, bi = x, n2 end end
+			table.remove(open, bi)
+			if k == j then return best[k] + (to - at[k]).Magnitude > limit end
+			for _, e in ipairs(adj[k :: number] or {}) do
+				local c = best[k :: number] + (e.at - at[k :: number]).Magnitude
+				if c <= limit and (best[e.to] == nil or c < best[e.to]) then
+					if best[e.to] == nil then open[#open + 1] = e.to end
+					best[e.to] = c
+					at[e.to] = e.at
+				end
+			end
+		end
+		return true
 	end
 
 	local rp = RaycastParams.new()
@@ -152,8 +190,29 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 	-- One sample: walk outward from rim point `p` on polygon `i`.
 	-- Returns target polygon, kind ("drop" | "up" | "across"), landing, the
 	-- point the body passes through, and the height it cleared.
+	local radius = (env.radius == math.huge) and 1 or env.radius
+	-- the body's edges fall clear to the landing: nothing it would catch on on the way
+	local function fallClear(from: Vector3, land: Vector3, outward: Vector3, rimY: number): boolean
+		local side = outward:Cross(UP)
+		local r = radius * Leaps.fallRadius
+		for _, o in ipairs({ outward * r, side * r, -side * r }) do
+			local top = from + o
+			local hit = ray(top, -UP * (top.Y - land.Y + Leaps.landTol))
+			if hit and hit.Position.Y > land.Y + env.step then return false end
+			-- and up, for a part the down ray started inside
+			local bot = Vector3.new(top.X, land.Y + 0.05, top.Z)
+			if ray(bot, top - bot) then return false end
+		end
+		-- toward the rim, up from the landing to just under it: an eave, a slab
+		-- edge or the floor's own lip the body would come down on
+		local back = Vector3.new(from.X, land.Y + 0.05, from.Z) - outward * r
+		if rimY - 0.1 > back.Y and ray(back, UP * (rimY - 0.1 - back.Y)) then return false end
+		return true
+	end
+
 	local function probe(p: Vector3, outward: Vector3, i: number): (number?, string?, Vector3?, { Vector3 }?, number)
 		local gapSeen = false
+		local crossed = false -- walked over floor that is not on the mesh
 		for _, past in ipairs(tries) do
 			local q = p + outward * past
 			local h = lowestPass(p, q)
@@ -171,12 +230,20 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 			if rel >= -env.step and rel <= env.step then
 				if j then
 					if not gapSeen then
-						-- walkable onto the neighbour: a seam's job
-						stats.duplicate += 1
-						return nil, nil, nil, nil, 0
+						-- walkable onto the neighbour. A seam's job -- unless there is no
+						-- seam: floor off the mesh between them (a roof valley whose
+						-- cells died, Cocosulx's image 20) leaves them unlinked, and the
+						-- walk over it is a two-way bridge.
+						if not crossed or h > env.step or not detour(i, j, p, hit.Position) then
+							stats.duplicate += 1
+							return nil, nil, nil, nil, 0
+						end
+						stats.walks += 1
+						return j, "walk", hit.Position, { q + UP * Leaps.lift }, h
 					end
 				else
 					stats.offMesh += 1 -- a lip, a cornice, a rail's top: keep going out
+					crossed = true
 					continue
 				end
 			elseif rel < -env.step then
@@ -189,6 +256,8 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 			-- a landing on polygon j: the way down must be open
 			local land = hit.Position
 			if ray(land + UP * 0.05, from - (land + UP * 0.05)) then return nil, nil, nil, nil, 0 end
+			-- too close to something the body would catch on: try further out
+			if not fallClear(from, land, outward, p.Y) then stats.caught += 1; crossed = true; continue end
 			if joined[math.min(i, j) .. ":" .. math.max(i, j)] then
 				stats.duplicate += 1
 				return nil, nil, nil, nil, 0
@@ -276,7 +345,12 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 			local cur: any = nil
 			local function flush()
 				if cur then
-					if cur.kind == "drop" then
+					if cur.kind == "walk" then
+						-- one sample is a corner graze, not a way across
+						if #cur.samples >= Leaps.walkMin then
+							emit("bridge", i, cur.target, cur.samples, false)
+						end
+					elseif cur.kind == "drop" then
 						emit("drop", i, cur.target, cur.samples, true)
 						stats.drops += 1
 						if cur.vaulted then stats.vaults += 1 end
@@ -332,7 +406,13 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 	local kept: { [string]: boolean } = {}
 	for _, L in ipairs(out) do
 		local c = L.centre
-		local key = L.kind .. ":" .. L.a .. ":" .. L.b .. ":" .. math.floor(c.X / 2) .. ":" .. math.floor(c.Z / 2)
+		local a, b = L.a, L.b
+		if not L.oneWay then
+			-- found from both sides: the same crossing, keyed by its middle
+			a, b = math.min(a, b), math.max(a, b)
+			c = (L.centre + (L.bLeft + L.bRight) * 0.5) * 0.5
+		end
+		local key = L.kind .. ":" .. a .. ":" .. b .. ":" .. math.floor(c.X / 2) .. ":" .. math.floor(c.Z / 2)
 		if kept[key] then
 			stats.duplicate += 1
 		else
@@ -346,9 +426,9 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 end
 
 function Leaps.report(s: any): string
-	return ("leaps     %d rim edges, %d samples: %d drops (%d over a rail), %d jumps up, %d jumps across (%d drop samples, %d jump samples); %d off the mesh, %d already walkable, %d walls; %d rays  (%.1fs)")
-		:format(s.rims, s.samples, s.drops, s.vaults, s.jumpsUp, s.jumpsAcross, s.dropSamples, s.jumpSamples,
-			s.offMesh, s.duplicate, s.walls, s.rays, s.seconds)
+	return ("leaps     %d rim edges, %d samples: %d drops (%d over a rail), %d jumps up, %d jumps across, %d walk samples over unmeshed floor (%d drop samples, %d jump samples); %d off the mesh, %d already walkable, %d walls, %d falls the body would catch; %d rays  (%.1fs)")
+		:format(s.rims, s.samples, s.drops, s.vaults, s.jumpsUp, s.jumpsAcross, s.walks, s.dropSamples, s.jumpSamples,
+			s.offMesh, s.duplicate, s.walls, s.caught, s.rays, s.seconds)
 end
 
 return Leaps

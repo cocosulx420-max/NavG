@@ -66,16 +66,6 @@ local function heightAt(f: any, p: Vector3): number
 	return c.Y - ((p.X - c.X) * up.X + (p.Z - c.Z) * up.Z) / up.Y
 end
 
-local function inPlan(f: any, p: Vector3): boolean
-	local v = f.verts
-	local n = #v
-	for k = 1, n do
-		local a, b = v[k], v[k % n + 1]
-		if (b.X - a.X) * (p.Z - a.Z) - (b.Z - a.Z) * (p.X - a.X) > 1e-4 then return false end
-	end
-	return true
-end
-
 -- Untraced floor: which traced regions each untraced cell reaches, and how far.
 -- The same relaxation as Portals' bridge links, by region instead of polygon.
 local function reachUntraced(data: any, snap: any, traced: { [number]: any }, limit: number): { [any]: { [number]: number } }
@@ -369,11 +359,6 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 	-- ------------------------------------------------------ 3. rim edges
 	local t2 = os.clock()
 	local rimByRegion: { [number]: { any } } = {}
-	local polysOf: { [number]: { number } } = {}
-	for i, f in ipairs(mesh.tris) do
-		local t = polysOf[f.region]; if not t then t = {}; polysOf[f.region] = t end
-		t[#t + 1] = i
-	end
 	do
 		local uses: { [string]: number } = {}
 		local function ek(r: number, a: Vector3, b: Vector3): string
@@ -617,7 +602,7 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 		else
 			-- ONE-SIDED: the far region has no run facing back (a filled hole, a
 			-- dropped shadow piece). Match against its whole rim nearby, then
-			-- failing that, against the polygon the run looks into.
+			-- failing that, through the cells the run stepped to.
 			local made = false
 			local pieces = runPieces(R)
 			for _, A in ipairs(pieces) do
@@ -642,49 +627,66 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 			if made then
 				stats.runsFallbackRim += 1
 			else
+				-- LAST: the cells the run's faces stepped to ARE the far side. Grouped
+				-- by the polygon each was claimed into; the far bar runs through them
+				-- at their own heights, so it can never sit a storey away.
 				for _, A in ipairs(pieces) do
 					local fa = mesh.tris[A.poly]
 					local up = fa.up or Vector3.yAxis
 					local da = flatten(A.p2 - A.p1, up)
-					if da.Magnitude < GridPortals.minSpan then continue end
-					local o = da.Unit:Cross(up)
-					for _, g in ipairs({ 0.5, 1.0, 1.5 }) do
-						local probe = (A.p1 + A.p2) * 0.5 + o * g
-						local hit = nil
-						for _, E in ipairs(rimByRegion[R.target] or {}) do
-							local f = mesh.tris[E.poly]
-							if not hit and inPlan(f, probe) and math.abs(heightAt(f, probe) - probe.Y) < 2.5 then hit = E.poly end
+					local la = da.Magnitude
+					if la < GridPortals.minSpan then continue end
+					local ua = da / la
+					local o = ua:Cross(up)
+					local byPoly: { [number]: any } = {}
+					for c in pairs(R.partnerCells) do
+						local pb = of[c]
+						local v = flatten(c.pos - A.p1, up)
+						local t, lat = v:Dot(ua), v:Dot(o)
+						if pb and pb ~= A.poly and t >= -0.5 and t <= la + 0.5 and lat >= -0.1 and lat <= gapMax then
+							local e = byPoly[pb]
+							if not e then e = { n = 0, lo = math.huge, hi = -math.huge, lat = 0 }; byPoly[pb] = e end
+							e.n += 1
+							e.lo = math.min(e.lo, t); e.hi = math.max(e.hi, t)
+							e.lat += lat
 						end
-						if not hit then
-							-- an interior polygon has no rim edge but can still hold the point
-							for _, i in ipairs(polysOf[R.target] or {}) do
-								local f = mesh.tris[i]
-								if inPlan(f, probe) and math.abs(heightAt(f, probe) - probe.Y) < 2.5 then hit = i break end
-							end
+					end
+					local best, bn = nil, 0
+					for pb, e in pairs(byPoly) do
+						if e.n > bn or (e.n == bn and pb < (best :: any)) then best, bn = pb, e.n end
+					end
+					if best then
+						local e = byPoly[best]
+						local fb = mesh.tris[best]
+						local lo = math.clamp(e.lo - 0.25, 0, la)
+						local hi = math.clamp(e.hi + 0.25, 0, la)
+						if hi - lo < GridPortals.minSpan then hi = math.min(la, lo + GridPortals.minSpan) end
+						local g = e.lat / e.n
+						local aL, aR = A.p1:Lerp(A.p2, lo / la), A.p1:Lerp(A.p2, hi / la)
+						local function across(p: Vector3): Vector3
+							local q = p + o * g
+							return Vector3.new(q.X, heightAt(fb, q), q.Z)
 						end
-						if hit then
-							local fb = mesh.tris[hit]
-							local function lift(p: Vector3): Vector3
-								local q = p + o * g
-								return Vector3.new(q.X, heightAt(fb, q), q.Z)
-							end
-							local key = math.min(A.poly, hit) .. ":" .. math.max(A.poly, hit) .. ":in:" .. vkey(A.p1)
+						local bL, bR = across(aR), across(aL)
+						local rmax = (R.kind == "bridge") and 2 * riseMax or riseMax
+						if math.abs((bR - aL):Dot(up)) <= rmax and math.abs((bL - aR):Dot(up)) <= rmax then
+							local key = math.min(A.poly, best) .. ":" .. math.max(A.poly, best) .. ":cells:" .. vkey(aL)
 							if not seen[key] then
 								seen[key] = true
-								local ca = (A.p1 + A.p2) * 0.5
-								local bL, bR = lift(A.p2), lift(A.p1)
+								local ca = (aL + aR) * 0.5
 								links[#links + 1] = {
-									kind = R.kind, a = A.poly, b = hit,
-									left = A.p1, right = A.p2, bLeft = bL, bRight = bR,
-									centre = ca, span = (A.p2 - A.p1).Magnitude,
+									kind = R.kind, a = A.poly, b = best,
+									left = aL, right = aR, bLeft = bL, bRight = bR,
+									centre = ca, span = (aR - aL).Magnitude,
 									drop = (ca - (bL + bR) * 0.5):Dot(up), gap = g,
-									count = nCells(R), residual = 0, fitted = true, edge = true,
-									source = "grid-inside",
+									count = e.n, residual = 0, fitted = true, edge = true,
+									source = "grid-cells",
 								}
 								if R.kind == "bridge" then stats.bridge += 1 else stats.seam += 1 end
 								made = true
 							end
-							break
+						else
+							fail("cells rise")
 						end
 					end
 				end
@@ -727,7 +729,7 @@ function GridPortals.report(res: any): string
 			:format(s.polys, #res.links, s.shared, s.seam, s.bridge, s.seconds, s.tFaces, s.tRuns, s.tLinks),
 		("  faces %d: %d open (%d via untraced floor), %d refused by the wall rays, %d with only a sideways pair")
 			:format(s.faces, s.facesOpen, s.facesBridge, s.facesBlocked, s.facesSideways),
-		("  runs %d: %d matched both sides, %d one-sided met the far rim, %d one-sided into a polygon, %d unlinked; %d gaps closed")
+		("  runs %d: %d matched both sides, %d one-sided met the far rim, %d one-sided from their cells, %d unlinked; %d gaps closed")
 			:format(s.runs, s.runsMatched, s.runsFallbackRim, s.runsFallbackInside, s.runsUnlinked, s.gapCloses),
 		("  %d corner contacts, %d raw nodes without provenance, %d runs with no rim edge under them, %d duplicate overlaps")
 			:format(s.corners, s.nodesUncovered, s.piecesMissing, s.duplicates),
