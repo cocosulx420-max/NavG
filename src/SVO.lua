@@ -192,6 +192,43 @@ function SVO:isSolid(p: Vector3): boolean
 	end
 end
 
+-- The solid intervals of the vertical line through (x, z), between yLo and yHi,
+-- merged and sorted bottom up: { {y0, y1}, ... }. Walks only the nodes the line
+-- passes through -- the two Y octants under each X/Z choice -- so a column costs
+-- its depth, not its height in voxels.
+function SVO:columnRuns(x: number, z: number, yLo: number, yHi: number): { { number } }
+	local out = {}
+	local function rec(node, nc: Vector3, nh: number)
+		if nc.Y + nh < yLo or nc.Y - nh > yHi then return end
+		if node.solid then
+			out[#out + 1] = { math.max(yLo, nc.Y - nh), math.min(yHi, nc.Y + nh) }
+			return
+		end
+		local ch = node.children
+		if not ch then return end
+		local h = nh * 0.5
+		local bx = (x >= nc.X) and 1 or 0
+		local bz = (z >= nc.Z) and 4 or 0
+		for _, by in ipairs({ 0, 2 }) do
+			local i = bx + by + bz
+			local c = ch[i]
+			if c then rec(c, nc + OFF[i] * h, h) end
+		end
+	end
+	rec(self.root, self.center, self.half)
+	table.sort(out, function(a, b) return a[1] < b[1] end)
+	local merged = {}
+	for _, r in ipairs(out) do
+		local last = merged[#merged]
+		if last and r[1] <= last[2] + 1e-6 then
+			if r[2] > last[2] then last[2] = r[2] end
+		else
+			merged[#merged + 1] = { r[1], r[2] }
+		end
+	end
+	return merged
+end
+
 -- Visit every solid leaf: fn(centerVec3, half)
 function SVO:forEachSolidLeaf(fn)
 	local function rec(node, nc: Vector3, nh: number)
@@ -368,6 +405,15 @@ function SVO.fromParts(parts: {BasePart}, leaf: number, margin: number, opts: an
 	-- root edge = leaf * 2^depth, big enough to hold maxE
 	local depth = math.max(0, math.ceil(math.log(maxE/leaf) / math.log(2))) -- luau: log base via division
 	local rootEdge = leaf * (2 ^ depth)
+	if opts and opts.align then
+		-- WORLD-ALIGNED LEAVES: every leaf boundary on a multiple of `leaf`, so a
+		-- world grid's columns line up with the voxels. The root is grown by one
+		-- level so the snapped corner still holds everything.
+		local snap = Vector3.new(math.floor(lo.X / leaf) * leaf, math.floor(lo.Y / leaf) * leaf,
+			math.floor(lo.Z / leaf) * leaf)
+		rootEdge *= 2
+		center = snap + Vector3.new(rootEdge, rootEdge, rootEdge) * 0.5
+	end
 	local tree = SVO.new(center, rootEdge * 0.5, leaf)
 	local onYield = onProgress and function() onProgress(nil, #parts) end
 	for i, part in ipairs(parts) do
