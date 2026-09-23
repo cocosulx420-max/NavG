@@ -47,6 +47,10 @@ GridPortals.riseSlack = 0.5      -- studs over the largest step the two sides ma
 -- the face normal). At 1.0 (45 degrees) the right partner sat to the side of
 -- every face of a small region and the link was lost.
 GridPortals.pastRatio = 0.5
+GridPortals.matchReach = 0.8   -- studs between a run's stepped-to cell and the far run's cell
+-- A one-sided run's far side must come this close to a cell it stepped to: the
+-- whole far rim within seamGap reached across a wall (Cocosulx's "bad").
+GridPortals.fallbackReach = 1.0
 
 local function vkey(p: Vector3): string
 	return ("%.3f,%.3f,%.3f"):format(p.X, p.Y, p.Z)
@@ -164,6 +168,23 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 			if workspace:Raycast(p1 + Vector3.yAxis * h, p2 - p1, rp) then return true end
 		end
 		return false
+	end
+	-- A GATE is tested once more between its two sides. Level over the higher
+	-- side a steep roof's own crease between two faces reads as a wall, and
+	-- along the slope a stair riser does, so only something that stops BOTH is
+	-- one -- a wall or a rail stops both. The column up from the lower side
+	-- alone is enough, as for faces: a slab overhead.
+	local function gateBlocked(a: Vector3, b: Vector3): boolean
+		local hi = math.max(a.Y, b.Y)
+		local low = (a.Y <= b.Y) and a or b
+		local rise = hi + GridPortals.rays[1] - low.Y
+		if rise > 0.2 and workspace:Raycast(low + Vector3.yAxis * 0.1, Vector3.yAxis * (rise - 0.1), rp) then return true end
+		-- at chest height only: whatever stops a gate at the knee alone is lower
+		-- than a step (a 59 degree hip's own crease stood 0.8 over both sides)
+		local p1 = Vector3.new(a.X, hi, a.Z)
+		local p2 = Vector3.new(b.X, hi, b.Z)
+		local up = Vector3.yAxis * GridPortals.rays[#GridPortals.rays]
+		return workspace:Raycast(p1 + up, p2 - p1, rp) ~= nil and workspace:Raycast(a + up, b - a, rp) ~= nil
 	end
 
 	-- ------------------------------------------------------------ 1. faces
@@ -500,6 +521,8 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 		local rmax = (kind == "bridge") and 2 * riseMax or riseMax
 		if math.abs((bR - aL):Dot(up)) > rmax or math.abs((bL - aR):Dot(up)) > rmax then return fail("rise") end
 		local ca, cb = (aL + aR) * 0.5, (bL + bR) * 0.5
+		-- the gate itself must be crossable, not only the faces behind it
+		if gateBlocked(ca, cb) then return fail("wall") end
 		local mid = (ca + cb) * 0.5
 		local key = math.min(A.poly, B.poly) .. ":" .. math.max(A.poly, B.poly) .. ":"
 			.. math.floor(mid.X * 2 + 0.5) .. ":" .. math.floor(mid.Y * 2 + 0.5) .. ":" .. math.floor(mid.Z * 2 + 0.5)
@@ -538,6 +561,7 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 		local rmax = (kind == "bridge") and 2 * riseMax or riseMax
 		if math.abs((bR - A.p1):Dot(up)) > rmax or math.abs((bL - A.p2):Dot(up)) > rmax then return fail("corner rise") end
 		local ca, cb = (A.p1 + A.p2) * 0.5, (bL + bR) * 0.5
+		if gateBlocked(ca, cb) then return fail("corner wall") end
 		local mid = (ca + cb) * 0.5
 		local key = math.min(A.poly, B.poly) .. ":" .. math.max(A.poly, B.poly) .. ":"
 			.. math.floor(mid.X * 2 + 0.5) .. ":" .. math.floor(mid.Y * 2 + 0.5) .. ":" .. math.floor(mid.Z * 2 + 0.5)
@@ -581,6 +605,16 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 			if R.kind == "seam" then
 				for c in pairs(R.partnerCells) do if S.cells[c] then hit = true break end end
 				if not hit then for c in pairs(S.partnerCells) do if R.cells[c] then hit = true break end end end
+				-- two lattices offset against each other: the cell a face steps to
+				-- is then an inner cell of the far run, not one of its own face cells
+				if not hit then
+					for c in pairs(R.partnerCells) do
+						for c2 in pairs(S.cells) do
+							if (c.pos - c2.pos).Magnitude <= GridPortals.matchReach then hit = true break end
+						end
+						if hit then break end
+					end
+				end
 			else
 				for vr in pairs(R.viaRegions) do if S.viaRegions[vr] then hit = true break end end
 			end
@@ -621,11 +655,23 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 			-- failing that, through the cells the run stepped to.
 			local made = false
 			local pieces = runPieces(R)
+			local function nearPartner(E: any): boolean
+				for c in pairs(R.partnerCells) do
+					if c.region == R.target or (R.kind == "bridge") then
+						if (segDist(c.pos, E.a, E.b, Vector3.yAxis)) <= GridPortals.fallbackReach then return true end
+					end
+				end
+				return false
+			end
+			local rimNear = {}
+			for _, E in ipairs(rimByRegion[R.target] or {}) do
+				if R.kind == "bridge" or nearPartner(E) then rimNear[#rimNear + 1] = E end
+			end
 			for _, A in ipairs(pieces) do
 				local lo, hi = A.p1:Min(A.p2), A.p1:Max(A.p2)
 				local pad = Vector3.one * (gapMax + 0.5)
 				lo, hi = lo - pad, hi + pad
-				for _, E in ipairs(rimByRegion[R.target] or {}) do
+				for _, E in ipairs(rimNear) do
 					local c = (E.a + E.b) * 0.5
 					local ext = (E.b - E.a).Magnitude * 0.5
 					if c.X >= lo.X - ext and c.X <= hi.X + ext and c.Z >= lo.Z - ext and c.Z <= hi.Z + ext
@@ -636,7 +682,7 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 			end
 			if not made then
 				local near = {}
-				for _, E in ipairs(rimByRegion[R.target] or {}) do near[#near + 1] = { poly = E.poly, p1 = E.a, p2 = E.b } end
+				for _, E in ipairs(rimNear) do near[#near + 1] = { poly = E.poly, p1 = E.a, p2 = E.b } end
 				local A, B = nearestPair(pieces, near)
 				if A and B then made = emitCorner(A, B, R.kind, gapMax, nCells(R)) end
 			end
