@@ -456,6 +456,29 @@ local function insertSegment(m: Mesh, u: number, v: number, depth: number?): boo
 	return true
 end
 
+-- A SEGMENT THE FLIPS CANNOT RECOVER IS SPLIT, NOT DROPPED. `insertSegment`
+-- flips the first flippable edge it crosses and gives up when none is; on a
+-- long edge through a crowded fan that happens. case6's r001 lost a 263 stud
+-- rim edge this way, triangles spanned the inlet it bounds, and the parity
+-- fill then inverted the region. Inserting the midpoint ON the edge and forcing
+-- each half is the standard fallback; the halves are shorter and cross fewer
+-- edges, and decimation takes an exactly collinear midpoint back out later.
+CDT.forceDepth = 6
+
+local function forceSegment(m: Mesh, u: number, v: number, depth: number): boolean
+	if insertSegment(m, u, v) then return true end
+	if depth >= CDT.forceDepth then return false end
+	local ux, uy, vx, vy = m.px[u], m.py[u], m.px[v], m.py[v]
+	if (vx - ux) ^ 2 + (vy - uy) ^ 2 < 4 * CDT.minSegLen * CDT.minSegLen then return false end
+	local wu, wv = m.world[u], m.world[v]
+	local w = (wu and wv) and ((wu + wv) * 0.5) or nil
+	local p = insertPoint(m, (ux + vx) * 0.5, (uy + vy) * 0.5, w, m.vt[u])
+	if not p then return false end
+	local a = forceSegment(m, u, p, depth + 1)
+	local b = forceSegment(m, p, v, depth + 1)
+	return a and b
+end
+
 -- Inside or outside, by PARITY of constrained crossings from the outside.
 --
 -- Nesting falls out: cross the outer rim and you are on the floor, cross a hole
@@ -1180,7 +1203,7 @@ function CDT.build(loops: { any }, data: any?): any
 		for _, ring in ipairs(ringIdx) do
 			local n = #ring
 			for i = 1, n do
-				if not insertSegment(m, ring[i], ring[i % n + 1]) then failed += 1 end
+				if not forceSegment(m, ring[i], ring[i % n + 1], 0) then failed += 1 end
 			end
 		end
 		if failed > 0 then
@@ -1190,6 +1213,46 @@ function CDT.build(loops: { any }, data: any?): any
 		end
 
 		markInside(m, s1)
+		-- PARITY NEEDS CLOSED CURVES. With an edge missing, the flood walks
+		-- through the gap without counting a crossing and every answer past it
+		-- inverts: case6's r001 lost two edges on one hole and got a missing
+		-- polygon of real floor plus triangles filling an inlet under a solid
+		-- strip 140 studs away. So when anything failed, ask each triangle's
+		-- centroid of the rings themselves -- inside the outer, in no hole.
+		if failed > 0 then
+			local function inRing(ring: { number }, x: number, y: number): boolean
+				local c, n = false, #ring
+				for i = 1, n do
+					local a, b = ring[i], ring[i % n + 1]
+					local ay, by = m.py[a], m.py[b]
+					if (ay > y) ~= (by > y) then
+						local ax, bx = m.px[a], m.px[b]
+						if x < (bx - ax) * (y - ay) / (by - ay) + ax then c = not c end
+					end
+				end
+				return c
+			end
+			for t = 1, m.nt do
+				if not m.dead[t] then
+					local T = m.tri[t]
+					if T[1] == s1 or T[2] == s1 or T[3] == s1 or T[1] == s2 or T[2] == s2
+						or T[3] == s2 or T[1] == s3 or T[2] == s3 or T[3] == s3 then
+						m.inside[t] = false
+					else
+						local x = (m.px[T[1]] + m.px[T[2]] + m.px[T[3]]) / 3
+						local y = (m.py[T[1]] + m.py[T[2]] + m.py[T[3]]) / 3
+						local inside = inRing(ringIdx[1], x, y)
+						if inside then
+							for k = 2, #ringIdx do
+								if inRing(ringIdx[k], x, y) then inside = false; break end
+							end
+						end
+						m.inside[t] = inside
+					end
+				end
+			end
+			stats.parityRepaired = (stats.parityRepaired or 0) + 1
+		end
 		if CDT.refine and not refine(m, stats) then
 			stats.stalled += 1
 			complaints[#complaints + 1] =
