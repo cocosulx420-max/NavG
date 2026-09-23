@@ -202,6 +202,12 @@ LocalGrid.cellBudget = 4000
 -- pays on open ground.
 LocalGrid.maxNodeCells = 16
 
+-- THE SWITCH. false bakes the uniform 0.5 stud lattice everywhere (every node
+-- one cell), true collapses interior floor into nodes up to maxNodeCells wide.
+-- OFF since 2026-09-23 (Cocosulx). Expect a much slower bake with it off: case5
+-- measured 66.6s uniform against 7.7s adaptive.
+LocalGrid.adaptive = false
+
 -- Collapse faces that are NOT blocks. ON, and it is the difference between the
 -- adaptive grid earning its keep on a dense map and doing nothing there.
 --
@@ -1062,7 +1068,7 @@ local function buildGrid(part: BasePart, surfels: {any}, c: any, bf: any, probe:
 		descend(iu + q, iv + q, q)
 	end
 
-	local K = LocalGrid.maxNodeCells
+	local K = LocalGrid.adaptive and LocalGrid.maxNodeCells or 1
 	for iu = 0, nu - 1, K do
 		for iv = 0, nv - 1, K do
 			descend(iu, iv, K)
