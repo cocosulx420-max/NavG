@@ -55,6 +55,10 @@ Leaps.fallRadius = 0.9
 Leaps.detour = 2.0      -- a walk bridge must save a way round longer than this x the walk...
 Leaps.detourSlack = 3.0 -- ...plus this many studs
 Leaps.walkMin = 2       -- samples (studs of rim) a walk bridge needs
+-- Debugging: a set of polygon indices; every probe from their rims is logged
+-- step by step into Leaps.traceLog.
+Leaps.tracePolys = nil :: { [number]: boolean }?
+Leaps.traceLog = {} :: { string }
 
 local function vkey(p: Vector3): string
 	return ("%.3f,%.3f,%.3f"):format(p.X, p.Y, p.Z)
@@ -210,18 +214,25 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 		return true
 	end
 
+	local tracing = false
+	local function note(fmt: string, ...)
+		if tracing then table.insert(Leaps.traceLog, fmt:format(...)) end
+	end
 	local function probe(p: Vector3, outward: Vector3, i: number): (number?, string?, Vector3?, { Vector3 }?, number)
+		tracing = Leaps.tracePolys ~= nil and (Leaps.tracePolys :: any)[i] == true
+		note("f%d p(%.2f,%.2f,%.2f) out(%.2f,%.2f)", i, p.X, p.Y, p.Z, outward.X, outward.Z)
 		local gapSeen = false
 		local crossed = false -- walked over floor that is not on the mesh
 		for _, past in ipairs(tries) do
 			local q = p + outward * past
 			local h = lowestPass(p, q)
-			if not h then stats.walls += 1; return nil, nil, nil, nil, 0 end
+			if not h then note("  %.1f no pass: wall", past); stats.walls += 1; return nil, nil, nil, nil, 0 end
 			local from = q + UP * (h + Leaps.lift)
 			local hit = ray(from, -UP * (h + Leaps.lift + depth))
-			if not hit then gapSeen = true; continue end
+			if not hit then note("  %.1f pass %.1f, nothing below", past, h); gapSeen = true; continue end
 			local rel = hit.Position.Y - p.Y
 			local j = locate(hit.Position)
+			note("  %.1f pass %.1f, fall hits %s rel %.2f on %s", past, h, hit.Instance.Name, rel, j and ("f" .. j) or "no polygon")
 			if j == i then
 				-- still our own floor: nothing to leave yet
 				if gapSeen then return nil, nil, nil, nil, 0 end
@@ -231,15 +242,17 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 				if j then
 					if not gapSeen then
 						-- walkable onto the neighbour. A seam's job -- unless there is no
-						-- seam: floor off the mesh between them (a roof valley whose
-						-- cells died, Cocosulx's image 20) leaves them unlinked, and the
-						-- walk over it is a two-way bridge.
-						if not crossed or h > env.step or not detour(i, j, p, hit.Position) then
+						-- seam: a roof valley whose cells died (Cocosulx's image 20), or a
+						-- steep panel's top a lip below the roof above it (image 22),
+						-- leaves them unlinked, and the walk is a two-way bridge.
+						if joined[math.min(i, j) .. ":" .. math.max(i, j)] or h > env.step
+							or not detour(i, j, p, hit.Position) then
 							stats.duplicate += 1
 							return nil, nil, nil, nil, 0
 						end
 						stats.walks += 1
-						return j, "walk", hit.Position, { q + UP * Leaps.lift }, h
+						local apex = h + Leaps.lift
+						return j, "walk", hit.Position, (h > 0) and { p + UP * apex, q + UP * apex } or { q + UP * apex }, h
 					end
 				else
 					stats.offMesh += 1 -- a lip, a cornice, a rail's top: keep going out

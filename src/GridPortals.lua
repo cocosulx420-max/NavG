@@ -149,6 +149,13 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 		local hi = math.max(a.Y, b.Y)
 		local p1 = Vector3.new(a.X, hi, a.Z)
 		local p2 = Vector3.new(b.X, hi, b.Z)
+		-- UP FROM THE LOWER CELL to where the crossing runs. A crawl space under
+		-- a roof pairs with the roof's own top a step above, and the rays over
+		-- the higher cell pass over the slab between (Cocosulx's "impossible").
+		-- A stair riser stands beside the lower cell, never over it.
+		local low = (a.Y <= b.Y) and a or b
+		local rise = hi + GridPortals.rays[1] - low.Y
+		if rise > 0.2 and workspace:Raycast(low + Vector3.yAxis * 0.1, Vector3.yAxis * (rise - 0.1), rp) then return true end
 		for _, h in ipairs(GridPortals.rays) do
 			if workspace:Raycast(p1 + Vector3.yAxis * h, p2 - p1, rp) then return true end
 		end
