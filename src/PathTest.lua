@@ -121,6 +121,22 @@ local function postureCost(T: any, prof: any?): number
 	return 1
 end
 
+-- WHERE A CROSSING IS SCORED. Not at the gate's centre: a wide gate's centre
+-- can sit tens of studs off the way through, and a pinhole gate onto a sliver
+-- then looks cheaper than the wide one next to it. Each gate is crossed at the
+-- point that makes from -> gate -> goal shortest (sampled along it), and a
+-- two-sided gate is crossed bar by bar, so the cost is the length walked.
+PathTest.gateSamples = 8
+local function bestOn(a: Vector3, b: Vector3, from: Vector3, goal: Vector3): Vector3
+	local best, bd = a, math.huge
+	for k = 0, PathTest.gateSamples do
+		local x = a:Lerp(b, k / PathTest.gateSamples)
+		local d = (x - from).Magnitude + (goal - x).Magnitude
+		if d < bd then best, bd = x, d end
+	end
+	return best
+end
+
 local function astar(mesh: any, adj: any, s: number, g: number, sp: Vector3, gp: Vector3,
 	prof: any?, banned: any?)
 	local open, came, gs = { s }, {}, { [s] = 0 }
@@ -140,9 +156,17 @@ local function astar(mesh: any, adj: any, s: number, g: number, sp: Vector3, gp:
 		closed[cur] = true
 		for _, e in ipairs(adj[cur] or {}) do
 			if not closed[e.to] and usable(mesh, e, prof, banned) then
-				local via = e.L.centre
-				local leap = (e.L.kind == "jump" or e.L.kind == "drop") and 2 or 0
-				local cost = gs[cur] + (via - pos[cur]).Magnitude * postureCost(mesh.tris[e.to], prof) + leap
+				local L = e.L
+				local first, second = { L.left, L.right }, (L.bLeft and L.bRight) and { L.bLeft, L.bRight } or nil
+				if second and e.reverse then first, second = second, first end
+				local x1 = bestOn(first[1], first[2], pos[cur], gp)
+				local via, walked = x1, (x1 - pos[cur]).Magnitude
+				if second then
+					via = bestOn(second[1], second[2], x1, gp)
+					walked += (via - x1).Magnitude
+				end
+				local leap = (L.kind == "jump" or L.kind == "drop") and 2 or 0
+				local cost = gs[cur] + walked * postureCost(mesh.tris[e.to], prof) + leap
 				if gs[e.to] == nil or cost < gs[e.to] then
 					gs[e.to] = cost
 					pos[e.to] = via
