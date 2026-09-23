@@ -68,16 +68,19 @@ end
 
 -- Untraced floor: which traced regions each untraced cell reaches, and how far.
 -- The same relaxation as Portals' bridge links, by region instead of polygon.
-local function reachUntraced(data: any, snap: any, traced: { [number]: any }, limit: number): { [any]: { [number]: number } }
+-- Each entry also keeps `src`, the traced cell of that region the walk started
+-- from, so a bridge can be tested end to end and not only at its first step.
+local function reachUntraced(data: any, snap: any, traced: { [number]: any }, limit: number): ({ [any]: { [number]: number } }, { [any]: { [number]: any } })
 	local step = data.config.step
 	local reachOf: { [any]: { [number]: number } } = {}
+	local srcOf: { [any]: { [number]: any } } = {}
 	local free = {}
 	for _, g in ipairs(data.grids) do
 		for _, cell in ipairs(g.cells) do
 			if cell.region and not traced[cell.region] then free[#free + 1] = cell end
 		end
 	end
-	if #free == 0 then return reachOf end
+	if #free == 0 then return reachOf, srcOf end
 	local reach = step * 1.6
 	local G = reach
 	local bucket: { [number]: { any } } = {}
@@ -89,18 +92,19 @@ local function reachUntraced(data: any, snap: any, traced: { [number]: any }, li
 		b[#b + 1] = cell
 	end
 	local queue = {}
-	local function relax(cell: any, r: number, d: number)
+	local function relax(cell: any, r: number, d: number, src: any)
 		if d > limit then return end
 		local t = reachOf[cell]
-		if not t then t = {}; reachOf[cell] = t end
+		if not t then t = {}; reachOf[cell] = t; srcOf[cell] = {} end
 		if t[r] and t[r] <= d then return end
 		t[r] = d
+		srcOf[cell][r] = src
 		queue[#queue + 1] = { cell, r }
 	end
 	for _, pr in ipairs(snap.pairs) do
 		local ta, tb = traced[pr.a.region], traced[pr.b.region]
-		if ta and not tb then relax(pr.b, pr.a.region, 0)
-		elseif tb and not ta then relax(pr.a, pr.b.region, 0) end
+		if ta and not tb then relax(pr.b, pr.a.region, 0, pr.a)
+		elseif tb and not ta then relax(pr.a, pr.b.region, 0, pr.b) end
 	end
 	local head = 1
 	while head <= #queue do
@@ -113,12 +117,12 @@ local function reachUntraced(data: any, snap: any, traced: { [number]: any }, li
 			for _, q in ipairs(bucket[hkey(bx + dx, by + dy, bz + dz)] or {}) do
 				if q ~= cell then
 					local dd = (q.pos - p).Magnitude
-					if dd <= reach then relax(q, r, d + dd) end
+					if dd <= reach then relax(q, r, d + dd, srcOf[cell][r]) end
 				end
 			end
 		end end end
 	end
-	return reachOf
+	return reachOf, srcOf
 end
 
 function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayExclude: { Instance }?): any
@@ -171,7 +175,7 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 		tb[#tb + 1] = pr.a
 	end
 	local limit = Portals.crossLimit or data.config.traceMinWidth or data.config.minWidth or (data.config.step * 3)
-	local reachOf = reachUntraced(data, snap, traced, limit)
+	local reachOf, srcOf = reachUntraced(data, snap, traced, limit)
 
 	-- label[face] = { target, kind, via }; blockedFace[face] = true
 	local label: { [any]: any } = {}
@@ -217,7 +221,12 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 				if target then kind, via = "bridge", bestU end
 			end
 			if target then
-				if blocked(f.cell.pos, via.pos) then
+				-- a bridge is tested at both ends: onto the strip, and off it onto the
+				-- far region's own cell (a crawl space under a roof panel bridged to
+				-- the panel's top, Cocosulx's "impossible1")
+				local far = (kind == "bridge") and srcOf[via] and srcOf[via][target] or nil
+				if blocked(f.cell.pos, via.pos)
+					or (far and blocked(via.pos, far.pos)) then
 					blockedFace[f] = true
 					stats.facesBlocked += 1
 				else
