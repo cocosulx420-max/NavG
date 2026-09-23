@@ -488,11 +488,23 @@ Portals.edgeAngle = 20    -- degrees off antiparallel two facing edges may be
 Portals.seamGap = 2.5     -- studs in plane between facing edges of a seam
 Portals.bridgeGap = 4.0   -- and of a bridge, which spans an untraced strip
 Portals.edgeSample = 0.25 -- studs between verdict samples along the overlap
+Portals.edgeBridge = 1.0  -- studs of missing evidence carried through when nothing stands in it
+
+local bridgeRay = RaycastParams.new()
+bridgeRay.FilterType = Enum.RaycastFilterType.Exclude
 
 local function edgePortals(mesh: any, e: any, kind: string, gapMax: number,
 	step: number, links: { any }, stats: any): number
 	local A, B = mesh.tris[e.lo], mesh.tris[e.hi]
 	if not A or not B then return 0 end
+	do
+		local ex = {}
+		for _, n in ipairs({ "NVGN_Debug", "NVGN_Path", "PathStart", "PathEnd", "NVGN_Follower" }) do
+			local x = workspace:FindFirstChild(n)
+			if x then ex[#ex + 1] = x end
+		end
+		bridgeRay.FilterDescendantsInstances = ex
+	end
 	local up = A.up or Vector3.yAxis
 	local function flat(v: Vector3): Vector3 return v - up * v:Dot(up) end
 	local cosTol = math.cos(math.rad(Portals.edgeAngle))
@@ -546,12 +558,33 @@ local function edgePortals(mesh: any, e: any, kind: string, gapMax: number,
 			local reach = math.max(step * 1.5, gap * 0.5 + step)
 			local ds = Portals.edgeSample
 			local runStart, runDrops = nil, {}
+			-- A SHORT HOLE IN THE EVIDENCE IS NOT A CUT. Two lattices meeting at a
+			-- slight angle leave the cell pairs along one opening patchy, and cutting
+			-- at every miss drew one edge as a dashed row of gates (Cocosulx). A gap
+			-- up to edgeBridge is carried through unless something solid stands in
+			-- it -- a ray along the edge at knee and at chest height, the rail and
+			-- the pillar test.
+			local function blocked(t1: number, t2: number): boolean
+				local p1 = a1 + (a2 - a1) * (t1 / la) + outward * (gap * 0.5)
+				local p2 = a1 + (a2 - a1) * (t2 / la) + outward * (gap * 0.5)
+				for _, hgt in ipairs({ 0.4, 2.0 }) do
+					local o1 = p1 + up * hgt
+					if workspace:Raycast(o1, (p2 + up * hgt) - o1, bridgeRay) then return true end
+				end
+				return false
+			end
 			local function onB(p: Vector3): Vector3
 				local d = b2 - b1
 				local t = math.clamp((p - b1):Dot(d) / d:Dot(d), 0, 1)
 				return b1 + d * t
 			end
 			local function emit(ts: number, te: number)
+				-- REACH THE CORNERS. Cells near a polygon's corner rarely carry
+				-- evidence, so every gate stopped short of its polygon's ends and an
+				-- edge shared out between several polygons read as a dashed row.
+				-- Stretch to the overlap's end when it is within edgeBridge and clear.
+				if ts - lo <= Portals.edgeBridge and ts - lo > 1e-3 and not blocked(lo, ts) then ts = lo end
+				if hi - te <= Portals.edgeBridge and hi - te > 1e-3 and not blocked(te, hi) then te = hi end
 				if te - ts < ds * 0.5 then return end
 				local aL, aR = a1 + (a2 - a1) * (ts / la), a1 + (a2 - a1) * (te / la)
 				local dsum, dn = 0, 0
@@ -566,22 +599,29 @@ local function edgePortals(mesh: any, e: any, kind: string, gapMax: number,
 				made += 1
 				stats.edgeLinks += 1
 			end
+			local lastHit = nil
 			local t = lo
 			while t <= hi + 1e-6 do
 				local pA = a1 + (a2 - a1) * (t / la)
 				local ev = evidence(pA + outward * (gap * 0.5), reach)
 				if #ev > 0 then
+					if runStart and lastHit and t - lastHit > ds * 1.5 then
+						if t - lastHit > Portals.edgeBridge or blocked(lastHit, t) then
+							emit(math.max(lo, runStart - ds * 0.5), math.min(hi, lastHit + ds * 0.5))
+							runStart = nil
+						else
+							stats.edgeBridged += 1
+						end
+					end
 					if not runStart then runStart = t; runDrops = {} end
+					lastHit = t
 					for _, k in ipairs(ev) do
 						if not used[k] then used[k] = true; runDrops[#runDrops + 1] = k end
 					end
-				elseif runStart then
-					emit(math.max(lo, runStart - ds * 0.5), math.min(hi, t - ds * 0.5))
-					runStart = nil
 				end
 				t += ds
 			end
-			if runStart then emit(math.max(lo, runStart - ds * 0.5), hi) end
+			if runStart and lastHit then emit(math.max(lo, runStart - ds * 0.5), math.min(hi, lastHit + ds * 0.5)) end
 		end
 	end
 	local nUsed = 0
@@ -1022,7 +1062,7 @@ function Portals.build(mesh: any, data: any, snap: any): any
 		bentGroups = 0, bentAt = {}, worstResidual = 0, worstResidualAt = "none",
 		orphans = {}, pieces = 0, sevPieces = 0, sevSplit = {},
 		gatesMerged = 0, mergeBlocked = 0,
-		edgeLinks = 0, edgeFallback = 0, edgeEvidence = 0, edgeEvidenceUsed = 0,
+		edgeLinks = 0, edgeFallback = 0, edgeEvidence = 0, edgeEvidenceUsed = 0, edgeBridged = 0,
 		sevNarrow = 0, sevNarrowAt = {},
 		seconds = 0,
 	}
@@ -1147,8 +1187,8 @@ function Portals.report(res: any): string
 			:format(s.worstResidual, s.worstResidualAt, s.gatesSplit, s.gatesFromTravel),
 		("  %d gates merged into their neighbours along one opening, %d merges refused by the pillar ray")
 			:format(s.gatesMerged or 0, s.mergeBlocked or 0),
-		("  edge-matched %d gates; %d polygon pairs fell back to fitting; %.0f%% of the crossing evidence lies on an edge gate")
-			:format(s.edgeLinks or 0, s.edgeFallback or 0,
+		("  edge-matched %d gates (%d evidence gaps bridged); %d polygon pairs fell back to fitting; %.0f%% of the crossing evidence lies on an edge gate")
+			:format(s.edgeLinks or 0, s.edgeBridged or 0, s.edgeFallback or 0,
 				100 * (s.edgeEvidenceUsed or 0) / math.max(1, s.edgeEvidence or 0)),
 	}
 	if s.overshared > 0 then

@@ -32,6 +32,10 @@ Leaps.dropCap = 300     -- deepest a ray looks when drop is unlimited
 Leaps.landTol = 0.75    -- how far a hit may sit off a polygon's plane
 Leaps.chest = 2.0       -- height of the clear-line test for jumps
 Leaps.groupRise = 0.75  -- samples merge while their landing heights agree this well
+-- How far out past the rim a drop may start. The first that lands on the mesh
+-- wins, so a cornice or a lip under the rim is stepped past rather than landed on.
+Leaps.pastTries = { 0.6, 1.5, 2.5, 3.5 }
+Leaps.knee = 0.5        -- height of the low clear-line test
 
 local function vkey(p: Vector3): string
 	return ("%.3f,%.3f,%.3f"):format(p.X, p.Y, p.Z)
@@ -132,6 +136,10 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 			gs += Vector3.new(s.to.X - s.from.X, 0, s.to.Z - s.from.Z).Magnitude
 		end
 		L.rise, L.gap = rs / #run, gs / #run
+		-- the point in the air just past the rim, for a forward-then-down arrow
+		local ov, no = Vector3.zero, 0
+		for _, s2 in ipairs(run) do if s2.over then ov += s2.over; no += 1 end end
+		if no > 0 then L.over = ov / no end
 		L.drop = -L.rise
 		out[#out + 1] = L
 	end
@@ -162,7 +170,7 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 							local rev = {}
 							for s = #cur.samples, 1, -1 do
 								local q = cur.samples[s]
-								rev[#rev + 1] = { from = q.to, to = q.from }
+								rev[#rev + 1] = { from = q.to, to = q.from, over = q.over }
 							end
 							emit("jump", cur.target, i, rev, true)
 							stats.jumpsUp += 1
@@ -178,23 +186,39 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 				local t = (s + 0.5) / m
 				local p = a:Lerp(b, t)
 				stats.samples += 1
-				local q = p + outward * Leaps.past
-				local hit = workspace:Raycast(q + UP * 0.25, -UP * (depth + 0.25), rp)
-				local target, kind, land = nil, nil, nil
-				if hit then
-					local h = p.Y - hit.Position.Y
-					if h > env.step then
-						local j = locate(hit.Position, i)
-						if j and not joined[math.min(i, j) .. ":" .. math.max(i, j)] then
-							target, kind, land = j, "drop", hit.Position
-						elseif not j then
-							stats.offMesh += 1
-						else
-							stats.duplicate += 1
-						end
+				local target, kind, land, over = nil, nil, nil, nil
+				-- THE WAY DOWN MUST BE OPEN. A ray that starts inside a part flies
+				-- straight through it, so a probe just past the top edge of a roof
+				-- panel -- already inside the building -- "landed" on the floor
+				-- inside, 10.6 studs down (Cocosulx's gateA_bad). Every drop now
+				-- needs the step off the rim clear at knee and chest height, and an
+				-- UP ray from the landing back to the start that hits nothing: no
+				-- roof, no ceiling in between.
+				local lastHit = nil
+				for _, past in ipairs(Leaps.pastTries) do
+					local q = p + outward * past
+					if workspace:Raycast(p + UP * Leaps.knee, outward * past, rp)
+						or workspace:Raycast(p + UP * Leaps.chest, outward * past, rp) then
+						break -- a wall or a parapet: no stepping off here
 					end
+					local hit = workspace:Raycast(q + UP * 0.25, -UP * (depth + 0.25), rp)
+					lastHit = hit
+					if not hit then break end
+					local h = p.Y - hit.Position.Y
+					if h <= env.step then break end -- walkable, a seam's job
+					local up = (q + UP * 0.25) - (hit.Position + UP * 0.05)
+					if workspace:Raycast(hit.Position + UP * 0.05, up, rp) then break end
+					local j = locate(hit.Position, i)
+					if j and not joined[math.min(i, j) .. ":" .. math.max(i, j)] then
+						target, kind, land, over = j, "drop", hit.Position, q
+						break
+					elseif j then
+						stats.duplicate += 1
+						break
+					end
+					stats.offMesh += 1 -- a lip or a cornice: try further out
 				end
-				if not target and (not hit or (p.Y - hit.Position.Y) > env.step) then
+				if not target and (not lastHit or (p.Y - lastHit.Position.Y) > env.step) then
 					-- nothing to step down onto: try a jump outward
 					local chest = p + UP * Leaps.chest
 					for dist = 1.0, env.jumpDistance, 0.5 do
@@ -205,10 +229,16 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 						if h2 then
 							local rise = h2.Position.Y - p.Y
 							if rise <= env.jump and rise >= -env.step then
-								local j = locate(h2.Position, i)
+								-- head room over the take-off and a clear column over the
+								-- landing: no jumping through a ceiling
+								local clearTake = not workspace:Raycast(p + UP * 0.1, UP * (math.max(rise, 0) + Leaps.chest + 1), rp)
+								local clearLand = not workspace:Raycast(h2.Position + UP * 0.05, top - (h2.Position + UP * 0.05), rp)
+								local clearLine = not workspace:Raycast(chest + UP * math.max(rise, 0),
+									(h2.Position + UP * Leaps.chest) - (chest + UP * math.max(rise, 0)), rp)
+								local j = (clearTake and clearLand and clearLine) and locate(h2.Position, i) or nil
 								if j and j ~= i then
 									if not joined[math.min(i, j) .. ":" .. math.max(i, j)] then
-										target, kind, land = j, "across", h2.Position
+										target, kind, land, over = j, "across", h2.Position, nil
 									else
 										stats.duplicate += 1
 									end
@@ -220,7 +250,7 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 				end
 				if target then
 					if kind == "drop" then stats.dropSamples += 1 else stats.jumpSamples += 1 end
-					local sample = { from = p, to = land }
+					local sample = { from = p, to = land, over = over }
 					local canUp = kind == "drop" and (p.Y - land.Y) <= env.jump
 					if cur and cur.target == target and cur.kind == kind
 						and math.abs((land.Y - p.Y) - (cur.last.to.Y - cur.last.from.Y)) <= Leaps.groupRise then

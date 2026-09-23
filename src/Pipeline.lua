@@ -1860,7 +1860,15 @@ function Pipeline.drawPortals(result: any, opts: any?): (Instance, string)
 			end
 			if L.oneWay then
 				local pa, pb = at(0.5)
-				arrow(pa, pb, colour, g)
+				if L.over then
+					-- FORWARD, THEN DOWN (or up, then across, for a jump-up): the way
+					-- the NPC actually goes, so the arrow never cuts through the ledge
+					local ov = L.over + off
+					segment(pa, ov, 0.07, colour, "shaft", g)
+					arrow(ov, pb, colour, g)
+				else
+					arrow(pa, pb, colour, g)
+				end
 			else
 				local pa, pb = at(1 / 3)
 				arrow(pa, pb, colour, g)
