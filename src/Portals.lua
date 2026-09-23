@@ -1238,4 +1238,7 @@ function Portals.report(res: any): string
 	return table.concat(lines, "\n")
 end
 
+-- For GridPortals, which builds its own cross-region links and reuses these.
+Portals.internal = { sharedLinks = sharedLinks, claimCells = claimCells, components = components }
+
 return Portals

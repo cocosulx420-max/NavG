@@ -30,9 +30,15 @@ local FaceKind = require(script.Parent:WaitForChild("FaceKind"))
 local EdgeKind = require(script.Parent:WaitForChild("EdgeKind"))
 local Nodes = require(script.Parent:WaitForChild("Nodes"))
 local Portals = require(script.Parent:WaitForChild("Portals"))
+local GridPortals = require(script.Parent:WaitForChild("GridPortals"))
 local Leaps = require(script.Parent:WaitForChild("Leaps"))
 -- drop and jump links (one-way), see Leaps
 Pipeline.leaps = true
+
+-- WHERE LINKS BETWEEN REGIONS COME FROM. "grid" decides them on the local grid
+-- and carries them onto the mesh (GridPortals); "mesh" searches the finished
+-- polygons for them (Portals.build), kept whole for comparison.
+Pipeline.portalSource = "grid"
 
 -- TUNING LIVES IN THE MODULES, NOT HERE. A number in OVERRIDES is a deliberate
 -- departure from a module's own default, and the module comment next to that
@@ -1607,6 +1613,11 @@ end
 -- because the pairs must come from the SAME data the mesh was cut from -- a
 -- snapshot of anything else would link polygons through cells that are not
 -- underneath them.
+-- The report for whichever builder made these links.
+function Pipeline.portalReport(res: any): string
+	return (res.source == "grid" and GridPortals.report or Portals.report)(res)
+end
+
 function Pipeline.portals(result: any): any
 	if not result.portals then
 		local mesh = Pipeline.mesh(result)
@@ -1615,20 +1626,24 @@ function Pipeline.portals(result: any): any
 			snap = Severance.snapshot(result.data)
 			result.severance = snap
 		end
-		result.portals = Portals.build(mesh, result.data, snap)
+		-- rays must not hit our own drawings, markers or characters
+		local ex = {}
+		for _, n in ipairs({ Pipeline.debugName, "NVGN_Path", "PathStart", "PathEnd", "NVGN_Follower", "NVGN_Grid" }) do
+			local x = workspace:FindFirstChild(n)
+			if x then ex[#ex + 1] = x end
+		end
+		local root = result.data.config and result.data.config.root
+		if typeof(root) == "Instance" then
+			for _, h in ipairs(root:GetDescendants()) do
+				if h:IsA("Humanoid") and h.Parent then ex[#ex + 1] = h.Parent end
+			end
+		end
+		if Pipeline.portalSource == "grid" then
+			result.portals = GridPortals.build(mesh, result.data, snap, result.loops, ex)
+		else
+			result.portals = Portals.build(mesh, result.data, snap)
+		end
 		if Pipeline.leaps then
-			-- rays must not hit our own drawings, markers or characters
-			local ex = {}
-			for _, n in ipairs({ Pipeline.debugName, "NVGN_Path", "PathStart", "PathEnd", "NVGN_Follower" }) do
-				local x = workspace:FindFirstChild(n)
-				if x then ex[#ex + 1] = x end
-			end
-			local root = result.data.config and result.data.config.root
-			if typeof(root) == "Instance" then
-				for _, h in ipairs(root:GetDescendants()) do
-					if h:IsA("Humanoid") and h.Parent then ex[#ex + 1] = h.Parent end
-				end
-			end
 			Leaps.build(mesh, result.data, result.portals, ex)
 		end
 		Pipeline.measure_(result)
@@ -1901,7 +1916,7 @@ function Pipeline.drawPortals(result: any, opts: any?): (Instance, string)
 		end
 	end
 
-	return root, Portals.report(res)
+	return root, Pipeline.portalReport(res)
 end
 
 -- QUALITY OF THE PORTALS, one line per defect class. Reports only.
@@ -2781,7 +2796,7 @@ function Pipeline.report(result: any): string
 		lines[#lines + 1] = EdgeKind.report(result.meshKind)
 	end
 	if result.portals then
-		lines[#lines + 1] = Portals.report(result.portals)
+		lines[#lines + 1] = Pipeline.portalReport(result.portals)
 	end
 	return table.concat(lines, "\n")
 end
