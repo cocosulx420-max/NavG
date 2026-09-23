@@ -480,6 +480,9 @@ function GlobalGrid.build(cfg: any): any
 		else
 			union(cell, o)
 			stats.links += 1
+			u.linked = o
+			cell.nb = cell.nb or {}
+			cell.nb[#cell.nb + 1] = o
 		end
 		if kind then
 			segs[#segs + 1] = { cell = cell, kind = kind,
@@ -500,6 +503,64 @@ function GlobalGrid.build(cfg: any): any
 	end
 	stats.regions = nRegion
 
+	-- 5b. LAYERS. Joining by "can I step there" makes a staircase and the floor
+	-- it climbs over ONE region -- and seen from above that region then sits on
+	-- top of itself, which the mesher (a 2D triangulation) cannot represent: its
+	-- outline overlapped itself and its polygons slanted through the arch. So each
+	-- region is split into layers that never overlap in plan, grown outward along
+	-- the links and refusing any cell whose footprint the layer already covers.
+	-- Where two layers meet along a link, the edge is exact (it is a cell edge),
+	-- is kept as it is like a tile cut, and becomes a portal.
+	local layerOf: { [any]: number } = {}
+	local nLayer = 0
+	local function slotsOf(cell: any): { string }
+		local out = {}
+		local n = math.max(1, math.floor(cell.s / MIN + 0.5))
+		for a = 0, n - 1 do
+			for b = 0, n - 1 do out[#out + 1] = slotKey(cell.x0 + (a + 0.5) * MIN, cell.z0 + (b + 0.5) * MIN) end
+		end
+		return out
+	end
+	for _, seed in ipairs(cells) do
+		if layerOf[seed] then continue end
+		nLayer += 1
+		local claimed: { [string]: boolean } = {}
+		for _, k in ipairs(slotsOf(seed)) do claimed[k] = true end
+		layerOf[seed] = nLayer
+		local queue, qi = { seed }, 1
+		while qi <= #queue do
+			local cc = queue[qi]; qi += 1
+			for _, o in ipairs(cc.nb or {}) do
+				if not layerOf[o] and o.region == cc.region then
+					local ks = slotsOf(o)
+					local free = true
+					for _, k in ipairs(ks) do if claimed[k] then free = false; break end end
+					if free then
+						for _, k in ipairs(ks) do claimed[k] = true end
+						layerOf[o] = nLayer
+						queue[#queue + 1] = o
+					end
+				end
+			end
+		end
+	end
+	for _, cell in ipairs(cells) do
+		cell.conn = cell.region -- the connected floor it belongs to
+		cell.region = layerOf[cell] -- the layer, which is what gets meshed
+	end
+	stats.layers = nLayer
+	-- linked units whose two cells ended up in different layers are cuts
+	for _, u in ipairs(units) do
+		local o = u.linked
+		if o and layerOf[o] ~= layerOf[u.cell] then
+			segs[#segs + 1] = { cell = u.cell, kind = "cut",
+				a = Vector3.new(u.ax, heightAt(u.cell, u.ax, u.az), u.az),
+				b = Vector3.new(u.bx, heightAt(u.cell, u.bx, u.bz), u.bz),
+				other = o }
+			stats.layerCuts = (stats.layerCuts or 0) + 1
+		end
+	end
+
 	-- 6. boundary loops per region, chained end to start. At a pinch -- two cells
 	-- of one region touching only at a corner -- take the LEFTMOST turn, which
 	-- keeps each loop simple instead of figure-eighting through the pinch.
@@ -514,7 +575,7 @@ function GlobalGrid.build(cfg: any): any
 		l[#l + 1] = sg
 	end
 	local loops = {}
-	for r = 1, nRegion do
+	for r = 1, nLayer do
 		local list = byRegion[r]
 		if not list then continue end
 		local starts: { [string]: { any } } = {}
@@ -594,16 +655,16 @@ function GlobalGrid.mesh(g: any): any
 	local c = g.config
 	local env = Agents.envelope()
 	local t0 = os.clock()
-	local stats = { loops = 0, rawCorners = 0, corners = 0, polys = 0, shared = 0, tile = 0,
+	local stats = { loops = 0, rawCorners = 0, corners = 0, polys = 0, shared = 0, tile = 0, layer = 0,
 		cellsInside = 0, cellsNearest = 0, cellsLost = 0, t = {} }
 
 	local loops = {}
 	for li, L in ipairs(g.loops) do
 		if L.closed and #L.pts >= 3 then
-			local pts = RubberBand.pull(L.pts, L.kinds, c.minCell)
+			local pts, kinds = RubberBand.pull(L.pts, L.kinds, c.minCell)
 			stats.rawCorners += #L.pts
 			stats.corners += #pts
-			loops[#loops + 1] = { region = L.region, index = li, pts = pts, up = UP, closed = true,
+			loops[#loops + 1] = { region = L.region, index = li, pts = pts, kinds = kinds, up = UP, closed = true,
 				tile = L.tile }
 		end
 	end
@@ -748,22 +809,46 @@ function GlobalGrid.mesh(g: any): any
 			end
 		end
 	end
-	-- tile borders: edges lying on a tile line, matched across it by overlap
-	local T = c.tile
-	local onLine: { [string]: { any } } = {}
-	local function lineKey(a: Vector3, b: Vector3): (string?, string?)
-		local function on(v: number): number? local q = v / T; local r = math.floor(q + 0.5); if math.abs(q - r) < 1e-4 then return r * T end return nil end
-		local xa, xb = on(a.X), on(b.X)
-		if xa and xb and xa == xb then return "x:" .. xa, "z" end
-		local za, zb = on(a.Z), on(b.Z)
-		if za and zb and za == zb then return "z:" .. za, "x" end
-		return nil, nil
+	-- CUT EDGES: tile borders and layer seams. Both are stretches the rubber band
+	-- kept exactly, lying on lattice lines, and the grid already proved the cells
+	-- either side connect. A polygon edge that lies on one of its own loop's cut
+	-- stretches is matched to the overlapping cut edge of the polygon across it.
+	local cutsOf: { [number]: { any } } = {}
+	for _, L in ipairs(loops) do
+		local n = #L.pts
+		for k = 1, n do
+			if L.kinds and L.kinds[k] == "cut" then
+				local l = cutsOf[L.region]
+				if not l then l = {}; cutsOf[L.region] = l end
+				l[#l + 1] = { L.pts[k], L.pts[k % n + 1] }
+			end
+		end
 	end
+	local function onCut(region: number, a: Vector3, b: Vector3): boolean
+		for _, cs in ipairs(cutsOf[region] or {}) do
+			local p, q = cs[1], cs[2]
+			local d = Vector3.new(q.X - p.X, 0, q.Z - p.Z)
+			local len = d.Magnitude
+			if len > 1e-6 then
+				local u = d / len
+				local function near(v: Vector3): boolean
+					local w = Vector3.new(v.X - p.X, 0, v.Z - p.Z)
+					local t = w:Dot(u)
+					return t >= -1e-3 and t <= len + 1e-3 and (w - u * t).Magnitude <= 1e-3
+				end
+				if near(a) and near(b) then return true end
+			end
+		end
+		return false
+	end
+	local onLine: { [string]: { any } } = {}
 	for i, f in ipairs(mesh.tris) do
 		for k = 1, f.n do
 			local A, B = f.verts[k], f.verts[k % f.n + 1]
-			local key, along = lineKey(A, B)
-			if key then
+			local key, along
+			if math.abs(A.X - B.X) < 1e-4 then key, along = ("x:%.3f"):format(A.X), "Z"
+			elseif math.abs(A.Z - B.Z) < 1e-4 then key, along = ("z:%.3f"):format(A.Z), "X" end
+			if key and onCut(f.region, A, B) then
 				local l = onLine[key]
 				if not l then l = {}; onLine[key] = l end
 				l[#l + 1] = { poly = i, a = A, b = B, along = along }
@@ -775,16 +860,13 @@ function GlobalGrid.mesh(g: any): any
 			for y = x + 1, #list do
 				local E, F = list[x], list[y]
 				local P, Q = mesh.tris[E.poly], mesh.tris[F.poly]
-				if P.tile ~= Q.tile then
+				if P.region ~= Q.region then
 					local ax = E.along
-					local e0, e1 = E.a[ax == "x" and "X" or "Z"], E.b[ax == "x" and "X" or "Z"]
-					local f0, f1 = F.a[ax == "x" and "X" or "Z"], F.b[ax == "x" and "X" or "Z"]
-					local lo = math.max(math.min(e0, e1), math.min(f0, f1))
-					local hi = math.min(math.max(e0, e1), math.max(f0, f1))
+					local lo = math.max(math.min(E.a[ax], E.b[ax]), math.min(F.a[ax], F.b[ax]))
+					local hi = math.min(math.max(E.a[ax], E.b[ax]), math.max(F.a[ax], F.b[ax]))
 					if hi - lo > 1e-3 then
 						local function at(S: any, t: number): Vector3
-							local s0 = S.a[ax == "x" and "X" or "Z"]
-							local s1 = S.b[ax == "x" and "X" or "Z"]
+							local s0, s1 = S.a[ax], S.b[ax]
 							local u = (s1 ~= s0) and (t - s0) / (s1 - s0) or 0
 							return S.a:Lerp(S.b, u)
 						end
@@ -792,10 +874,11 @@ function GlobalGrid.mesh(g: any): any
 						local ql, qr = at(F, lo), at(F, hi)
 						local mid = ((pl + pr) * 0.5).Y - ((ql + qr) * 0.5).Y
 						if math.abs(mid) <= env.step then
-							links[#links + 1] = { kind = "tile", a = E.poly, b = F.poly, left = pl, right = pr,
+							local kind = (P.tile ~= Q.tile) and "tile" or "layer"
+							links[#links + 1] = { kind = kind, a = E.poly, b = F.poly, left = pl, right = pr,
 								bLeft = qr, bRight = ql, centre = (pl + pr) * 0.5, span = hi - lo,
 								rise = -mid, drop = mid, edge = true }
-							stats.tile += 1
+							stats[kind] = (stats[kind] or 0) + 1
 						end
 					end
 				end
@@ -809,8 +892,8 @@ end
 
 function GlobalGrid.meshReport(m: any): string
 	local s = m.stats
-	return ("mesh  %d loops, %d grid corners -> %d banded corners -> %d polygons | portals: %d shared, %d tile-border | cells: %d inside a polygon, %d nearest, %d with no polygon | band %.2fs, cdt %.2fs, membership %.2fs, portals %.2fs")
-		:format(s.loops, s.rawCorners, s.corners, s.polys, s.shared, s.tile, s.cellsInside, s.cellsNearest,
+	return ("mesh  %d loops, %d grid corners -> %d banded corners -> %d polygons | portals: %d shared, %d tile-border, %d layer-seam | cells: %d inside a polygon, %d nearest, %d with no polygon | band %.2fs, cdt %.2fs, membership %.2fs, portals %.2fs")
+		:format(s.loops, s.rawCorners, s.corners, s.polys, s.shared, s.tile, s.layer, s.cellsInside, s.cellsNearest,
 			s.cellsLost, s.t.band or 0, s.t.cdt or 0, s.t.member or 0, s.t.portals or 0)
 end
 
@@ -818,9 +901,9 @@ function GlobalGrid.report(g: any): string
 	local s = g.stats
 	local open = 0
 	for _, L in ipairs(g.loops) do if not L.closed then open += 1 end end
-	return ("globalgrid  minCell %.2f | %d parts, %d tiles | %d cells (%d big, %d fine), %d rays, %d killed, %d no surface, %d too steep | %d links, %d cut by a wall | %d regions, %d loops (%d open), %d bound + %d cut segments | %d too narrow | svo %.1fs, cells %.1fs, narrow %.1fs, links %.1fs, loops %.1fs, total %.1fs")
+	return ("globalgrid  minCell %.2f | %d parts, %d tiles | %d cells (%d big, %d fine), %d rays, %d killed, %d no surface, %d too steep | %d links, %d cut by a wall | %d regions -> %d layers, %d loops (%d open), %d bound + %d cut segments | %d too narrow | svo %.1fs, cells %.1fs, narrow %.1fs, links %.1fs, loops %.1fs, total %.1fs")
 		:format(g.config.minCell, s.parts, s.tiles, s.cells, s.bigCells, s.fineCells, s.rays, s.killed,
-			s.noSurface, s.steep, s.links, s.wallCut, s.regions, s.loops, open, s.boundSegs, s.cutSegs,
+			s.noSurface, s.steep, s.links, s.wallCut, s.regions, s.layers or s.regions, s.loops, open, s.boundSegs, s.cutSegs,
 			s.narrow or 0, s.t.svo or 0, s.t.cells or 0, s.t.narrow or 0, s.t.links or 0, s.t.loops or 0, s.t.total or 0)
 end
 

@@ -207,24 +207,55 @@ if keep then
 		n += 1
 		if n % 4000 == 0 then task.wait() end
 	end
-	-- banded outlines (cyan), cut stretches (white)
+	-- EVERY LINE ON THE SURFACE. A polygon of a layer that climbs a staircase has
+	-- corners at different heights, so a straight corner-to-corner line cuts
+	-- through the treads and the arch. Sample each line and put every sample on
+	-- the cell of the same layer underneath it.
+	local MIN = keep.g.config.minCell
+	local layerSlot = {}
+	for _, cell in ipairs(keep.g.cells) do
+		local n2 = math.max(1, math.floor(cell.s / MIN + 0.5))
+		for a = 0, n2 - 1 do
+			for b = 0, n2 - 1 do
+				layerSlot[cell.region .. "|" .. keep.g.slotKey(cell.x0 + (a + 0.5) * MIN, cell.z0 + (b + 0.5) * MIN)] = cell
+			end
+		end
+	end
+	local function onSurface(region, p)
+		for _, d in ipairs({ { 0, 0 }, { 0.2, 0 }, { -0.2, 0 }, { 0, 0.2 }, { 0, -0.2 } }) do
+			local cell = layerSlot[region .. "|" .. keep.g.slotKey(p.X + d[1], p.Z + d[2])]
+			if cell then return Vector3.new(p.X, GG.heightAt(cell, p.X, p.Z), p.Z) end
+		end
+		return p
+	end
+	local function draped(region, a, b, col, thick, parent, lift, name)
+		local len = (Vector3.new(b.X - a.X, 0, b.Z - a.Z)).Magnitude
+		local m = math.max(1, math.floor(len / 0.5))
+		local prev = onSurface(region, a)
+		for j = 1, m do
+			local q = onSurface(region, a:Lerp(b, j / m))
+			seg(prev + Vector3.new(0, lift, 0), q + Vector3.new(0, lift, 0), col, thick, parent, name)
+			prev = q
+		end
+	end
 	local fo = Instance.new("Folder"); fo.Name = "Outlines"; fo.Parent = root
 	for _, L in ipairs(keep.m.loops) do
 		local pts = L.pts
 		for k = 1, #pts do
-			seg(pts[k] + Vector3.new(0, 0.25, 0), pts[k % #pts + 1] + Vector3.new(0, 0.25, 0),
-				L.kind == "hole" and Color3.fromRGB(255, 80, 160) or Color3.fromRGB(60, 230, 255), 0.12, fo)
+			local col = (L.kinds and L.kinds[k] == "cut") and Color3.fromRGB(255, 255, 255)
+				or (L.kind == "hole" and Color3.fromRGB(255, 80, 160) or Color3.fromRGB(60, 230, 255))
+			draped(L.region, pts[k], pts[k % #pts + 1], col, 0.12, fo, 0.25)
 		end
 	end
-	-- polygon edges (dark), portals (shared blue, tile orange)
 	local fp = Instance.new("Folder"); fp.Name = "Polygons"; fp.Parent = root
-	for i, f in ipairs(keep.m.mesh.tris) do
-		for k = 1, f.n do seg(f.verts[k] + Vector3.new(0, 0.18, 0), f.verts[k % f.n + 1] + Vector3.new(0, 0.18, 0), Color3.fromRGB(60, 60, 60), 0.06, fp) end
+	for _, f in ipairs(keep.m.mesh.tris) do
+		for k = 1, f.n do draped(f.region, f.verts[k], f.verts[k % f.n + 1], Color3.fromRGB(60, 60, 60), 0.06, fp, 0.18) end
 	end
 	local fl = Instance.new("Folder"); fl.Name = "Portals"; fl.Parent = root
+	local COL = { shared = Color3.fromRGB(40, 110, 255), tile = Color3.fromRGB(255, 140, 20), layer = Color3.fromRGB(60, 255, 90) }
 	for i, L in ipairs(keep.m.portals.links) do
-		seg(L.left + Vector3.new(0, 0.35, 0), L.right + Vector3.new(0, 0.35, 0),
-			L.kind == "tile" and Color3.fromRGB(255, 140, 20) or Color3.fromRGB(40, 110, 255), 0.18, fl, ("p%d_%s"):format(i, L.kind))
+		local region = keep.m.mesh.tris[L.a].region
+		draped(region, L.left, L.right, COL[L.kind] or Color3.new(1, 1, 1), 0.18, fl, 0.35, ("p%d_%s"):format(i, L.kind))
 	end
 	root.Parent = workspace
 	out[#out + 1] = ("drew the %.2f run into workspace.NVGN_GG (%d cells)"):format(DRAW, n)

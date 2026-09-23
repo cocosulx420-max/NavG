@@ -73,9 +73,11 @@ end
 
 -- `pts` is a closed ring (region on the left), `kinds[i]` the kind of the run
 -- that starts at pts[i]. `width` is the band width: one cell.
-function RubberBand.pull(pts: { Vector3 }, kinds: { string }, width: number): { Vector3 }
+-- Returns the new ring and, per point, the kind of the run that starts there,
+-- so the caller still knows which stretches are cuts.
+function RubberBand.pull(pts: { Vector3 }, kinds: { string }, width: number): ({ Vector3 }, { string })
 	local n = #pts
-	if n < 4 then return pts end
+	if n < 4 then return pts, kinds end
 
 	-- anchors: both ends of every cut run; with none, the extreme vertex, which
 	-- any tight outline of the band must still pass through
@@ -116,12 +118,13 @@ function RubberBand.pull(pts: { Vector3 }, kinds: { string }, width: number): { 
 	-- pulling every bound run tight between its two anchors
 	local start = 1
 	for i = 1, n do if anchor[i] then start = i; break end end
-	local out = {}
+	local out, outKinds = {}, {}
 	local i = start
 	local walked = 0
 	while walked < n do
 		if kinds[i] == "cut" then
 			out[#out + 1] = pts[i]
+			outKinds[#outKinds + 1] = "cut"
 			i = i % n + 1
 			walked += 1
 		else
@@ -137,12 +140,15 @@ function RubberBand.pull(pts: { Vector3 }, kinds: { string }, width: number): { 
 			end
 			gates[#gates + 1] = { pts[j], pts[j] }
 			local line = funnel(gates)
-			for m = 1, #line - 1 do out[#out + 1] = line[m] end
+			for m = 1, #line - 1 do
+				out[#out + 1] = line[m]
+				outKinds[#outKinds + 1] = "bound"
+			end
 			i = j
 			walked += steps
 		end
 	end
-	return out
+	return out, outKinds
 end
 
 return RubberBand
