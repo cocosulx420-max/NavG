@@ -161,11 +161,14 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 	-- crouch: anything lower than bandLo is a step walked over, anything in the
 	-- band stops a body. bandLo also keeps a steep roof's own crease, 0.8 over
 	-- both sides of a hip, from reading as a wall.
+	-- THE BAND STOPS UNDER THE LOWER SIDE'S OWN HEADROOM. A prone-only crawl
+	-- space was swept for a crouching body: the blade clipped the slab over it
+	-- from outside and started inside it from under it, so alternate faces of
+	-- one edge came out blocked (case5 r047, a seam in 0.5 stud dashes).
 	local env = Agents.envelope()
-	local bandHi = ((env.crouch == math.huge) and 3 or env.crouch) - 0.1
-	local bandSize = Vector3.new(GridPortals.bladeWidth, bandHi - GridPortals.bandLo, GridPortals.bladeWidth)
-	local bandMid = (GridPortals.bandLo + bandHi) * 0.5
-	local function blocked(a: Vector3, b: Vector3): boolean
+	local crouch = (env.crouch == math.huge) and 3 or env.crouch
+	local function blocked(a: Vector3, b: Vector3, head: number?): boolean
+		local bandHi = math.min(crouch, head or math.huge) - 0.1
 		local hi = math.max(a.Y, b.Y)
 		-- UP FROM THE LOWER SIDE to where the crossing runs. A crawl space under
 		-- a roof pairs with the roof's own top a step above, and a sweep over
@@ -174,6 +177,9 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 		local low = (a.Y <= b.Y) and a or b
 		local rise = hi + GridPortals.rays[1] - low.Y
 		if rise > 0.2 and workspace:Raycast(low + Vector3.yAxis * 0.1, Vector3.yAxis * (rise - 0.1), rp) then return true end
+		if bandHi - GridPortals.bandLo < 0.1 then return false end
+		local bandSize = Vector3.new(GridPortals.bladeWidth, bandHi - GridPortals.bandLo, GridPortals.bladeWidth)
+		local bandMid = (GridPortals.bandLo + bandHi) * 0.5
 		local p1 = Vector3.new(a.X, hi + bandMid, a.Z)
 		local p2 = Vector3.new(b.X, hi + bandMid, b.Z)
 		local d = p2 - p1
@@ -242,8 +248,8 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 				-- far region's own cell (a crawl space under a roof panel bridged to
 				-- the panel's top, Cocosulx's "impossible1")
 				local far = (kind == "bridge") and srcOf[via] and srcOf[via][target] or nil
-				if blocked(f.cell.pos, via.pos)
-					or (far and blocked(via.pos, far.pos)) then
+				if blocked(f.cell.pos, via.pos, math.min(f.cell.clearance, via.clearance))
+					or (far and blocked(via.pos, far.pos, math.min(via.clearance, far.clearance))) then
 					blockedFace[f] = true
 					stats.facesBlocked += 1
 				else
@@ -367,15 +373,17 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 					local tgt, kind = l:match("^(%d+):(%a+)$")
 					cur = { key = l, loop = L, li = li, region = L.region, target = tonumber(tgt), kind = kind,
 						nodes = {}, cells = {}, partnerCells = {}, viaRegions = {}, whole = whole,
-						nodeEdge = nodeEdge, nodeT = nodeT }
+						nodeEdge = nodeEdge, nodeT = nodeT, head = math.huge }
 				end
 				cur.nodes[#cur.nodes + 1] = j
 				local f = nodeFace[j]
 				if f then
 					cur.cells[f.cell] = true
+					cur.head = math.min(cur.head, f.cell.clearance)
 					local lb = label[f]
 					if lb then
 						cur.partnerCells[lb.via] = true
+						cur.head = math.min(cur.head, lb.via.clearance)
 						cur.viaRegions[lb.viaRegion] = true
 					end
 				end
@@ -491,7 +499,7 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 		fails[why] = (fails[why] or 0) + 1
 		return false
 	end
-	local function emitPair(A: any, B: any, kind: string, gapMax: number, count: number): boolean
+	local function emitPair(A: any, B: any, kind: string, gapMax: number, count: number, head: number?): boolean
 		local fa = mesh.tris[A.poly]
 		local up = fa.up or Vector3.yAxis
 		local da = flatten(A.p2 - A.p1, up)
@@ -518,7 +526,7 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 		if math.abs((bR - aL):Dot(up)) > rmax or math.abs((bL - aR):Dot(up)) > rmax then return fail("rise") end
 		local ca, cb = (aL + aR) * 0.5, (bL + bR) * 0.5
 		-- the gate itself must be crossable, not only the faces behind it
-		if gateBlocked(ca, cb) then return fail("wall") end
+		if gateBlocked(ca, cb, head) then return fail("wall") end
 		local mid = (ca + cb) * 0.5
 		local key = math.min(A.poly, B.poly) .. ":" .. math.max(A.poly, B.poly) .. ":"
 			.. math.floor(mid.X * 2 + 0.5) .. ":" .. math.floor(mid.Y * 2 + 0.5) .. ":" .. math.floor(mid.Z * 2 + 0.5)
@@ -546,7 +554,7 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 		local q = a + d * t
 		return flatten(q - p, up).Magnitude, q
 	end
-	local function emitCorner(A: any, B: any, kind: string, gapMax: number, count: number): boolean
+	local function emitCorner(A: any, B: any, kind: string, gapMax: number, count: number, head: number?): boolean
 		local fa = mesh.tris[A.poly]
 		local up = fa.up or Vector3.yAxis
 		local d1, bR = segDist(A.p1, B.p1, B.p2, up)
@@ -557,7 +565,7 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 		local rmax = (kind == "bridge") and 2 * riseMax or riseMax
 		if math.abs((bR - A.p1):Dot(up)) > rmax or math.abs((bL - A.p2):Dot(up)) > rmax then return fail("corner rise") end
 		local ca, cb = (A.p1 + A.p2) * 0.5, (bL + bR) * 0.5
-		if gateBlocked(ca, cb) then return fail("corner wall") end
+		if gateBlocked(ca, cb, head) then return fail("corner wall") end
 		local mid = (ca + cb) * 0.5
 		local key = math.min(A.poly, B.poly) .. ":" .. math.max(A.poly, B.poly) .. ":"
 			.. math.floor(mid.X * 2 + 0.5) .. ":" .. math.floor(mid.Y * 2 + 0.5) .. ":" .. math.floor(mid.Z * 2 + 0.5)
@@ -635,12 +643,12 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 					local made = false
 					for _, A in ipairs(runPieces(R)) do
 						for _, B in ipairs(runPieces(S)) do
-							if emitPair(A, B, R.kind, gapMax, nCells(R)) then made = true end
+							if emitPair(A, B, R.kind, gapMax, nCells(R), math.min(R.head, S.head)) then made = true end
 						end
 					end
 					if not made then
 						local A, B = nearestPair(runPieces(R), runPieces(S))
-						if A and B then made = emitCorner(A, B, R.kind, gapMax, nCells(R)) end
+						if A and B then made = emitCorner(A, B, R.kind, gapMax, nCells(R), math.min(R.head, S.head)) end
 					end
 					if made then R.made = (R.made or 0) + 1; S.made = (S.made or 0) + 1 end
 				end
@@ -672,7 +680,7 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 					local ext = (E.b - E.a).Magnitude * 0.5
 					if c.X >= lo.X - ext and c.X <= hi.X + ext and c.Z >= lo.Z - ext and c.Z <= hi.Z + ext
 						and c.Y >= lo.Y - ext and c.Y <= hi.Y + ext then
-						if emitPair(A, { poly = E.poly, p1 = E.a, p2 = E.b }, R.kind, gapMax, nCells(R)) then made = true end
+						if emitPair(A, { poly = E.poly, p1 = E.a, p2 = E.b }, R.kind, gapMax, nCells(R), R.head) then made = true end
 					end
 				end
 			end
@@ -680,7 +688,7 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 				local near = {}
 				for _, E in ipairs(rimNear) do near[#near + 1] = { poly = E.poly, p1 = E.a, p2 = E.b } end
 				local A, B = nearestPair(pieces, near)
-				if A and B then made = emitCorner(A, B, R.kind, gapMax, nCells(R)) end
+				if A and B then made = emitCorner(A, B, R.kind, gapMax, nCells(R), R.head) end
 			end
 			if made then
 				stats.runsFallbackRim += 1

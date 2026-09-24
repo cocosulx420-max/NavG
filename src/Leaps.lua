@@ -39,7 +39,6 @@ local Agents = require(script.Parent:WaitForChild("Agents"))
 Leaps.sample = 1.0      -- studs between samples along a rim
 Leaps.dropCap = 300     -- deepest a ray looks when drop is unlimited
 Leaps.landTol = 0.75    -- how far a hit may sit off a polygon's plane
-Leaps.groupRise = 0.75  -- samples merge while their landing heights agree this well
 -- Distances out from the rim the body is tried at. Up to dropReach it steps (or
 -- vaults) off and falls; beyond it, it has to jump the distance.
 Leaps.tries = { 0.6, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5 }
@@ -56,6 +55,7 @@ Leaps.fallRadius = 0.9
 Leaps.detour = 2.0      -- a walk bridge must save a way round longer than this x the walk...
 Leaps.detourSlack = 3.0 -- ...plus this many studs
 Leaps.walkMin = 2       -- samples (studs of rim) a walk bridge needs
+Leaps.joinNear = 2.0    -- studs in plan from an existing gate of the pair that makes a leap redundant
 -- Debugging: a set of polygon indices; every probe from their rims is logged
 -- step by step into Leaps.traceLog.
 Leaps.tracePolys = nil :: { [number]: boolean }?
@@ -120,9 +120,13 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 
 	-- links that already join a pair, either way
 	local joined: { [string]: boolean } = {}
+	local joinedAt: { [string]: { any } } = {}
 	local adj: { [number]: { any } } = {}
 	for _, L in ipairs(res.links) do
-		joined[math.min(L.a, L.b) .. ":" .. math.max(L.a, L.b)] = true
+		local pk = math.min(L.a, L.b) .. ":" .. math.max(L.a, L.b)
+		joined[pk] = true
+		local t = joinedAt[pk]; if not t then t = {}; joinedAt[pk] = t end
+		t[#t + 1] = L
 		adj[L.a] = adj[L.a] or {}; table.insert(adj[L.a], { to = L.b, at = L.centre })
 		adj[L.b] = adj[L.b] or {}; table.insert(adj[L.b], { to = L.a, at = L.centre })
 	end
@@ -151,6 +155,26 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 			end
 		end
 		return true
+	end
+
+	-- A LINK JOINS TWO POLYGONS AT A PLACE. A ramp's foot seams onto the ground
+	-- polygon its sides drop onto, and "joined anywhere" threw away every side
+	-- drop (case5 r010, r012-r014). A leap is a duplicate only within joinNear
+	-- of a gate that already joins the pair.
+	local function joinedNear(i: number, j: number, p: Vector3): boolean
+		for _, L in ipairs(joinedAt[math.min(i, j) .. ":" .. math.max(i, j)] or {}) do
+			for _, seg in ipairs({ { L.left, L.right }, { L.bLeft, L.bRight } }) do
+				local a, b = seg[1], seg[2]
+				if a and b then
+					local d = Vector3.new(b.X - a.X, 0, b.Z - a.Z)
+					local v = Vector3.new(p.X - a.X, 0, p.Z - a.Z)
+					local dd = d:Dot(d)
+					local t = dd > 1e-9 and math.clamp(v:Dot(d) / dd, 0, 1) or 0
+					if (v - d * t).Magnitude <= Leaps.joinNear then return true end
+				end
+			end
+		end
+		return false
 	end
 
 	local rp = RaycastParams.new()
@@ -266,7 +290,7 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 			if ray(land + UP * 0.05, from - (land + UP * 0.05)) then return nil, nil, nil, nil, 0 end
 			-- too close to something the body would catch on: try further out
 			if not fallClear(from, land, outward) then stats.caught += 1; crossed = true; continue end
-			if joined[math.min(i, j) .. ":" .. math.max(i, j)] then
+			if joinedNear(i, j, p) then
 				stats.duplicate += 1
 				return nil, nil, nil, nil, 0
 			end
@@ -297,6 +321,27 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 		end
 	end
 
+	-- SAMPLES MERGE WHILE NO PROFILE LIMIT LIES BETWEEN THEM. A ramp's side
+	-- falls ~1.1 studs further every stud, and merging only within 0.75 of
+	-- height left it one sample per gate (case5 r010, r012-r014). Heights are
+	-- cut at every profile's step, jump and finite drop; gaps at every jump
+	-- distance.
+	local heightLimits, gapLimits = {}, {}
+	for _, pr in pairs(Agents.profiles) do
+		heightLimits[#heightLimits + 1] = pr.step
+		heightLimits[#heightLimits + 1] = pr.jump
+		if pr.drop ~= math.huge then heightLimits[#heightLimits + 1] = pr.drop end
+		gapLimits[#gapLimits + 1] = pr.jumpDistance
+	end
+	local function band(limits: { number }, x: number): number
+		local n = 0
+		for _, b in ipairs(limits) do if x > b + 1e-6 then n += 1 end end
+		return n
+	end
+	local function flatGap(s: any): number
+		return Vector3.new(s.to.X - s.from.X, 0, s.to.Z - s.from.Z).Magnitude
+	end
+
 	local out = {}
 	local function emit(kind: string, a: number, b: number, run: { any }, oneWay: boolean)
 		if #run == 0 then return end
@@ -310,13 +355,24 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 			rise = 0, gap = 0, count = #run, residual = 0, fitted = true, edge = true,
 			oneWay = oneWay, type = kind, vault = 0,
 		}
-		local rs, gs = 0, 0
+		-- A gate records its WORST sample, so a profile that accepts it accepts
+		-- every stretch of it: the deepest drop, the highest jump, the widest gap.
+		-- Grouping never spans a profile limit, so no profile loses part of one.
+		local rs, rlo, rhi, gs, ghi = 0, math.huge, -math.huge, 0, 0
 		for _, s in ipairs(run) do
-			rs += s.to.Y - s.from.Y
-			gs += Vector3.new(s.to.X - s.from.X, 0, s.to.Z - s.from.Z).Magnitude
+			local r = s.to.Y - s.from.Y
+			local g = Vector3.new(s.to.X - s.from.X, 0, s.to.Z - s.from.Z).Magnitude
+			rs += r; gs += g
+			rlo, rhi, ghi = math.min(rlo, r), math.max(rhi, r), math.max(ghi, g)
 			if (s.vault or 0) > L.vault then L.vault = s.vault end
 		end
-		L.rise, L.gap = rs / #run, gs / #run
+		if kind == "drop" then
+			L.rise, L.gap = rlo, ghi
+		elseif kind == "jump" then
+			L.rise, L.gap = rhi, ghi
+		else
+			L.rise, L.gap = rs / #run, gs / #run
+		end
 		-- the path the body takes, averaged over samples that share its shape
 		local nv = run[1].via and #run[1].via or 0
 		if nv > 0 then
@@ -392,7 +448,8 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 					-- cannot be reversed by the same jump
 					local canUp = kind == "drop" and (p.Y - land.Y) <= env.jump and vault <= env.step
 					if cur and cur.target == target and cur.kind == kind
-						and math.abs((land.Y - p.Y) - (cur.last.to.Y - cur.last.from.Y)) <= Leaps.groupRise
+						and band(heightLimits, math.abs(land.Y - p.Y)) == band(heightLimits, math.abs(cur.last.to.Y - cur.last.from.Y))
+						and band(gapLimits, flatGap(sample)) == band(gapLimits, flatGap(cur.last))
 						and (vault > env.step) == cur.vaulted then
 						cur.samples[#cur.samples + 1] = sample
 						cur.last = sample

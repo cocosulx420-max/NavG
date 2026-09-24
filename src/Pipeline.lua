@@ -1662,6 +1662,7 @@ end
 --            (horizontal distance crossed), type walk / step
 -- Drop and jump links (one-way) carry the same fields.
 Pipeline.widthCap = 64
+Pipeline.headroomShare = 0.75 -- share of a polygon's cells `headroomOpen` holds for
 
 function Pipeline.measure_(result: any)
 	local mesh, res = result.mesh, result.portals
@@ -1675,9 +1676,12 @@ function Pipeline.measure_(result: any)
 		data.wallDistMeasured = true
 	end
 	local head, wide, n = {}, {}, {}
+	local clears: { [number]: { number } } = {}
 	for cell, pi in pairs(res.polyOf) do
 		local c = cell.clearance or math.huge
 		if head[pi] == nil or c < head[pi] then head[pi] = c end
+		local cl = clears[pi]; if not cl then cl = {}; clears[pi] = cl end
+		cl[#cl + 1] = c
 		local t = cell.wallDist
 		if t and t ~= math.huge then
 			if wide[pi] == nil or t > wide[pi] then wide[pi] = t end
@@ -1722,6 +1726,18 @@ function Pipeline.measure_(result: any)
 		local up = f.up or Vector3.yAxis
 		f.slope = math.deg(math.acos(math.clamp(up.Y, -1, 1)))
 		f.headroom = head[i] or 0
+		-- HEADROOM MOST OF IT HAS. `headroom` is the lowest cell, so a strip under
+		-- an eave condemns a whole stair tread for a tall body (case3's outside
+		-- stairs: 84-100% open sky, headroom 5.7). This is the clearance at least
+		-- headroomShare of the cells have; a body that uses it may bump the low
+		-- strip, and the path's stuck fallback routes round it.
+		local cl = clears[i]
+		if cl and #cl > 0 then
+			table.sort(cl)
+			f.headroomOpen = cl[math.max(1, math.floor(#cl * (1 - Pipeline.headroomShare)) + 1)]
+		else
+			f.headroomOpen = f.headroom
+		end
 		f.width = math.min(Pipeline.widthCap, 2 * (wide[i] or 0))
 		f.cells = n[i] or 0
 	end
@@ -1738,6 +1754,15 @@ function Pipeline.measure_(result: any)
 		local pa = L.centre
 		local pb = (L.bLeft and L.bRight) and (L.bLeft + L.bRight) * 0.5 or L.centre
 		L.rise = heightAt(mesh.tris[L.b], pb) - heightAt(mesh.tris[L.a], pa)
+		-- A LEAP KEEPS ITS WORST END. Along a ramp's side the fall grows the whole
+		-- way, and the centre's height let a profile past the deep end Leaps had
+		-- grouped by (left pairs with bRight, right with bLeft).
+		if L.oneWay and L.bLeft and L.bRight then
+			for _, e in ipairs({ { L.left, L.bRight }, { L.right, L.bLeft } }) do
+				local r = heightAt(mesh.tris[L.b], e[2]) - heightAt(mesh.tris[L.a], e[1])
+				if (L.kind == "drop" and r < L.rise) or (L.kind ~= "drop" and r > L.rise) then L.rise = r end
+			end
+		end
 		L.gap = L.gap or 0
 		-- along the portal, both sides of it
 		local best = 0
@@ -1784,17 +1809,20 @@ function Pipeline.drawPortals(result: any, opts: any?): (Instance, string)
 		f.Parent = root
 		return f
 	end
-	local byKind = {
-		shared = folder("shared"),
+	local showShared = o.shared == true
+	local byKind: { [string]: Folder } = {
 		seam = folder("seam"),
 		bridge = folder("bridge"),
 		drop = folder("drop"),
 		jump = folder("jump"),
 	}
+	if showShared then byKind.shared = folder("shared") end
 
 	-- ONE COLOUR PER KIND, chosen clear of the outline drawing (cyan rims, pink
 	-- holes, yellow corners, green closures):
 	--   blue    shared  -- the exact edge two polygons of one region share
+	--                      (hidden unless opts.shared: 143 of them on case5,
+	--                      and they only say a floor's triangles touch)
 	--   green   seam    -- between regions, flush (height change <= 0.25)
 	--   orange  seam    -- between regions, a step up to the largest step
 	--   purple  bridge  -- across floor too narrow to trace
@@ -1802,8 +1830,12 @@ function Pipeline.drawPortals(result: any, opts: any?): (Instance, string)
 	--   teal    jump    -- one-way, up onto a ledge or across a gap
 	--   dark red        a walk link steeper than any step: should not exist
 	--   white   ball    -- a polygon with no link at all
-	-- A portal with two sides is drawn as TWO bars, the overlap on each edge,
-	-- with arrows between them: two for a two-way crossing, one for one-way.
+	-- EACH LINK IS DRAWN ONCE, as a flat ribbon on the edge. Gates of one kind
+	-- between the same two polygons that touch end to end are drawn as one
+	-- ribbon, so a run of pieces reads as the one crossing it is. A two-way
+	-- ribbon lies midway between its two sides; a one-way link is a ribbon where
+	-- it leaves, a faint one where it lands, and one arrow along the path the
+	-- body takes. The folder's `links` attribute lists the portals it merged.
 	local SHARED = o.sharedColor or Color3.fromRGB(40, 110, 255)
 	local FLUSH  = o.flushColor or Color3.fromRGB(60, 255, 90)
 	local STEP   = o.stepColor or Color3.fromRGB(255, 140, 20)
@@ -1812,91 +1844,202 @@ function Pipeline.drawPortals(result: any, opts: any?): (Instance, string)
 	local JUMP   = o.jumpColor or Color3.fromRGB(0, 230, 220)
 	local STEEP  = o.steepColor or Color3.fromRGB(140, 0, 0)
 	local STEPMAX = require(script.Parent:WaitForChild("Agents")).envelope().step
+	local WIDTH = o.ribbonWidth or 0.35
+	-- studs between gates drawn as one ribbon, and off the line. Leaps samples
+	-- every 1.0 and thins them, and finds a jump both from below and as a drop
+	-- reversed, 0.6 apart, so a ramp side lands 1 to 2.2 studs apart.
+	local joinGap = o.joinGap or 1.25
+	local leapGap, leapOff = o.leapGap or 2.5, o.leapOff or 1.0
+
+	local function ribbon(a: Vector3, b: Vector3, up: Vector3, colour: Color3, name: string,
+		parent: Instance, transparency: number?)
+		local p = Instance.new("Part")
+		p.Anchored = true; p.CanCollide = false; p.CanQuery = false; p.CanTouch = false
+		p.Material = Enum.Material.Neon
+		p.Color = colour
+		p.Transparency = transparency or 0
+		p.Name = name
+		local d = b - a
+		local len = d.Magnitude
+		if len < 0.05 then
+			-- a one-cell-pair gate has no length; a missing mark would read as a
+			-- missing link
+			p.Size = Vector3.new(WIDTH, 0.06, WIDTH)
+			p.CFrame = CFrame.new(a)
+		else
+			local fwd = d / len
+			local right = fwd:Cross(up)
+			if right.Magnitude < 1e-3 then right = fwd:Cross(Vector3.xAxis) end
+			right = right.Unit
+			p.Size = Vector3.new(WIDTH, 0.06, len)
+			p.CFrame = CFrame.fromMatrix(a + d * 0.5, right, right:Cross(fwd).Unit)
+		end
+		p.Parent = parent
+	end
 
 	local function arrow(from: Vector3, to: Vector3, colour: Color3, parent: Instance)
 		local d = to - from
 		local len = d.Magnitude
 		if len < 0.05 then return end
-		local head = math.min(0.5, len * 0.45)
+		local head = math.min(0.6, len * 0.45)
 		local dir = d / len
-		segment(from, to - dir * head * 0.5, 0.07, colour, "shaft", parent)
+		segment(from, to - dir * head * 0.5, 0.06, colour, "shaft", parent)
 		-- a V for the head, in the plane that holds the arrow and the world up
 		-- (or world X when the arrow is vertical, as a drop's is)
 		local side = dir:Cross(math.abs(dir.Y) > 0.9 and Vector3.xAxis or Vector3.yAxis)
 		if side.Magnitude < 1e-3 then side = Vector3.zAxis end
 		side = side.Unit
-		segment(to, to - dir * head + side * head * 0.6, 0.07, colour, "head", parent)
-		segment(to, to - dir * head - side * head * 0.6, 0.07, colour, "head", parent)
+		segment(to, to - dir * head + side * head * 0.6, 0.06, colour, "head", parent)
+		segment(to, to - dir * head - side * head * 0.6, 0.06, colour, "head", parent)
 	end
 
+	-- One entry per link, both sides in a fixed order: A is where a one-way link
+	-- leaves, and the lower polygon of a two-way one (found from either side).
+	local groups: { [string]: { any } } = {}
+	local order: { string } = {}
 	for i, L in ipairs(res.links) do
-		local into = byKind[L.kind] or byKind.seam
-		local up = mesh.tris[L.a].up
-		local off = up * lift
-		local g = Instance.new("Folder")
-		local rise = L.rise or -(L.drop or 0)
-		g.Name = ("%sp%04d_f%04d-f%04d_%.1fw_%+.2frise"):format(
-			(L.kind ~= "shared" and not (L.bLeft and L.bRight)) and "FITTED_" or "",
-			i, L.a, L.b, L.span, rise)
-		g.Parent = into
+		if L.kind == "shared" and not showShared then continue end
+		local a1, a2, b1, b2 = L.left, L.right, L.bRight, L.bLeft
+		local pa, pb = L.a, L.b
+		if not L.oneWay and L.a > L.b and b1 and b2 then
+			a1, a2, b1, b2 = L.bLeft, L.bRight, L.right, L.left
+			pa, pb = L.b, L.a
+		end
+		-- by REGION, not polygon: the ground is many triangles, and one roof edge
+		-- dropping onto three of them is still one drop
+		local ra, rb = mesh.tris[pa].region, mesh.tris[pb].region
+		if not L.oneWay and ra > rb then ra, rb = rb, ra end
+		local key = L.kind .. ":" .. ra .. (L.oneWay and ">" or "=") .. rb
+		local g = groups[key]
+		if not g then g = {}; groups[key] = g; order[#order + 1] = key end
+		g[#g + 1] = { i = i, L = L, a1 = a1, a2 = a2, b1 = b1 or a1, b2 = b2 or a2, pa = pa, pb = pb }
+	end
 
-		local d = math.abs(rise)
-		local colour
-		if L.kind == "shared" then colour = SHARED
-		elseif L.kind == "drop" then colour = DROP
-		elseif L.kind == "jump" then colour = JUMP
-		elseif d > STEPMAX then colour = STEEP
-		elseif L.kind == "bridge" then colour = BRIDGE
-		else colour = (d <= 0.25) and FLUSH or STEP end
+	local function flat(v: Vector3): Vector3 return Vector3.new(v.X, 0, v.Z) end
 
-		local function bar(a: Vector3, b: Vector3, name: string)
-			if (b - a).Magnitude > 1e-4 then
-				segment(a + off, b + off, 0.2, colour, name, g)
+	for _, key in ipairs(order) do
+		local g = groups[key]
+		-- EDGE LINES FIRST. Gates of one pair can sit on two edges of a corner; a
+		-- ribbon from one to the other cut the corner (case5 p0440+441). A gate
+		-- joins a line only running along it and lying on it; a one-sample gate
+		-- has no direction and joins the nearest line it lies on.
+		local lines: { any } = {}
+		local function offLine(ln: any, v: Vector3): number
+			local w = flat(v - ln.base)
+			if not ln.dir then return w.Magnitude end
+			return (w - ln.dir * w:Dot(ln.dir)).Magnitude
+		end
+		local sorted = table.clone(g)
+		table.sort(sorted, function(x, y) return (x.a2 - x.a1).Magnitude > (y.a2 - y.a1).Magnitude end)
+		for _, m in ipairs(sorted) do
+			local gap = m.L.oneWay and leapGap or joinGap
+			local tol = m.L.oneWay and leapOff or 0.5
+			local d = flat(m.a2 - m.a1)
+			local home = nil
+			if d.Magnitude > 0.05 then
+				local u = d.Unit
+				for _, ln in ipairs(lines) do
+					if ln.dir and math.abs(u:Dot(ln.dir)) >= 0.97
+						and offLine(ln, m.a1) <= tol and offLine(ln, m.a2) <= tol then home = ln break end
+				end
+				if not home then home = { dir = u, base = m.a1, members = {} }; lines[#lines + 1] = home end
 			else
-				-- a one-cell-pair portal has no width to draw, and a missing bar
-				-- would read as a missing link
-				local ball = Instance.new("Part")
-				ball.Anchored = true; ball.CanCollide = false; ball.CanQuery = false; ball.CanTouch = false
-				ball.Shape = Enum.PartType.Ball
-				ball.Size = Vector3.new(0.3, 0.3, 0.3)
-				ball.Color = colour; ball.Material = Enum.Material.Neon
-				ball.CFrame = CFrame.new(a + off)
-				ball.Name = name
-				ball.Parent = g
+				local bd = math.huge
+				for _, ln in ipairs(lines) do
+					local o2 = offLine(ln, m.a1)
+					local lim = ln.dir and tol or gap
+					if o2 <= lim and o2 < bd then home, bd = ln, o2 end
+				end
+				if not home then
+					home = { dir = nil, base = m.a1, members = {} }; lines[#lines + 1] = home
+				elseif not home.dir then
+					local w = flat(m.a1 - home.base)
+					if w.Magnitude > 1e-3 then home.dir = w.Unit end
+				end
+			end
+			home.members[#home.members + 1] = m
+		end
+
+		-- chains: gates on one line that touch end to end
+		local chains: { { any } } = {}
+		for _, ln in ipairs(lines) do
+			local dir = ln.dir or Vector3.xAxis
+			local base = ln.base
+			local function along(v: Vector3): number return flat(v - base):Dot(dir) end
+			for _, m in ipairs(ln.members) do
+				-- orient every gate the same way along the line
+				if along(m.a2) < along(m.a1) then m.a1, m.a2, m.b1, m.b2 = m.a2, m.a1, m.b2, m.b1 end
+				m.lo, m.hi = along(m.a1), along(m.a2)
+			end
+			table.sort(ln.members, function(x, y) return x.lo < y.lo end)
+			local cur, curHi = nil, 0
+			for _, m in ipairs(ln.members) do
+				local gap = m.L.oneWay and leapGap or joinGap
+				if cur and m.lo <= curHi + gap then
+					cur[#cur + 1] = m
+					curHi = math.max(curHi, m.hi)
+				else
+					cur = { m }; chains[#chains + 1] = cur
+					curHi = m.hi
+				end
 			end
 		end
-		bar(L.left, L.right, "gateA")
-		if L.bLeft and L.bRight then
-			bar(L.bLeft, L.bRight, "gateB")
-			-- L.left pairs with L.bRight and L.right with L.bLeft (B's edge runs the
-			-- other way), so the point at fraction t on A faces 1 - t on B
-			local function at(t: number): (Vector3, Vector3)
-				return L.left:Lerp(L.right, t) + off, L.bRight:Lerp(L.bLeft, t) + off
+
+		for _, ch in ipairs(chains) do
+			local first, last = ch[1], ch[1]
+			for _, m in ipairs(ch) do if m.hi > last.hi then last = m end end
+			local L = first.L
+			local into = byKind[L.kind] or byKind.seam
+			local upA = mesh.tris[first.pa].up
+			local upB = mesh.tris[first.pb].up
+			local worst, ids = 0, {}
+			for _, m in ipairs(ch) do
+				worst = math.max(worst, math.abs(m.L.rise or -(m.L.drop or 0)))
+				ids[#ids + 1] = m.i
 			end
-			if L.oneWay then
-				local pa, pb = at(0.5)
-				if L.via and #L.via > 0 then
-					-- the path the body takes: up, over what it clears, down
-					local prev = pa
-					for _, w in ipairs(L.via) do
-						segment(prev, w + off, 0.07, colour, "shaft", g)
-						prev = w + off
-					end
-					arrow(prev, pb, colour, g)
-				elseif L.over then
-					-- FORWARD, THEN DOWN (or up, then across, for a jump-up): the way
-					-- the NPC actually goes, so the arrow never cuts through the ledge
-					local ov = L.over + off
-					segment(pa, ov, 0.07, colour, "shaft", g)
-					arrow(ov, pb, colour, g)
-				else
-					arrow(pa, pb, colour, g)
-				end
+			table.sort(ids)
+			local gf = Instance.new("Folder")
+			gf.Name = ("p%04d%s_f%04d%sf%04d_%.1fw_%.2frise"):format(ids[1],
+				#ids > 1 and ("+" .. (#ids - 1)) or "", first.pa, L.oneWay and ">" or "-", first.pb,
+				(last.a2 - first.a1).Magnitude, worst)
+			gf:SetAttribute("links", table.concat(ids, ","))
+			gf.Parent = into
+
+			local colour
+			if L.kind == "shared" then colour = SHARED
+			elseif L.kind == "drop" then colour = DROP
+			elseif L.kind == "jump" then colour = JUMP
+			elseif worst > STEPMAX then colour = STEEP
+			elseif L.kind == "bridge" then colour = BRIDGE
+			else colour = (worst <= 0.25) and FLUSH or STEP end
+
+			if not L.oneWay then
+				local s = (first.a1 + first.b1) * 0.5 + upA * lift
+				local e = (last.a2 + last.b2) * 0.5 + upA * lift
+				ribbon(s, e, upA, colour, "gate", gf)
 			else
-				local pa, pb = at(1 / 3)
-				arrow(pa, pb, colour, g)
-				local qa, qb = at(2 / 3)
-				arrow(qb, qa, colour, g)
+				ribbon(first.a1 + upA * lift, last.a2 + upA * lift, upA, colour, "leave", gf)
+				ribbon(first.b1 + upB * lift, last.b2 + upB * lift, upB, colour, "land", gf, 0.6)
+				-- one arrow, along the proved path of the gate nearest the middle
+				local mid = (first.lo + last.hi) * 0.5
+				local pick = ch[1]
+				for _, m in ipairs(ch) do
+					if math.abs((m.lo + m.hi) * 0.5 - mid) < math.abs((pick.lo + pick.hi) * 0.5 - mid) then pick = m end
+				end
+				local PL = pick.L
+				local pa = (pick.a1 + pick.a2) * 0.5 + upA * lift
+				local pb = (pick.b1 + pick.b2) * 0.5 + upB * lift
+				local prev = pa
+				if PL.via and #PL.via > 0 then
+					for _, w in ipairs(PL.via) do
+						segment(prev, w + upA * lift, 0.06, colour, "shaft", gf)
+						prev = w + upA * lift
+					end
+				elseif PL.over then
+					segment(prev, PL.over + upA * lift, 0.06, colour, "shaft", gf)
+					prev = PL.over + upA * lift
+				end
+				arrow(prev, pb, colour, gf)
 			end
 		end
 	end

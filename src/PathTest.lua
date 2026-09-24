@@ -19,6 +19,7 @@ PathTest.lift = 0.6         -- studs the drawn path floats above the floor
 PathTest.snapHeight = 4.0   -- how far below a marker a polygon may be and still hold it
 PathTest.snapReach = 3.0    -- studs off the mesh a point may be and still find its polygon
 PathTest.folderName = "NVGN_Path"
+PathTest.snapDraw = 1.5    -- studs a drawn sample may move to sit on a polygon
 
 local function flat(v: Vector3): Vector3 return Vector3.new(v.X, 0, v.Z) end
 
@@ -98,7 +99,10 @@ local function usable(mesh: any, e: any, prof: any?, banned: any?): boolean
 	if not prof then return true end
 	local L, T = e.L, mesh.tris[e.to]
 	local w = 2 * (prof.radius or 0)
-	if T.headroom and T.headroom < (prof.prone or 0) then return false end
+	-- what most of the polygon has (Pipeline.measure_): a tall body may bump a
+	-- low strip at its edge and the caller's stuck fallback routes round it
+	local head = T.headroomOpen or T.headroom
+	if head and head < (prof.prone or 0) then return false end
 	-- width by the PORTAL'S clearance (see Pipeline.measure_); a polygon's own
 	-- width misleads, a thin triangle along a wall can sit in a wide room
 	if L.clear and L.clear < w then return false end
@@ -115,9 +119,10 @@ end
 
 -- extra cost for moving somewhere cramped, so an upright route wins when there is one
 local function postureCost(T: any, prof: any?): number
-	if not prof or not T.headroom then return 1 end
-	if T.headroom < (prof.crouch or 0) then return 3 end
-	if T.headroom < (prof.height or 0) then return 1.6 end
+	local head = T.headroomOpen or T.headroom
+	if not prof or not head then return 1 end
+	if head < (prof.crouch or 0) then return 3 end
+	if head < (prof.height or 0) then return 1.6 end
 	return 1
 end
 
@@ -380,7 +385,57 @@ local function straighten(mesh: any, adj: any, pts: { Vector3 }, corridor: { num
 	return out, extra
 end
 
-function PathTest.solve(result: any, sp: Vector3, gp: Vector3, prof: any?, banned: any?): (any, string)
+-- the point of polygon f nearest p: the plane under p when p is over it in
+-- plan, else the nearest point of its rim
+local function closestOn(f: any, p: Vector3): Vector3
+	local v = f.verts
+	local n = #v
+	local inside = true
+	for k = 1, n do
+		local a, b = v[k], v[k % n + 1]
+		if (b.X - a.X) * (p.Z - a.Z) - (b.Z - a.Z) * (p.X - a.X) > 1e-6 then inside = false; break end
+	end
+	if inside then
+		local c, up = f.centre, f.up or Vector3.yAxis
+		local h = c.Y
+		if math.abs(up.Y) > 1e-3 then h = c.Y - ((p.X - c.X) * up.X + (p.Z - c.Z) * up.Z) / up.Y end
+		return Vector3.new(p.X, h, p.Z)
+	end
+	local best, bd = v[1], math.huge
+	for k = 1, n do
+		local a, b = v[k], v[k % n + 1]
+		local d = b - a
+		local dd = d:Dot(d)
+		local t = dd > 1e-9 and math.clamp((p - a):Dot(d) / dd, 0, 1) or 0
+		local q = a + d * t
+		local dq = (q - p).Magnitude
+		if dq < bd then best, bd = q, dq end
+	end
+	return best
+end
+
+-- every polygon this profile can reach from s
+local function reachable(mesh: any, adj: any, s: number, prof: any?, banned: any?): { number }
+	local seen, out, q = { [s] = true }, { s }, { s }
+	local h = 1
+	while h <= #q do
+		local cur = q[h]; h += 1
+		for _, e in ipairs(adj[cur] or {}) do
+			if not seen[e.to] and usable(mesh, e, prof, banned) then
+				seen[e.to] = true
+				out[#out + 1] = e.to
+				q[#q + 1] = e.to
+			end
+		end
+	end
+	return out
+end
+
+-- opts.nearest: when the goal cannot be reached, go to the reachable point
+-- nearest it instead of failing (a follower waits at the door of a room it
+-- does not fit in). The path then carries `partial = true`. Off by default:
+-- the walk test counts an unreachable goal as a failure.
+function PathTest.solve(result: any, sp: Vector3, gp: Vector3, prof: any?, banned: any?, opts: any?): (any, string)
 	local mesh, res = result.mesh, result.portals
 	result._pathAdj = result._pathAdj or graph(res)
 	local s, sdy = locate(mesh, sp)
@@ -389,6 +444,19 @@ function PathTest.solve(result: any, sp: Vector3, gp: Vector3, prof: any?, banne
 	if not g then return nil, "PathEnd is not above any polygon" end
 	local sFloor, gFloor = sp - Vector3.yAxis * sdy, gp - Vector3.yAxis * gdy
 	local chain = (s == g) and {} or astar(mesh, result._pathAdj, s, g, sp, gp, prof, banned)
+	local partial = false
+	if not chain and opts and opts.nearest then
+		local want = gFloor
+		local bestI, bestQ, bd = s, sFloor, math.huge
+		for _, i in ipairs(reachable(mesh, result._pathAdj, s, prof, banned)) do
+			local q = closestOn(mesh.tris[i], want)
+			local d = (q - want).Magnitude
+			if d < bd then bestI, bestQ, bd = i, q, d end
+		end
+		g, gp, gFloor = bestI, bestQ, bestQ
+		chain = (s == g) and {} or astar(mesh, result._pathAdj, s, g, sp, gp, prof, banned)
+		partial = true
+	end
 	if not chain then
 		return nil, ("no path: polygon f%04d (r%03d) and f%04d (r%03d) are not connected")
 			:format(s, mesh.tris[s].region, g, mesh.tris[g].region)
@@ -405,17 +473,22 @@ function PathTest.solve(result: any, sp: Vector3, gp: Vector3, prof: any?, banne
 	local ks = {}
 	for k, v in pairs(kinds) do ks[#ks + 1] = k .. " " .. v end
 	table.sort(ks)
-	return { points = pts, chain = chain, from = s, to = g, extra = extra },
-		("%d polygons, %d portals (%s), %d corners, %.1f studs")
-			:format(#chain + 1, #chain, table.concat(ks, ", "), #pts, len)
+	return { points = pts, chain = chain, from = s, to = g, extra = extra, partial = partial },
+		(partial and "unreachable, waiting at the nearest point: " or "")
+			.. ("%d polygons, %d portals (%s), %d corners, %.1f studs")
+				:format(#chain + 1, #chain, table.concat(ks, ", "), #pts, len)
 end
 
-function PathTest.draw(result: any, path: any): Folder
-	local old = workspace:FindFirstChild(PathTest.folderName)
+-- opts: colour of the line, folder name, and extra lift -- so several
+-- followers can each show their own path without replacing the others'.
+function PathTest.draw(result: any, path: any, opts: any?): Folder
+	local o = opts or {}
+	local name = o.name or PathTest.folderName
+	local old = workspace:FindFirstChild(name)
 	if old then old:Destroy() end
 	local f = Instance.new("Folder")
-	f.Name = PathTest.folderName
-	local up = Vector3.yAxis * PathTest.lift
+	f.Name = name
+	local up = Vector3.yAxis * (PathTest.lift + (o.lift or 0))
 	local pts = path.points
 	-- ALONG THE SURFACES: a straight corner-to-corner line cuts through stair
 	-- treads and floats over ridges. Sample each stretch and put every sample on
@@ -425,7 +498,12 @@ function PathTest.draw(result: any, path: any): Folder
 	for _, st in ipairs(path.chain) do corridor[#corridor + 1] = st.e.to end
 	-- and the polygons a straightened stretch crossed
 	for _, pv in ipairs(path.extra or {}) do corridor[#corridor + 1] = pv end
-	local function surfaceAt(p: Vector3): Vector3
+	-- the corridor polygon under p NEAREST THE ROUTE'S OWN HEIGHT there, and only
+	-- within snapDraw of it: a stair climbs over ground the same route crossed,
+	-- and across the unmeshed gap between two treads (a bridge) the ground was
+	-- the only polygon under the line, which fell through the stairs onto it
+	local function surfaceAt(p: Vector3): (Vector3, boolean)
+		local best, bd = p, PathTest.snapDraw
 		for _, i in ipairs(corridor) do
 			local poly = mesh.tris[i]
 			local v = poly.verts
@@ -439,18 +517,176 @@ function PathTest.draw(result: any, path: any): Folder
 				local c, u = poly.centre, poly.up or Vector3.yAxis
 				local h = c.Y
 				if math.abs(u.Y) > 1e-3 then h = c.Y - ((p.X - c.X) * u.X + (p.Z - c.Z) * u.Z) / u.Y end
-				return Vector3.new(p.X, h, p.Z)
+				if math.abs(h - p.Y) < bd then best, bd = Vector3.new(p.X, h, p.Z), math.abs(h - p.Y) end
 			end
 		end
-		return p
+		return best, bd < PathTest.snapDraw
 	end
-	local trail = { pts[1] }
-	for k = 2, #pts do
-		local a2, b2 = pts[k - 1], pts[k]
+	-- ON THE GEOMETRY, NOT JUST THE POLYGON. Between two treads joined by a
+	-- bridge no polygon is under the line, a straight line up a stair cuts every
+	-- nosing, and a tiled roof stands proud of its polygon's plane; a short ray
+	-- down puts the line back on top. It only ever lifts, by at most snapDraw.
+	local rpDraw = RaycastParams.new()
+	rpDraw.FilterType = Enum.RaycastFilterType.Exclude
+	do
+		local ex = {}
+		for _, c in ipairs(workspace:GetChildren()) do
+			if c.Name:sub(1, 5) == "NVGN_" or c.Name:sub(1, 9) == "PathStart" or c.Name:sub(1, 7) == "PathEnd"
+				or c:FindFirstChildOfClass("Humanoid") then ex[#ex + 1] = c end
+		end
+		rpDraw.FilterDescendantsInstances = ex
+	end
+	local trail: { Vector3 } = { pts[1] }
+	local function walk(a2: Vector3, b2: Vector3)
 		local m = math.max(1, math.floor((b2 - a2).Magnitude / 0.5))
-		for j = 1, m do trail[#trail + 1] = surfaceAt(a2:Lerp(b2, j / m)) end
+		for j = 1, m do
+			local q0 = a2:Lerp(b2, j / m)
+			local q = surfaceAt(q0)
+			-- from well above: overlapping roof tiles put a ray that starts just
+			-- over the line INSIDE the next tile, and a ray never sees the part it
+			-- starts in; a hit more than snapDraw up is something else's top
+			local hit = workspace:Raycast(q0 + Vector3.yAxis * 4, -Vector3.yAxis * (4 + PathTest.snapDraw), rpDraw)
+			if hit and hit.Position.Y > q.Y and hit.Position.Y <= q0.Y + PathTest.snapDraw then
+				q = Vector3.new(q.X, hit.Position.Y, q.Z)
+			end
+			trail[#trail + 1] = q
+		end
 	end
-	for k = 2, #trail do segment(trail[k - 1] + up, trail[k] + up, Color3.fromRGB(255, 255, 255), 0.3, f) end
+
+	-- LEAPS ARE DRAWN AS THE BODY GOES. The route is pulled tight across a jump
+	-- or a drop, so its straight line ran through the rails and roof edges the
+	-- body goes over (case3: one 22 stud stretch crossed three leaps). Where a
+	-- stretch passes a leap's takeoff edge, the line walks along the edge to the
+	-- gate's middle and takes the path Leaps proved there (`via`, or `over`)
+	-- onto the landing. Not shifted to where the route crosses: slid along the
+	-- gate it ran through a corner post the check never swept.
+	local function flatV(v: Vector3): Vector3 return Vector3.new(v.X, 0, v.Z) end
+	local events: { [number]: { any } } = {}
+	for _, st in ipairs(path.chain) do
+		local L = st.e.L
+		if (L.kind == "jump" or L.kind == "drop") and L.bLeft and L.bRight then
+			local bestK, bestT, bestS, bd = nil, 0, 0, 1.0
+			for k = 2, #pts do
+				local a2, b2 = pts[k - 1], pts[k]
+				local d = flatV(b2 - a2)
+				local dd = d:Dot(d)
+				for i = 0, 10 do
+					local sBar = i / 10
+					local bp = L.left:Lerp(L.right, sBar)
+					local t = dd > 1e-9 and math.clamp(flatV(bp - a2):Dot(d) / dd, 0, 1) or 0
+					local dist = (flatV(a2 + (b2 - a2) * t) - flatV(bp)).Magnitude
+					if dist < bd then bestK, bestT, bestS, bd = k, t, sBar, dist end
+				end
+			end
+			if bestK then
+				local ev = events[bestK]
+				if not ev then ev = {}; events[bestK] = ev end
+				ev[#ev + 1] = { t = bestT, s = bestS, L = L }
+			end
+		end
+	end
+	-- after a leap the line goes on from the LANDING: a route corner on the
+	-- landing is skipped to, so a point takeoff shared by two stretches is not
+	-- walked back to and climbed again
+	local k, cur = 2, pts[1]
+	while k <= #pts do
+		local b2 = pts[k]
+		local ev = events[k] or {}
+		table.sort(ev, function(x, y) return x.t < y.t end)
+		local nextK = k + 1
+		for _, e in ipairs(ev) do
+			local L = e.L
+			local take = (L.left + L.right) * 0.5
+			local land = (L.bRight + L.bLeft) * 0.5
+			walk(cur, L.left:Lerp(L.right, e.s))
+			walk(L.left:Lerp(L.right, e.s), take)
+			for _, w in ipairs(L.via or (L.over and { L.over }) or {}) do trail[#trail + 1] = w end
+			trail[#trail + 1] = land
+			cur = land
+			for j = k, #pts do
+				if (pts[j] - land).Magnitude < 0.75 then b2 = pts[j]; nextK = j + 1 break end
+			end
+		end
+		if (b2 - cur).Magnitude > 1e-3 then walk(cur, b2) end
+		cur = b2
+		k = nextK
+	end
+	-- A STEP IS DRAWN AS A STEP. Where two close samples differ in height the
+	-- diagonal between them cut the nosing of a stair or the edge of a roof
+	-- tile; go up before crossing, or cross before going down.
+	local stepped: { Vector3 } = { trail[1] }
+	for k2 = 2, #trail do
+		local a2, b2 = trail[k2 - 1], trail[k2]
+		local dy = b2.Y - a2.Y
+		if math.abs(dy) > 0.3 and flatV(b2 - a2).Magnitude < 0.6 then
+			stepped[#stepped + 1] = dy > 0 and Vector3.new(a2.X, b2.Y, a2.Z) or Vector3.new(b2.X, a2.Y, b2.Z)
+		end
+		stepped[#stepped + 1] = b2
+	end
+	-- opts.rubberBand: the line pulled tight through the portals instead -- the
+	-- start, where the route crosses each portal bar (at the bar's own height),
+	-- the goal. Nothing is laid on a floor, so a polygon buried under a roof
+	-- cannot drag it into the geometry.
+	if o.rubberBand then
+		-- IN ORDER ALONG THE ROUTE: each bar is matched only from the previous
+		-- crossing on. Matched against the whole route, a 22 stud ridge bar took
+		-- its crossing off the stairs 20 studs below it (same plan position), and
+		-- the line kinked back to reach it.
+		local cursor = 2
+		local function nearOnBar(a: Vector3, b: Vector3): Vector3
+			local best, bd, bk = a, math.huge, cursor
+			for i = 0, 20 do
+				local q = a:Lerp(b, i / 20)
+				for k2 = cursor, #pts do
+					local p0, p1 = pts[k2 - 1], pts[k2]
+					local d = flatV(p1 - p0)
+					local dd = d:Dot(d)
+					local t = dd > 1e-9 and math.clamp(flatV(q - p0):Dot(d) / dd, 0, 1) or 0
+					local dist = (flatV(p0 + (p1 - p0) * t) - flatV(q)).Magnitude
+					if dist < bd - 1e-6 or (math.abs(dist - bd) <= 1e-6 and k2 < bk) then best, bd, bk = q, dist, k2 end
+				end
+			end
+			cursor = bk
+			return best
+		end
+		stepped = { pts[1] }
+		for _, st in ipairs(path.chain) do
+			local L = st.e.L
+			local sides = { { L.left, L.right } }
+			if L.bLeft and L.bRight then
+				sides[2] = { L.bRight, L.bLeft }
+				if st.e.reverse then sides = { sides[2], sides[1] } end
+			end
+			local from = #stepped
+			for _, sd in ipairs(sides) do stepped[#stepped + 1] = nearOnBar(sd[1], sd[2]) end
+			-- A LEAP GOES OVER WHAT IT CLEARS: up at the edge to the highest point
+			-- of the path Leaps proved (a vault's rail), across, down onto the
+			-- landing. Across-then-down at the edge's own height ran through the
+			-- very rail the body vaults.
+			if (L.kind == "jump" or L.kind == "drop") and #stepped == from + 2 then
+				local a2, b2 = stepped[from + 1], stepped[from + 2]
+				local apex = math.max(a2.Y, b2.Y)
+				for _, w in ipairs(L.via or (L.over and { L.over }) or {}) do apex = math.max(apex, w.Y) end
+				table.insert(stepped, from + 2, Vector3.new(b2.X, apex, b2.Z))
+				table.insert(stepped, from + 2, Vector3.new(a2.X, apex, a2.Z))
+			end
+		end
+		stepped[#stepped + 1] = pts[#pts]
+		-- and every other short change of height is a step: across a riser the
+		-- two bars sit a fraction apart and the diagonal between them cut the nosing
+		local out2: { Vector3 } = { stepped[1] }
+		for k2 = 2, #stepped do
+			local a2, b2 = stepped[k2 - 1], stepped[k2]
+			local dy = b2.Y - a2.Y
+			if math.abs(dy) > 0.3 and flatV(b2 - a2).Magnitude > 1e-3 and flatV(b2 - a2).Magnitude < 1.0 then
+				out2[#out2 + 1] = dy > 0 and Vector3.new(a2.X, b2.Y, a2.Z) or Vector3.new(b2.X, a2.Y, b2.Z)
+			end
+			out2[#out2 + 1] = b2
+		end
+		stepped = out2
+	end
+	local colour = o.colour or Color3.fromRGB(255, 255, 255)
+	for k2 = 2, #stepped do segment(stepped[k2 - 1] + up, stepped[k2] + up, colour, 0.3, f) end
 	-- the portals the path went through, black, so a bad one is visible where it bites
 	for _, st in ipairs(path.chain) do
 		local L = st.e.L
