@@ -33,7 +33,9 @@ local GridPortals = {}
 local Portals = require(script.Parent:WaitForChild("Portals"))
 local Agents = require(script.Parent:WaitForChild("Agents"))
 
-GridPortals.rays = { 0.4, 2.0 }  -- studs above the higher cell: knee and chest
+GridPortals.rays = { 0.4 }       -- studs over the higher side the column from the lower side runs to
+GridPortals.bandLo = 1.0         -- studs over the higher side the body sweep starts
+GridPortals.bladeWidth = 0.2     -- studs; the swept box is a thin blade, not a body's width
 GridPortals.gapFaces = 2         -- unlabelled faces a run may carry through
 GridPortals.edgeTol = 0.15       -- studs a rim edge may sit off its outline edge (straighten drops 0.1)
 GridPortals.facingAngle = 45     -- degrees off antiparallel the two sides may be
@@ -153,39 +155,33 @@ function GridPortals.build(mesh: any, data: any, snap: any, loops: { any }, rayE
 	rp.FilterType = Enum.RaycastFilterType.Exclude
 	rp.FilterDescendantsInstances = rayExclude or {}
 	rp.IgnoreWater = true
+	-- THE BODY'S BAND, SWEPT. Rays at two heights let whatever stood between
+	-- them through, and every fix so far patched one more gap. A thin box as
+	-- tall as the body is swept instead, from bandLo over the higher side to a
+	-- crouch: anything lower than bandLo is a step walked over, anything in the
+	-- band stops a body. bandLo also keeps a steep roof's own crease, 0.8 over
+	-- both sides of a hip, from reading as a wall.
+	local env = Agents.envelope()
+	local bandHi = ((env.crouch == math.huge) and 3 or env.crouch) - 0.1
+	local bandSize = Vector3.new(GridPortals.bladeWidth, bandHi - GridPortals.bandLo, GridPortals.bladeWidth)
+	local bandMid = (GridPortals.bandLo + bandHi) * 0.5
 	local function blocked(a: Vector3, b: Vector3): boolean
 		local hi = math.max(a.Y, b.Y)
-		local p1 = Vector3.new(a.X, hi, a.Z)
-		local p2 = Vector3.new(b.X, hi, b.Z)
-		-- UP FROM THE LOWER CELL to where the crossing runs. A crawl space under
-		-- a roof pairs with the roof's own top a step above, and the rays over
-		-- the higher cell pass over the slab between (Cocosulx's "impossible").
-		-- A stair riser stands beside the lower cell, never over it.
+		-- UP FROM THE LOWER SIDE to where the crossing runs. A crawl space under
+		-- a roof pairs with the roof's own top a step above, and a sweep over
+		-- the higher side passes over the slab between (Cocosulx's "impossible").
+		-- A stair riser stands beside the lower side, never over it.
 		local low = (a.Y <= b.Y) and a or b
 		local rise = hi + GridPortals.rays[1] - low.Y
 		if rise > 0.2 and workspace:Raycast(low + Vector3.yAxis * 0.1, Vector3.yAxis * (rise - 0.1), rp) then return true end
-		for _, h in ipairs(GridPortals.rays) do
-			if workspace:Raycast(p1 + Vector3.yAxis * h, p2 - p1, rp) then return true end
-		end
-		return false
+		local p1 = Vector3.new(a.X, hi + bandMid, a.Z)
+		local p2 = Vector3.new(b.X, hi + bandMid, b.Z)
+		local d = p2 - p1
+		if d.Magnitude < 1e-3 then return false end
+		return workspace:Blockcast(CFrame.new(p1), bandSize, d, rp) ~= nil
 	end
-	-- A GATE is tested once more between its two sides. Level over the higher
-	-- side a steep roof's own crease between two faces reads as a wall, and
-	-- along the slope a stair riser does, so only something that stops BOTH is
-	-- one -- a wall or a rail stops both. The column up from the lower side
-	-- alone is enough, as for faces: a slab overhead.
-	local function gateBlocked(a: Vector3, b: Vector3): boolean
-		local hi = math.max(a.Y, b.Y)
-		local low = (a.Y <= b.Y) and a or b
-		local rise = hi + GridPortals.rays[1] - low.Y
-		if rise > 0.2 and workspace:Raycast(low + Vector3.yAxis * 0.1, Vector3.yAxis * (rise - 0.1), rp) then return true end
-		-- at chest height only: whatever stops a gate at the knee alone is lower
-		-- than a step (a 59 degree hip's own crease stood 0.8 over both sides)
-		local p1 = Vector3.new(a.X, hi, a.Z)
-		local p2 = Vector3.new(b.X, hi, b.Z)
-		local up = Vector3.yAxis * GridPortals.rays[#GridPortals.rays]
-		return workspace:Raycast(p1 + up, p2 - p1, rp) ~= nil and workspace:Raycast(a + up, b - a, rp) ~= nil
-	end
+	-- a gate between its two sides: the same test
+	local gateBlocked = blocked
 
 	-- ------------------------------------------------------------ 1. faces
 	local partners: { [any]: { any } } = {}

@@ -10,9 +10,9 @@
 -- `sample` studs. From each sample the body walks OUTWARD, distance by distance
 -- (`tries`), and at each distance two questions are asked:
 --
---   PASS   the lowest height the body can cross from the rim to here at: rays
---          at its feet, middle and head (`body`, the smallest crouch of any
---          profile) all clear, and the column over the rim clear up to it. Up
+--   PASS   the lowest height the body can cross from the rim to here at: a
+--          blade from its feet to its head (`body`, the smallest crouch of any
+--          profile) swept clear, and the column over the rim clear up to it. Up
 --          to the envelope jump; nothing passes -> a wall, stop.
 --   FALL   from that height, straight down. What it finds decides:
 --            a lip or cornice off the mesh within a step    keep going out
@@ -47,6 +47,7 @@ Leaps.dropReach = 3.5
 Leaps.jumpStep = 0.5    -- studs between the tries past dropReach, out to jumpDistance
 Leaps.passStep = 0.5    -- studs between the heights the pass is tried at
 Leaps.lift = 0.3        -- studs off a surface a ray runs, clear of the surface itself
+Leaps.blade = 0.2       -- studs; width of the body sweep, a thin blade from feet to head
 -- THE FALL IS AS WIDE AS THE BODY. A ray down the centre slipped past an eave
 -- slab 0.9 studs away and "landed" 50 studs below, straight through the
 -- overhang the body would hit (Cocosulx's dropoffbad). Rays at this share of
@@ -164,14 +165,15 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 	end
 
 	-- Can the body go from over the rim `p` to over `q` with its feet at
-	-- p.Y + h? Feet, middle and head clear along the way, and the column over
-	-- the rim clear up to the head.
+	-- p.Y + h? A thin blade from its feet to its head, swept along: rays at
+	-- three heights let whatever stood between them through.
+	local bladeSize = Vector3.new(Leaps.blade, body - 0.1 - Leaps.lift, Leaps.blade)
+	local bladeMid = (Leaps.lift + body - 0.1) * 0.5
 	local function passes(p: Vector3, q: Vector3, h: number): boolean
 		local d = q - p
-		for _, y in ipairs({ h + Leaps.lift, h + body * 0.5, h + body - 0.1 }) do
-			if ray(p + UP * y, d) then return false end
-		end
-		return true
+		if d.Magnitude < 1e-3 then return true end
+		stats.rays += 1
+		return workspace:Blockcast(CFrame.new(p + UP * (h + bladeMid)), bladeSize, d, rp) == nil
 	end
 	local function lowestPass(p: Vector3, q: Vector3): number?
 		local h = 0
@@ -195,23 +197,16 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 	-- Returns target polygon, kind ("drop" | "up" | "across"), landing, the
 	-- point the body passes through, and the height it cleared.
 	local radius = (env.radius == math.huge) and 1 or env.radius
-	-- the body's edges fall clear to the landing: nothing it would catch on on the way
-	local function fallClear(from: Vector3, land: Vector3, outward: Vector3, rimY: number): boolean
-		local side = outward:Cross(UP)
-		local r = radius * Leaps.fallRadius
-		for _, o in ipairs({ outward * r, side * r, -side * r }) do
-			local top = from + o
-			local hit = ray(top, -UP * (top.Y - land.Y + Leaps.landTol))
-			if hit and hit.Position.Y > land.Y + env.step then return false end
-			-- and up, for a part the down ray started inside
-			local bot = Vector3.new(top.X, land.Y + 0.05, top.Z)
-			if ray(bot, top - bot) then return false end
-		end
-		-- toward the rim, up from the landing to just under it: an eave, a slab
-		-- edge or the floor's own lip the body would come down on
-		local back = Vector3.new(from.X, land.Y + 0.05, from.Z) - outward * r
-		if rimY - 0.1 > back.Y and ray(back, UP * (rimY - 0.1 - back.Y)) then return false end
-		return true
+	-- THE FALL IS AS WIDE AS THE BODY: its footprint, a flat box, swept down
+	-- from where it steps off to a step over the landing. An eave, a slab
+	-- edge or the ledge it is still over catches it on any side, where rays
+	-- round it slipped past (Cocosulx's dropoffbad).
+	local footSize = Vector3.new(2 * radius * Leaps.fallRadius, 0.2, 2 * radius * Leaps.fallRadius)
+	local function fallClear(from: Vector3, land: Vector3, outward: Vector3): boolean
+		local drop = from.Y - (land.Y + env.step)
+		if drop <= 0 then return true end
+		stats.rays += 1
+		return workspace:Blockcast(CFrame.lookAt(from, from + outward), footSize, -UP * drop, rp) == nil
 	end
 
 	local tracing = false
@@ -270,7 +265,7 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 			local land = hit.Position
 			if ray(land + UP * 0.05, from - (land + UP * 0.05)) then return nil, nil, nil, nil, 0 end
 			-- too close to something the body would catch on: try further out
-			if not fallClear(from, land, outward, p.Y) then stats.caught += 1; crossed = true; continue end
+			if not fallClear(from, land, outward) then stats.caught += 1; crossed = true; continue end
 			if joined[math.min(i, j) .. ":" .. math.max(i, j)] then
 				stats.duplicate += 1
 				return nil, nil, nil, nil, 0
