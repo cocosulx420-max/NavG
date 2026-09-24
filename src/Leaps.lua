@@ -127,13 +127,35 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 		joined[pk] = true
 		local t = joinedAt[pk]; if not t then t = {}; joinedAt[pk] = t end
 		t[#t + 1] = L
-		adj[L.a] = adj[L.a] or {}; table.insert(adj[L.a], { to = L.b, at = L.centre })
-		adj[L.b] = adj[L.b] or {}; table.insert(adj[L.b], { to = L.a, at = L.centre })
+		adj[L.a] = adj[L.a] or {}; table.insert(adj[L.a], { to = L.b, L = L, reverse = false })
+		-- a one-way link is no way round in reverse: a drop cannot be walked back
+		-- up, and counting it did away with bridges that were the only way back
+		if not L.oneWay then
+			adj[L.b] = adj[L.b] or {}; table.insert(adj[L.b], { to = L.a, L = L, reverse = true })
+		end
 	end
 	-- A WALK BRIDGE MUST SAVE A DETOUR. Over unmeshed floor between two polygons
 	-- the walk links already join a short way round, it adds a gate and no
 	-- route; kept only when the way round is longer than detour x the straight
-	-- walk plus detourSlack. Measured through the link centres, bounded.
+	-- walk plus detourSlack. Bounded.
+	-- MEASURED THROUGH THE NEAREST POINT OF EACH GATE, not its centre: a 93 stud
+	-- seam's centre sat 46 studs off, so the way round along the seam itself
+	-- looked long and a 3 stud bridge was laid right beside its end (case6
+	-- p5570, the same 0.75 step the seam already crosses).
+	local function nearOn(a: Vector3, b: Vector3, p: Vector3): Vector3
+		local d = b - a
+		local dd = d:Dot(d)
+		local t = dd > 1e-9 and math.clamp((p - a):Dot(d) / dd, 0, 1) or 0
+		return a + d * t
+	end
+	local function crossAt(e: any, p: Vector3): Vector3
+		local L = e.L
+		local n1, n2, f1, f2 = L.left, L.right, L.bLeft, L.bRight
+		if e.reverse and f1 and f2 then n1, n2, f1, f2 = f1, f2, n1, n2 end
+		local q = nearOn(n1, n2, p)
+		if f1 and f2 then q = nearOn(f1, f2, q) end
+		return q
+	end
 	local function detour(i: number, j: number, from: Vector3, to: Vector3): boolean
 		local direct = (to - from).Magnitude
 		local limit = Leaps.detour * direct + Leaps.detourSlack
@@ -146,11 +168,12 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 			table.remove(open, bi)
 			if k == j then return best[k] + (to - at[k]).Magnitude > limit end
 			for _, e in ipairs(adj[k :: number] or {}) do
-				local c = best[k :: number] + (e.at - at[k :: number]).Magnitude
+				local q = crossAt(e, at[k :: number])
+				local c = best[k :: number] + (q - at[k :: number]).Magnitude
 				if c <= limit and (best[e.to] == nil or c < best[e.to]) then
 					if best[e.to] == nil then open[#open + 1] = e.to end
 					best[e.to] = c
-					at[e.to] = e.at
+					at[e.to] = q
 				end
 			end
 		end

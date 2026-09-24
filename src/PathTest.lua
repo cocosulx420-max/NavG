@@ -20,6 +20,7 @@ PathTest.snapHeight = 4.0   -- how far below a marker a polygon may be and still
 PathTest.snapReach = 3.0    -- studs off the mesh a point may be and still find its polygon
 PathTest.folderName = "NVGN_Path"
 PathTest.snapDraw = 1.5    -- studs a drawn sample may move to sit on a polygon
+PathTest.barTol = 0.75     -- studs off the final route a portal may be and still pin the rubber band
 
 local function flat(v: Vector3): Vector3 return Vector3.new(v.X, 0, v.Z) end
 
@@ -301,7 +302,7 @@ local function cross2(a: Vector3, b: Vector3, u: Vector3, w: Vector3): (number?,
 	return s, r
 end
 local function walkRay(mesh: any, adj: any, from: number, a: Vector3, b: Vector3, targets: { [number]: boolean },
-	prof: any?, banned: any?, visited: { number }): boolean
+	prof: any?, banned: any?, visited: { number }, crossed: { any }?): boolean
 	local cur, t = from, 0
 	for _ = 1, 512 do
 		if targets[cur] then return true end
@@ -321,7 +322,7 @@ local function walkRay(mesh: any, adj: any, from: number, a: Vector3, b: Vector3
 		end
 		if tExit >= 1 then return false end -- ends in a polygon that is not the target
 		local x = a:Lerp(b, tExit)
-		local nextPoly, nextT = nil, nil
+		local nextPoly, nextT, nextLink = nil, nil, nil
 		for _, e in ipairs(adj[cur] or {}) do
 			local L = e.L
 			if WALK[L.kind] and usable(mesh, e, prof, banned) then
@@ -338,18 +339,19 @@ local function walkRay(mesh: any, adj: any, from: number, a: Vector3, b: Vector3
 					else
 						nextPoly, nextT = e.to, tExit
 					end
-					if nextPoly then break end
+					if nextPoly then nextLink = L; break end
 				end
 			end
 		end
 		if not nextPoly then return false end
 		visited[#visited + 1] = nextPoly
+		if crossed then crossed[#crossed + 1] = nextLink end
 		cur, t = nextPoly, nextT :: number
 	end
 	return false
 end
-local function straighten(mesh: any, adj: any, pts: { Vector3 }, corridor: { number }, prof: any?, banned: any?): ({ Vector3 }, { number })
-	if #pts <= 2 then return pts, {} end
+local function straighten(mesh: any, adj: any, pts: { Vector3 }, corridor: { number }, prof: any?, banned: any?): ({ Vector3 }, { number }, { any })
+	if #pts <= 2 then return pts, {}, {} end
 	-- which corridor polygons hold each point
 	local holds = {}
 	for k, p in ipairs(pts) do
@@ -360,20 +362,21 @@ local function straighten(mesh: any, adj: any, pts: { Vector3 }, corridor: { num
 		end
 		holds[k] = t
 	end
-	local out, seen = { pts[1] }, {}
+	local out, seen, crossedAll = { pts[1] }, {}, {}
 	local i = 1
 	while i < #pts do
 		local jBest = i + 1
 		for j = #pts, i + 2, -1 do
 			local ok = false
-			local visited = {}
+			local visited, crossed = {}, {}
 			for start in pairs(holds[i]) do
-				table.clear(visited)
-				if walkRay(mesh, adj, start, pts[i], pts[j], holds[j], prof, banned, visited) then ok = true break end
+				table.clear(visited); table.clear(crossed)
+				if walkRay(mesh, adj, start, pts[i], pts[j], holds[j], prof, banned, visited, crossed) then ok = true break end
 			end
 			if ok then
 				jBest = j
 				for _, pv in ipairs(visited) do seen[pv] = true end
+				for _, L in ipairs(crossed) do crossedAll[#crossedAll + 1] = L end
 				break
 			end
 		end
@@ -382,7 +385,7 @@ local function straighten(mesh: any, adj: any, pts: { Vector3 }, corridor: { num
 	end
 	local extra = {}
 	for pv in pairs(seen) do extra[#extra + 1] = pv end
-	return out, extra
+	return out, extra, crossedAll
 end
 
 -- the point of polygon f nearest p: the plane under p when p is over it in
@@ -465,18 +468,45 @@ function PathTest.solve(result: any, sp: Vector3, gp: Vector3, prof: any?, banne
 	local corridor = { s }
 	for _, st in ipairs(chain) do corridor[#corridor + 1] = st.e.to end
 	local extra
-	pts, extra = straighten(mesh, result._pathAdj, pts, corridor, prof, banned)
+	local crossed
+	pts, extra, crossed = straighten(mesh, result._pathAdj, pts, corridor, prof, banned)
 	local len = 0
 	for k = 2, #pts do len += (pts[k] - pts[k - 1]).Magnitude end
+	-- THE PORTALS THE FINAL ROUTE CROSSES. straighten cuts across polygons
+	-- through other links, so a chain portal can lie well off the route (a 3
+	-- stud bridge 9 studs away, case6); reporting and drawing the chain showed
+	-- portals the route never touches. Used: every leap on the chain, every
+	-- chain portal within barTol of the route, and every link a straightened
+	-- stretch crossed.
+	local used, isUsed = {}, {}
+	local function add(L: any) if not isUsed[L] then isUsed[L] = true; used[#used + 1] = L end end
+	local function nearRoute(p: Vector3, q: Vector3): boolean
+		for i = 0, 10 do
+			local x = p:Lerp(q, i / 10)
+			for k = 2, #pts do
+				local a, b = pts[k - 1], pts[k]
+				local d = flat(b - a)
+				local dd = d:Dot(d)
+				local t = dd > 1e-9 and math.clamp(flat(x - a):Dot(d) / dd, 0, 1) or 0
+				if (flat(a + (b - a) * t) - flat(x)).Magnitude <= PathTest.barTol then return true end
+			end
+		end
+		return false
+	end
+	for _, st in ipairs(chain) do
+		local L = st.e.L
+		if L.kind == "jump" or L.kind == "drop" or nearRoute(L.left, L.right) then add(L) end
+	end
+	for _, L in ipairs(crossed) do add(L) end
 	local kinds = {}
-	for _, st in ipairs(chain) do kinds[st.e.L.kind] = (kinds[st.e.L.kind] or 0) + 1 end
+	for _, L in ipairs(used) do kinds[L.kind] = (kinds[L.kind] or 0) + 1 end
 	local ks = {}
 	for k, v in pairs(kinds) do ks[#ks + 1] = k .. " " .. v end
 	table.sort(ks)
-	return { points = pts, chain = chain, from = s, to = g, extra = extra, partial = partial },
+	return { points = pts, chain = chain, used = used, from = s, to = g, extra = extra, partial = partial },
 		(partial and "unreachable, waiting at the nearest point: " or "")
-			.. ("%d polygons, %d portals (%s), %d corners, %.1f studs")
-				:format(#chain + 1, #chain, table.concat(ks, ", "), #pts, len)
+			.. ("%d portals crossed (%s), %d corners, %.1f studs")
+				:format(#used, table.concat(ks, ", "), #pts, len)
 end
 
 -- opts: colour of the line, folder name, and extra lift -- so several
@@ -633,7 +663,7 @@ function PathTest.draw(result: any, path: any, opts: any?): (Folder, { Vector3 }
 		-- its crossing off the stairs 20 studs below it (same plan position), and
 		-- the line kinked back to reach it.
 		local cursor = 2
-		local function nearOnBar(a: Vector3, b: Vector3): Vector3
+		local function nearOnBar(a: Vector3, b: Vector3): (Vector3, number)
 			local best, bd, bk = a, math.huge, cursor
 			for i = 0, 20 do
 				local q = a:Lerp(b, i / 20)
@@ -647,7 +677,7 @@ function PathTest.draw(result: any, path: any, opts: any?): (Folder, { Vector3 }
 				end
 			end
 			cursor = bk
-			return best
+			return best, bd
 		end
 		stepped = { pts[1] }
 		for _, st in ipairs(path.chain) do
@@ -658,7 +688,17 @@ function PathTest.draw(result: any, path: any, opts: any?): (Folder, { Vector3 }
 				if st.e.reverse then sides = { sides[2], sides[1] } end
 			end
 			local from = #stepped
-			for _, sd in ipairs(sides) do stepped[#stepped + 1] = nearOnBar(sd[1], sd[2]) end
+			-- ONLY PORTALS THE ROUTE CROSSES. straighten cuts across polygons, so a
+			-- portal the search went through can lie well off the final route; the
+			-- line bent 9 studs out to touch such a bridge and back (case6). A leap
+			-- is always kept: the body has to take it.
+			local leap = L.kind == "jump" or L.kind == "drop"
+			local cross = {}
+			for _, sd in ipairs(sides) do
+				local q, d = nearOnBar(sd[1], sd[2])
+				if leap or d <= PathTest.barTol then cross[#cross + 1] = q end
+			end
+			for _, q in ipairs(cross) do stepped[#stepped + 1] = q end
 			-- A LEAP GOES OVER WHAT IT CLEARS: up at the edge to the highest point
 			-- of the path Leaps proved (a vault's rail), across, down onto the
 			-- landing. Across-then-down at the edge's own height ran through the
@@ -687,9 +727,8 @@ function PathTest.draw(result: any, path: any, opts: any?): (Folder, { Vector3 }
 	end
 	local colour = o.colour or Color3.fromRGB(255, 255, 255)
 	for k2 = 2, #stepped do segment(stepped[k2 - 1] + up, stepped[k2] + up, colour, 0.3, f) end
-	-- the portals the path went through, black, so a bad one is visible where it bites
-	for _, st in ipairs(path.chain) do
-		local L = st.e.L
+	-- the portals the route crosses, black, so a bad one is visible where it bites
+	for _, L in ipairs(path.used or {}) do
 		segment(L.left + up * 0.9, L.right + up * 0.9, Color3.fromRGB(10, 10, 10), 0.16, f)
 		if L.bLeft then segment(L.bLeft + up * 0.9, L.bRight + up * 0.9, Color3.fromRGB(10, 10, 10), 0.16, f) end
 	end
