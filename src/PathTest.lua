@@ -481,7 +481,7 @@ end
 
 -- opts: colour of the line, folder name, and extra lift -- so several
 -- followers can each show their own path without replacing the others'.
-function PathTest.draw(result: any, path: any, opts: any?): Folder
+function PathTest.draw(result: any, path: any, opts: any?): (Folder, { Vector3 })
 	local o = opts or {}
 	local name = o.name or PathTest.folderName
 	local old = workspace:FindFirstChild(name)
@@ -694,7 +694,61 @@ function PathTest.draw(result: any, path: any, opts: any?): Folder
 		if L.bLeft then segment(L.bLeft + up * 0.9, L.bRight + up * 0.9, Color3.fromRGB(10, 10, 10), 0.16, f) end
 	end
 	f.Parent = workspace
-	return f
+	return f, stepped
+end
+
+-- THE BODY ALONG THE LINE. The mesh is lenient for a body bigger than the bake
+-- knew about (headroomOpen; portal width from the envelope's radius), so a big
+-- NPC's route can still pass somewhere it does not fit. This sweeps a box of
+-- the body's own size along a drawn line -- `size` is width x height x width,
+-- lifted `lift` studs so steps under that do not count -- and returns every
+-- stretch where it would touch something: { at, part, from, to }.
+-- Each stretch is swept both ways: a cast never sees a part it starts inside.
+--
+-- THE BODY STANDS ON THE HIGHEST FLOOR UNDER IT. Its footprint reaches past
+-- the line, so on a stair it is already over the next tread; swept from the
+-- floor under its centre it hit every step block it stood on (case6: 28
+-- "clips", all stair steps). Each stretch is swept level, at the highest line
+-- point within the body's reach, plus `lift`.
+function PathTest.bodyCheck(line: { Vector3 }, size: Vector3, lift: number, rp: RaycastParams): { any }
+	local hits = {}
+	local box = Vector3.new(size.X, math.max(0.2, size.Y - lift), size.Z)
+	local reach = 0.5 * math.sqrt(size.X * size.X + size.Z * size.Z)
+	local function flat(v: Vector3): Vector3 return Vector3.new(v.X, 0, v.Z) end
+	-- only a floor a step or so up is under the body: anything higher is a wall
+	-- or another storey the route crosses later, and counting it lifted the box
+	-- 20 studs into the floor above (case6)
+	local window = math.max(lift * 1.5, 3)
+	local function floorNear(a: Vector3, b: Vector3): number
+		local own = math.max(a.Y, b.Y)
+		local top = own
+		for _, q in ipairs(line) do
+			if q.Y > top and q.Y <= own + window then
+				local d = flat(b - a)
+				local dd = d:Dot(d)
+				local t = dd > 1e-9 and math.clamp(flat(q - a):Dot(d) / dd, 0, 1) or 0
+				if (flat(a + (b - a) * t) - flat(q)).Magnitude <= reach then top = q.Y end
+			end
+		end
+		return top
+	end
+	for k = 2, #line do
+		local base = floorNear(line[k - 1], line[k])
+		local centre = base + lift + box.Y * 0.5
+		local a = Vector3.new(line[k - 1].X, centre, line[k - 1].Z)
+		local b = Vector3.new(line[k].X, centre, line[k].Z)
+		local d = b - a
+		if d.Magnitude > 1e-3 then
+			local h = workspace:Blockcast(CFrame.new(a), box, d, rp)
+			local at = h and (a + d.Unit * h.Distance)
+			if not h then
+				h = workspace:Blockcast(CFrame.new(b), box, -d, rp)
+				at = h and (b - d.Unit * h.Distance)
+			end
+			if h then hits[#hits + 1] = { at = at, part = h.Instance, from = line[k - 1], to = line[k], box = box } end
+		end
+	end
+	return hits
 end
 
 -- marker parts, made if missing, and a watcher that re-solves when they move

@@ -1618,6 +1618,74 @@ function Pipeline.portalReport(res: any): string
 	return (res.source == "grid" and GridPortals.report or Portals.report)(res)
 end
 
+-- ONE CROSSING, ONE LINK. A bridge (and now and then a seam) is found from
+-- both sides -- by GridPortals and again by Leaps' walk -- and stored twice:
+-- two parallel bars a fraction apart over the same stretch, rises of opposite
+-- sign (case6: 71 pairs). Of two two-way links of one kind between the same
+-- polygons, the one kept is the WIDER (measured `clear`, then span): kept by
+-- span alone, 10 of case6's 72 merges dropped the wider of two equal bars
+-- (64 vs 3.5 studs) and a wide body detoured 16 studs. The other goes when it
+-- lies within doubleOffset of the kept one's line and doubleCover of it is
+-- covered. The kept link joins the same pair, so no route is lost. Runs after
+-- measure_, which sets `clear`.
+Pipeline.mergeDoubles = true
+Pipeline.doubleOffset = 3.0 -- studs between the two bars, in plan
+Pipeline.doubleCover = 0.8  -- share of the shorter bar the longer covers
+function Pipeline.dedupeLinks(res: any): number
+	local links = res.links
+	local function flat(v: Vector3): Vector3 return Vector3.new(v.X, 0, v.Z) end
+	local byPair: { [string]: { number } } = {}
+	for i, L in ipairs(links) do
+		if not L.oneWay and (L.kind == "seam" or L.kind == "bridge") then
+			local k = L.kind .. ":" .. math.min(L.a, L.b) .. ":" .. math.max(L.a, L.b)
+			local t = byPair[k]
+			if not t then t = {}; byPair[k] = t end
+			t[#t + 1] = i
+		end
+	end
+	local drop: { [number]: boolean } = {}
+	for _, list in pairs(byPair) do
+		if #list > 1 then
+			table.sort(list, function(x, y)
+				local cx, cy = links[x].clear or 0, links[y].clear or 0
+				if math.abs(cx - cy) > 0.01 then return cx > cy end
+				return (links[x].span or 0) > (links[y].span or 0)
+			end)
+			for x = 1, #list do
+				local K = links[list[x]]
+				local dk = flat(K.right - K.left)
+				if not drop[list[x]] and dk.Magnitude > 0.3 then
+					local u = dk.Unit
+					for y = x + 1, #list do
+						local D = links[list[y]]
+						if not drop[list[y]] then
+							local dd = flat(D.right - D.left)
+							local parallel = dd.Magnitude <= 0.3 or math.abs(dd.Unit:Dot(u)) > 0.95
+							local w = flat(D.left - K.left)
+							local off = (w - u * w:Dot(u)).Magnitude
+							local t1, t2 = w:Dot(u), flat(D.right - K.left):Dot(u)
+							local lo, hi = math.min(t1, t2), math.max(t1, t2)
+							local ov = math.min(dk.Magnitude, hi) - math.max(0, lo)
+							local cover = (hi - lo > 1e-3) and ov / (hi - lo) or ((lo >= -1e-3 and lo <= dk.Magnitude + 1e-3) and 1 or 0)
+							if parallel and off <= Pipeline.doubleOffset and cover >= Pipeline.doubleCover then
+								drop[list[y]] = true
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	local kept, n = {}, 0
+	for i, L in ipairs(links) do
+		if drop[i] then n += 1 else kept[#kept + 1] = L end
+	end
+	res.links = kept
+	res.stats = res.stats or {}
+	res.stats.doublesMerged = n
+	return n
+end
+
 function Pipeline.portals(result: any): any
 	if not result.portals then
 		local mesh = Pipeline.mesh(result)
@@ -1647,6 +1715,8 @@ function Pipeline.portals(result: any): any
 			Leaps.build(mesh, result.data, result.portals, ex)
 		end
 		Pipeline.measure_(result)
+		-- after measuring: which of two doubles is kept is decided by its width
+		if Pipeline.mergeDoubles then Pipeline.dedupeLinks(result.portals) end
 	end
 	return result.portals
 end
@@ -1662,7 +1732,7 @@ end
 --            (horizontal distance crossed), type walk / step
 -- Drop and jump links (one-way) carry the same fields.
 Pipeline.widthCap = 64
-Pipeline.headroomShare = 0.75 -- share of a polygon's cells `headroomOpen` holds for
+Pipeline.headroomShare = 0.75 -- share of a polygon's area `headroomOpen` holds for
 
 function Pipeline.measure_(result: any)
 	local mesh, res = result.mesh, result.portals
@@ -1681,7 +1751,7 @@ function Pipeline.measure_(result: any)
 		local c = cell.clearance or math.huge
 		if head[pi] == nil or c < head[pi] then head[pi] = c end
 		local cl = clears[pi]; if not cl then cl = {}; clears[pi] = cl end
-		cl[#cl + 1] = c
+		cl[#cl + 1] = { c = c, area = (cell.su or 1) * (cell.sv or 1) }
 		local t = cell.wallDist
 		if t and t ~= math.huge then
 			if wide[pi] == nil or t > wide[pi] then wide[pi] = t end
@@ -1696,28 +1766,36 @@ function Pipeline.measure_(result: any)
 	-- 2 studs by themselves while sitting in wide rooms. Along the portal, the
 	-- widest point to cross at is twice the largest wall distance of the cells
 	-- under it; a corridor is narrow at every point, a room is not.
-	local H = 1.0
+	-- A COLLAPSED NODE IS ITS FOOTPRINT, not its centre. Open floor is 2 to 8
+	-- stud nodes whose centres sit well back from a portal, so only the small
+	-- cells at its ends were found -- the ones against a pillar -- and a 59 stud
+	-- open edge measured 1.74 wide (case6 f390|f391). Each cell is filed under
+	-- every bucket its footprint plus REACH covers, and found by footprint.
+	local H, REACH = 1.0, 0.75
 	local cellsAt: { [string]: { any } } = {}
+	local halfOf: { [any]: number } = {}
 	for cell in pairs(res.polyOf) do
 		local p = cell.pos
-		local k = math.floor(p.X / H) .. ":" .. math.floor(p.Z / H)
-		local b = cellsAt[k]
-		if not b then b = {}; cellsAt[k] = b end
-		b[#b + 1] = cell
+		local half = 0.5 * math.sqrt((cell.su or 0) ^ 2 + (cell.sv or 0) ^ 2)
+		halfOf[cell] = half
+		local rad = half + REACH
+		for bx = math.floor((p.X - rad) / H), math.floor((p.X + rad) / H) do
+			for bz = math.floor((p.Z - rad) / H), math.floor((p.Z + rad) / H) do
+				local k = bx .. ":" .. bz
+				local b = cellsAt[k]
+				if not b then b = {}; cellsAt[k] = b end
+				b[#b + 1] = cell
+			end
+		end
 	end
-	local function clearAt(p: Vector3, reach: number): number
+	local function clearAt(p: Vector3): number
 		local best = 0
-		local bx, bz = math.floor(p.X / H), math.floor(p.Z / H)
-		for dx = -1, 1 do
-			for dz = -1, 1 do
-				for _, cell in ipairs(cellsAt[(bx + dx) .. ":" .. (bz + dz)] or {}) do
-					local d = cell.pos - p
-					if Vector3.new(d.X, 0, d.Z).Magnitude <= reach and math.abs(d.Y) < 2.5 then
-						local t = cell.wallDist
-						if t == math.huge then return Pipeline.widthCap end
-						if t and t > best then best = t end
-					end
-				end
+		for _, cell in ipairs(cellsAt[math.floor(p.X / H) .. ":" .. math.floor(p.Z / H)] or {}) do
+			local d = cell.pos - p
+			if Vector3.new(d.X, 0, d.Z).Magnitude <= REACH + halfOf[cell] and math.abs(d.Y) < 2.5 then
+				local t = cell.wallDist
+				if t == math.huge then return Pipeline.widthCap end
+				if t and t > best then best = t end
 			end
 		end
 		return best
@@ -1729,12 +1807,22 @@ function Pipeline.measure_(result: any)
 		-- HEADROOM MOST OF IT HAS. `headroom` is the lowest cell, so a strip under
 		-- an eave condemns a whole stair tread for a tall body (case3's outside
 		-- stairs: 84-100% open sky, headroom 5.7). This is the clearance at least
-		-- headroomShare of the cells have; a body that uses it may bump the low
-		-- strip, and the path's stuck fallback routes round it.
+		-- headroomShare of the polygon's AREA has -- by area, not cell count: a
+		-- rim is many 0.5 cells and open floor a few 4 stud nodes, and by count
+		-- the low ends of case6's walkway arch outvoted its 14.6 stud middle.
+		-- A body that uses it may bump the low strip; the stuck fallback routes
+		-- round it.
 		local cl = clears[i]
 		if cl and #cl > 0 then
-			table.sort(cl)
-			f.headroomOpen = cl[math.max(1, math.floor(#cl * (1 - Pipeline.headroomShare)) + 1)]
+			table.sort(cl, function(a, b) return a.c < b.c end)
+			local total = 0
+			for _, e in ipairs(cl) do total += e.area end
+			local low, acc = total * (1 - Pipeline.headroomShare), 0
+			f.headroomOpen = cl[#cl].c
+			for _, e in ipairs(cl) do
+				acc += e.area
+				if acc > low then f.headroomOpen = e.c; break end
+			end
 		else
 			f.headroomOpen = f.headroom
 		end
@@ -1770,8 +1858,8 @@ function Pipeline.measure_(result: any)
 		local m = math.max(1, math.floor(len / 0.5))
 		for k = 0, m do
 			local t = k / m
-			best = math.max(best, clearAt(L.left:Lerp(L.right, t), 0.75))
-			if L.bLeft and L.bRight then best = math.max(best, clearAt(L.bRight:Lerp(L.bLeft, t), 0.75)) end
+			best = math.max(best, clearAt(L.left:Lerp(L.right, t)))
+			if L.bLeft and L.bRight then best = math.max(best, clearAt(L.bRight:Lerp(L.bLeft, t))) end
 			if best >= Pipeline.widthCap then break end
 		end
 		L.clear = math.min(Pipeline.widthCap, 2 * best)
