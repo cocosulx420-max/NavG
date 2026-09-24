@@ -1120,6 +1120,98 @@ end
 
 -- World XZ bucket, 1 stud, holding every cell and every dead cell so a
 -- neighbour can be found without knowing which grid owns it.
+-- TERRAIN FLOOR, from the octree like any part's. Floor.readTerrain puts the
+-- terrain's voxels into the SVO, and Floor.extract finds its surface the way it
+-- finds a part's: a solid cell with empty space above, then a ray down from
+-- inside that empty space onto the real surface -- so a cave floor and the
+-- ground over it are both found. Those surfels, one per stud of column, are
+-- binned here into NODES terrainStep across: the rectangle-on-its-own-plane an
+-- adaptive collapse makes, which every later stage already handles. Cheap by
+-- design: a node per terrainStep^2 of ground, not per 0.5 cell.
+--
+-- A bin can hold several LAYERS (a cave floor under the ground above it):
+-- surfels further apart in height than terrainLayerGap are different floors.
+-- Each layer is one node: centred on the bin, on the plane of its surfels'
+-- mean normal through the surfel nearest the centre, with the lowest headroom
+-- of any of them. Water in the voxel just above -> no floor (a game brings its
+-- own water system).
+LocalGrid.terrainStep = 2
+LocalGrid.terrainLayerGap = 3
+-- Between two TERRAIN cells: ground is bumpy and curved, not planar, so the
+-- flush test allows terrainFlushTol (under the 2 stud step, so a real ledge
+-- still splits), neighbours may differ by terrainAngle, and a region is not
+-- held to one plane. Part floors keep flushTol / regionAngle / regionPlanarity.
+LocalGrid.terrainFlushTol = 1.0
+LocalGrid.terrainAngle = 35
+local function isTerrainPair(ga: any, gb: any): boolean
+	return ga ~= nil and gb ~= nil and ga.terrain == true and gb.terrain == true
+end
+LocalGrid.isTerrainPair = isTerrainPair
+local function buildTerrainGrid(sfs: {any}, c: any, water: { [string]: boolean }?): Grid
+	local T = LocalGrid.terrainStep
+	local step = c.step
+	local grid: Grid = {
+		part = workspace.Terrain :: any, fallback = true, step = step,
+		cells = {}, index = {}, dead = {}, deadIndex = {},
+	}
+	;(grid :: any).terrain = true
+	local bins: { [string]: { any } } = {}
+	local order: { string } = {}
+	for _, sf in ipairs(sfs) do
+		local bx, bz = math.floor(sf.pos.X / T), math.floor(sf.pos.Z / T)
+		local k = bx .. ":" .. bz
+		local b = bins[k]
+		if not b then b = { bx = bx, bz = bz, list = {} }; bins[k] = b; order[#order + 1] = k end
+		b.list[#b.list + 1] = sf
+	end
+	-- deterministic: bins in the order their first surfel was found
+	local function wet(p: Vector3): boolean
+		if not water then return false end
+		local q = p + Vector3.yAxis * 1.5
+		return water[string.format("%d:%d:%d", math.floor(q.X / 4), math.floor(q.Y / 4), math.floor(q.Z / 4))] == true
+	end
+	for _, k in ipairs(order) do
+		local b = bins[k]
+		local list = b.list
+		table.sort(list, function(x, y) return x.pos.Y < y.pos.Y end)
+		local layers, cur = {}, { list[1] }
+		for i = 2, #list do
+			if list[i].pos.Y - list[i - 1].pos.Y > LocalGrid.terrainLayerGap then layers[#layers + 1] = cur; cur = {} end
+			cur[#cur + 1] = list[i]
+		end
+		layers[#layers + 1] = cur
+		local cx, cz = (b.bx + 0.5) * T, (b.bz + 0.5) * T
+		for li, layer in ipairs(layers) do
+			local nsum, near, nd = Vector3.zero, nil, math.huge
+			local clearance, cover = math.huge, nil
+			for _, sf in ipairs(layer) do
+				nsum += sf.normal
+				local d = (sf.pos.X - cx) ^ 2 + (sf.pos.Z - cz) ^ 2
+				if d < nd then near, nd = sf, d end
+				if sf.clearance < clearance then clearance, cover = sf.clearance, sf.cover end
+			end
+			if clearance < c.minClearance or wet(near.pos) then continue end
+			local n = (nsum.Magnitude > 1e-4) and nsum.Unit or Vector3.yAxis
+			local slope = math.deg(math.acos(math.clamp(n.Y, -1, 1)))
+			if slope > c.maxSlope then continue end
+			local y = near.pos.Y
+			if math.abs(n.Y) > 1e-3 then
+				y = near.pos.Y - ((cx - near.pos.X) * n.X + (cz - near.pos.Z) * n.Z) / n.Y
+			end
+			local iu, iv = math.floor(b.bx * T / step + 0.5), math.floor(b.bz * T / step + 0.5)
+			local cell: Cell = {
+				ui = iu, vi = iv, pos = Vector3.new(cx, y, cz), normal = n, slope = slope,
+				clearance = clearance, cover = cover,
+				fpos = Vector3.new(cx, y, cz), fu = T, fv = T,
+				su = T, sv = T,
+			}
+			grid.cells[#grid.cells + 1] = cell
+			grid.index[string.format("%d:%d:%d", iu, iv, li)] = cell
+		end
+	end
+	return grid
+end
+
 local function buildWorldIndex(grids: any)
 	local live: {[string]: {any}} = {}
 	local dead: {[string]: {any}} = {}
@@ -1247,7 +1339,10 @@ local function neighbourPos(g: Grid, cell: Cell, d: {number}): Vector3
 	if not g.fallback and g.u and g.v then
 		return cell.pos + g.u * ou + g.v * ov
 	end
-	return cell.pos + Vector3.new(ou, 0, ov)
+	-- a world-aligned grid steps flat, so a coarse node (terrain) is followed
+	-- along its own plane; a one-step cell answers its centre, as before
+	local q = cell.pos + Vector3.new(ou, 0, ov)
+	return Vector3.new(q.X, heightAt(g, cell, q), q.Z)
 end
 
 -- Drop cells on surfaces too narrow to stand on.
@@ -1539,7 +1634,7 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 	-- broadphase returned first, and that can now be something outside the bake,
 	-- which would hide the wall behind it. Same reason the uncapped variant
 	-- existed for the bounds query.
-	local cbf = Floor.bakeFilter(data.parts or {}, data.config and data.config.root)
+	local cbf = Floor.bakeFilter(data.parts or {}, data.config and data.config.root, data.config and data.config.terrain ~= nil)
 	local bakeSet = cbf.set
 	local op, opAll = cbf.op, cbf.op
 	if not cbf.wide then
@@ -1591,7 +1686,13 @@ function LocalGrid.classifyNodes(data: any, cfg: Config?)
 								-- cells read as walls and dropoffs the moment the
 								-- tolerance dropped below its per-cell rise.
 								local dy = q.Y - p.Y
-								if math.abs(dy) <= tol then
+								local ctol = tol
+								if isTerrainPair(g, e.g) then
+									-- terrain: against the neighbour's own plane, bumpy tolerance
+									dy = heightAt(e.g, e.cell, p) - p.Y
+									ctol = LocalGrid.terrainFlushTol
+								end
+								if math.abs(dy) <= ctol then
 									floor = true
 									-- The floor continues here, so this is not a
 									-- wall or a dropoff -- but if it continues
@@ -1767,7 +1868,7 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?, tr
 	-- against 527us at 18197, measured on case6. Every hot query here filtered on
 	-- the whole part list. See Floor.bakeFilter for the rule and the re-cast that
 	-- keeps it exact.
-	local bf = Floor.bakeFilter(parts, c.root)
+	local bf = Floor.bakeFilter(parts, c.root, c.terrain ~= nil)
 
 	local probe = Instance.new("Part")
 	probe.Name = "NVGN_ClearProbe"
@@ -1786,6 +1887,7 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?, tr
 	local rpTerrain = nil
 	local noTerrain = floorData.noTerrain
 	if noTerrain == nil then noTerrain = not Floor.hasTerrain(c) end
+	if c.terrain then noTerrain = false end
 	if not noTerrain then
 		rpTerrain = RaycastParams.new()
 		rpTerrain.FilterType = Enum.RaycastFilterType.Include
@@ -1793,6 +1895,9 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?, tr
 	end
 
 	local byPart = groupByPart(floorData.surfels)
+	-- terrain has no faces to lay a part lattice on: its surfels become nodes
+	local terrainSfs = byPart[workspace.Terrain :: any]
+	byPart[workspace.Terrain :: any] = nil
 	-- An ARRAY now, not a map keyed by part: a part can own several grids, one
 	-- per walkable face. Every grid still carries its own `part`.
 	local grids: {Grid} = {}
@@ -1861,6 +1966,14 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?, tr
 	end
 	probe:Destroy()
 
+	local nTerrain = 0
+	if terrainSfs then
+		local tg = buildTerrainGrid(terrainSfs, c, floorData.terrainWater)
+		grids[#grids + 1] = tg
+		nTerrain = #tg.cells
+		nCells += nTerrain
+	end
+
 	local nFit = { 0, 0, 0 }
 	for _, g in pairs(grids) do
 		for _, cell in ipairs(g.cells) do
@@ -1878,6 +1991,7 @@ function LocalGrid.fromFloor(floorData: any, parts: {BasePart}, cfg: Config?, tr
 		svo = tree,
 		stats = { parts = nParts, grids = nBlock + nFallback, faces = nFaces,
 			framed = nBlock, block = nBlock, fallback = nFallback, cells = nCells, dead = nDead,
+			terrainNodes = nTerrain,
 			prone = nFit[1], crouch = nFit[2], stand = nFit[3] },
 	}
 	LocalGrid.pruneNarrow(data, cfg)
@@ -1969,6 +2083,7 @@ function LocalGrid.regions(data: any, cfg: Config?)
 	local tol = c.flushTol
 	local cosTol = math.cos(math.rad(c.regionAngle))
 	local cosPlanar = math.cos(math.rad(c.regionPlanarity))
+	local cosTerrain = math.cos(math.rad(LocalGrid.terrainAngle))
 	local dirs = dirsFor(c)
 
 	local up: { [any]: any } = {}
@@ -1983,13 +2098,14 @@ function LocalGrid.regions(data: any, cfg: Config?)
 		while up[x] do up[x], x = r, up[x] end
 		return r
 	end
-	local function union(a, b)
+	local function union(a, b, loose: boolean?)
 		local ra, rb = find(a), find(b)
 		if ra == rb then return end
 		local na = anchorN[ra] or a.normal
 		local nb = anchorN[rb] or b.normal
 		-- the two surfaces must be the same surface, not merely locally parallel
-		if na:Dot(nb) < cosPlanar then return end
+		-- (terrain: a hill is one surface however much it curves)
+		if not loose and na:Dot(nb) < cosPlanar then return end
 		if (size[ra] or 1) < (size[rb] or 1) then ra, rb = rb, ra; na, nb = nb, na end
 		up[rb] = ra
 		anchorN[ra] = na
@@ -2008,11 +2124,15 @@ function LocalGrid.regions(data: any, cfg: Config?)
 						for _, e in ipairs(live[(bx + ox) .. ":" .. (bz + oz)] or {}) do
 							local q = e.cell
 							local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
+							local terr = isTerrainPair(g, e.g)
+							-- terrain and part floor never share a region: terrain
+							-- is meshed on its own (TerrainMesh)
+							if (g.terrain == true) ~= (e.g.terrain == true) then continue end
 							if (dx * dx + dz * dz <= r2 or (e.coarse and cellCovers(e.g, q, p)))
-								and math.abs(heightAt(e.g, q, p) - p.Y) <= tol
-								and cell.normal:Dot(q.normal) >= cosTol
+								and math.abs(heightAt(e.g, q, p) - p.Y) <= (terr and LocalGrid.terrainFlushTol or tol)
+								and cell.normal:Dot(q.normal) >= (terr and cosTerrain or cosTol)
 								and q.fit == cell.fit then
-								union(cell, q)
+								union(cell, q, terr)
 							end
 						end
 					end

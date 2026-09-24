@@ -32,6 +32,7 @@ local Nodes = require(script.Parent:WaitForChild("Nodes"))
 local Portals = require(script.Parent:WaitForChild("Portals"))
 local GridPortals = require(script.Parent:WaitForChild("GridPortals"))
 local Leaps = require(script.Parent:WaitForChild("Leaps"))
+local TerrainMesh = require(script.Parent:WaitForChild("TerrainMesh"))
 -- drop and jump links (one-way), see Leaps
 Pipeline.leaps = true
 
@@ -1399,6 +1400,8 @@ function Pipeline.mesh(result: any): any
 			result.meshKind = EdgeKind.build(result.mesh, result.data, trees)
 			result.meshKind.seconds = os.clock() - t0
 		end
+		-- terrain is meshed from its own nodes, after the parts' polygons
+		TerrainMesh.build(result.data, result.mesh)
 	end
 	return result.mesh
 end
@@ -1708,6 +1711,11 @@ function Pipeline.portals(result: any): any
 		end
 		if Pipeline.portalSource == "grid" then
 			result.portals = GridPortals.build(mesh, result.data, snap, result.loops, ex)
+			-- terrain cells were claimed by TerrainMesh, from above; the CDT
+			-- claim projects in one frame per region, which a hill does not have
+			for cell, pi in pairs(result.data.terrainPolyOf or {}) do
+				result.portals.polyOf[cell] = pi
+			end
 		else
 			result.portals = Portals.build(mesh, result.data, snap)
 		end

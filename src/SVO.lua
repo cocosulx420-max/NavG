@@ -170,6 +170,45 @@ function SVO:insertOBB(o)
 	self:_insert(self.root, self.center, self.half, self.maxDepth, o)
 end
 
+-- EXACT AXIS-ALIGNED INSERT, for boxes on the tree's own grid (terrain voxels).
+-- `_insert` is conservative -- a cell merely TOUCHING an oriented box goes
+-- solid, the right call for a tilted part -- but a grid-aligned box then paints
+-- the layer of empty cells resting on it: every terrain surface grew a phantom
+-- stud and its floor was found in the wrong place, or not at all (23% of the
+-- islands' open ground). Here a cell is solid only if it OVERLAPS the box.
+local AABB_EPS = 1e-4
+function SVO:_insertAABB(node, nc: Vector3, nh: number, depth: number, lo: Vector3, hi: Vector3)
+	if node.solid then return end
+	local nlo, nhi = nc - Vector3.one * nh, nc + Vector3.one * nh
+	if nlo.X >= hi.X - AABB_EPS or nhi.X <= lo.X + AABB_EPS
+		or nlo.Y >= hi.Y - AABB_EPS or nhi.Y <= lo.Y + AABB_EPS
+		or nlo.Z >= hi.Z - AABB_EPS or nhi.Z <= lo.Z + AABB_EPS then
+		return
+	end
+	if (nlo.X >= lo.X - AABB_EPS and nhi.X <= hi.X + AABB_EPS
+		and nlo.Y >= lo.Y - AABB_EPS and nhi.Y <= hi.Y + AABB_EPS
+		and nlo.Z >= lo.Z - AABB_EPS and nhi.Z <= hi.Z + AABB_EPS) or depth == 0 then
+		markSolid(node)
+		return
+	end
+	node.children = node.children or {}
+	local ch = nh * 0.5
+	for i = 0, 7 do
+		local cc = nc + OFF[i] * ch
+		local child = node.children[i] or {}
+		node.children[i] = child
+		self:_insertAABB(child, cc, ch, depth - 1, lo, hi)
+		if not child.solid and not child.children then
+			node.children[i] = nil
+		end
+	end
+	tryCollapse(node)
+end
+
+function SVO:insertAABB(lo: Vector3, hi: Vector3)
+	self:_insertAABB(self.root, self.center, self.half, self.maxDepth, lo, hi)
+end
+
 function SVO:insertPart(part: BasePart)
 	self:insertOBB(SVO.obbFromPart(part))
 end
@@ -350,8 +389,14 @@ end
 -- function yield, so call it from a coroutine; omit it and the build is
 -- synchronous exactly as before. See insertPartPrecise for why a big map needs
 -- this to be divisible at all.
+-- opts.boxes: axis-aligned solid boxes { min, max } inserted after the parts
+-- (terrain voxels, one vertical run per box). opts.align: snap the root's lower
+-- corner to a multiple of this, so boxes on that grid fill whole cells instead
+-- of straddling them -- terrain's 4 stud voxels would otherwise shatter into
+-- 1 stud leaves.
 function SVO.fromParts(parts: {BasePart}, leaf: number, margin: number, opts: any?)
-	assert(#parts > 0, "SVO.fromParts: no parts")
+	local boxes = opts and opts.boxes or {}
+	assert(#parts > 0 or #boxes > 0, "SVO.fromParts: no parts")
 	local onProgress = opts and opts.onProgress
 	local lo = Vector3.new(math.huge, math.huge, math.huge)
 	local hi = -lo
@@ -360,14 +405,23 @@ function SVO.fromParts(parts: {BasePart}, leaf: number, margin: number, opts: an
 		lo = lo:Min(part.Position - h)
 		hi = hi:Max(part.Position + h)
 	end
+	for _, b in ipairs(boxes) do
+		lo = lo:Min(b.min)
+		hi = hi:Max(b.max)
+	end
 	lo -= Vector3.new(margin, margin, margin)
 	hi += Vector3.new(margin, margin, margin)
-	local center = (lo + hi) * 0.5
+	local align = opts and opts.align
+	if align then
+		lo = Vector3.new(math.floor(lo.X / align) * align, math.floor(lo.Y / align) * align, math.floor(lo.Z / align) * align)
+	end
 	local extent = hi - lo
 	local maxE = math.max(extent.X, extent.Y, extent.Z)
 	-- root edge = leaf * 2^depth, big enough to hold maxE
 	local depth = math.max(0, math.ceil(math.log(maxE/leaf) / math.log(2))) -- luau: log base via division
 	local rootEdge = leaf * (2 ^ depth)
+	-- aligned: the root's lower corner IS `lo`, so every cell edge lands on the grid
+	local center = if align then lo + Vector3.one * (rootEdge * 0.5) else (lo + hi) * 0.5
 	local tree = SVO.new(center, rootEdge * 0.5, leaf)
 	local onYield = onProgress and function() onProgress(nil, #parts) end
 	for i, part in ipairs(parts) do
@@ -377,6 +431,10 @@ function SVO.fromParts(parts: {BasePart}, leaf: number, margin: number, opts: an
 			tree:insertPartPrecise(part, nil, onYield)     -- real-geometry path
 		end
 		if onProgress then onProgress(i, #parts) end
+	end
+	for i, b in ipairs(boxes) do
+		tree:insertAABB(b.min, b.max)
+		if onProgress and i % 500 == 0 then onProgress(nil, #boxes) end
 	end
 	return tree
 end

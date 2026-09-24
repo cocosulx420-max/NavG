@@ -137,7 +137,26 @@ local function neighbourPos(g: any, cell: any, d: {number}): Vector3
 	if not g.fallback and g.u and g.v then
 		return cell.pos + g.u * ou + g.v * ov
 	end
-	return cell.pos + Vector3.new(ou, 0, ov)
+	-- a world-aligned grid steps flat, so a coarse node (terrain) is followed
+	-- along its own plane; a one-step cell answers its centre, as before
+	local q = cell.pos + Vector3.new(ou, 0, ov)
+	local su, sv = cell.su, cell.sv
+	local nrm = cell.normal
+	if su and sv and (su > g.step or sv > g.step) and nrm and math.abs(nrm.Y) > 1e-3 then
+		local c0 = cell.pos
+		return Vector3.new(q.X, c0.Y - ((q.X - c0.X) * nrm.X + (q.Z - c0.Z) * nrm.Z) / nrm.Y, q.Z)
+	end
+	return q
+end
+-- Between two terrain cells the flush test is LocalGrid.terrainFlushTol; kept
+-- in step with it by hand, since this module does not require LocalGrid.
+local TERRAIN_FLUSH = 1.0
+-- terrain corner heights further apart than this are different levels (a cliff's
+-- top and foot), not bumps on one rim: the walkable step plus a margin
+local TERRAIN_SPLIT = 2.5
+local function pairTol(ga: any, gb: any, tol: number): number
+	if ga and gb and ga.terrain and gb.terrain then return TERRAIN_FLUSH end
+	return tol
 end
 
 -- Surface height of a cell AT `p`. Mirrors LocalGrid's helper of the same name --
@@ -309,7 +328,7 @@ function Boundary.faces(data: any)
 								local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
 								local dd = dx * dx + dz * dz
 								if (dd <= r2 or cellCovers(e.g, q, p))
-									and math.abs(heightAt(e.g, q, p) - p.Y) <= tol and dd < bd then
+									and math.abs(heightAt(e.g, q, p) - p.Y) <= pairTol(g, e.g, tol) and dd < bd then
 									bd = dd; found = q; fg = e.g
 								end
 							end
@@ -339,7 +358,7 @@ function Boundary.faces(data: any)
 							if q ~= cell and q.region == cell.region then
 								local dx, dz = q.pos.X - p.X, q.pos.Z - p.Z
 								if (dx * dx + dz * dz <= r2 or cellCovers(en.g, q, p))
-									and math.abs(heightAt(en.g, q, p) - p.Y) <= tol then
+									and math.abs(heightAt(en.g, q, p) - p.Y) <= pairTol(g, en.g, tol) then
 									local t = diag[cell]
 									if not t then t = {}; diag[cell] = t end
 									t[q] = true
@@ -357,10 +376,15 @@ function Boundary.faces(data: any)
 	end
 
 	local out = {}
+	-- terrain face corners, to be given one shared height below
+	local terrainEnds: { any } = {}
 	for _, g in ipairs(data.grids) do
 		local u = g.u or Vector3.xAxis
 		local v = g.v or Vector3.zAxis
 		local up = g.n or u:Cross(v)
+		-- X x Z is DOWN: a world-aligned grid traced every loop backwards, outer
+		-- rims read as holes and holes as rims. Terrain faces use world up.
+		if g.terrain then up = Vector3.yAxis end
 		for _, cell in ipairs(g.cells) do
 			local r = cell.region
 			if r and keep[r] then
@@ -401,15 +425,113 @@ function Boundary.faces(data: any)
 						if stats[kind] then stats[kind] += 1 end
 						stats.faces += 1
 						any = true
-						list[#list + 1] = {
+						local face = {
 							a = ctr - t * alongHalf,
 							b = ctr + t * alongHalf,
 							up = up, cell = cell, kind = kind, dir = bit,
 						}
+						list[#list + 1] = face
+						if g.terrain then terrainEnds[#terrainEnds + 1] = { face = face, g = g } end
 					end
 				end
 				if any then stats.cells += 1 end
 			end
+		end
+	end
+	-- ONE HEIGHT PER TERRAIN CORNER. Every terrain node is its own tilted plane,
+	-- so two neighbours put the corner they share at different heights -- more
+	-- than SEAM_STEPS apart on bumpy ground -- and the rim never welded (case:
+	-- terrain islands, an island's outer rim in 7 open pieces). Each face that
+	-- touches a corner proposes its node's surface height there; all of them take
+	-- the mean, so the faces meet exactly.
+	-- ONLY AMONG FACES AT THAT HEIGHT: a cliff's top and foot meet at the same
+	-- corner in plan, and one mean for all of them folded the upper rim onto the
+	-- lower into a two-face loop the walk could not leave (islands: 26 broken).
+	-- Proposals are grouped where they lie within TERRAIN_SPLIT of each other,
+	-- and each group takes its own mean. TERRAIN_SPLIT is more than a walkable
+	-- step: bumpy nodes on ONE rim disagree at a corner by over a stud on steep
+	-- ground, and cutting at 1 stud split them (26 broken loops became 75).
+	if #terrainEnds > 0 then
+		local props: { [string]: { number } } = {}
+		local function key(p: Vector3): string
+			return math.round(p.X * 64) .. ":" .. math.round(p.Z * 64)
+		end
+		local want = {}
+		for ti, te in ipairs(terrainEnds) do
+			local f = te.face
+			local ha, hb = heightAt(te.g, f.cell, f.a), heightAt(te.g, f.cell, f.b)
+			want[ti] = { ha, hb }
+			for _, pr in ipairs({ { f.a, ha }, { f.b, hb } }) do
+				local k = key(pr[1])
+				local t = props[k]; if not t then t = {}; props[k] = t end
+				t[#t + 1] = pr[2]
+			end
+		end
+		-- per corner: sorted heights, cut into groups at gaps over TERRAIN_FLUSH
+		local groups: { [string]: { any } } = {}
+		for k, hs in pairs(props) do
+			table.sort(hs)
+			local gs, cur = {}, { hs[1] }
+			for i = 2, #hs do
+				if hs[i] - hs[i - 1] > TERRAIN_SPLIT then gs[#gs + 1] = cur; cur = {} end
+				cur[#cur + 1] = hs[i]
+			end
+			gs[#gs + 1] = cur
+			local out2 = {}
+			for _, g in ipairs(gs) do
+				local sm = 0
+				for _, h in ipairs(g) do sm += h end
+				out2[#out2 + 1] = { lo = g[1], hi = g[#g], mean = sm / #g }
+			end
+			groups[k] = out2
+		end
+		local function shared(p: Vector3, h: number): number
+			for _, g in ipairs(groups[key(p)]) do
+				if h >= g.lo - 1e-9 and h <= g.hi + 1e-9 then return g.mean end
+			end
+			return h
+		end
+		for ti, te in ipairs(terrainEnds) do
+			local f = te.face
+			f.a = Vector3.new(f.a.X, shared(f.a, want[ti][1]), f.a.Z)
+			f.b = Vector3.new(f.b.X, shared(f.b, want[ti][2]), f.b.Z)
+		end
+		-- A STEP THE CORNERS CALL ONE LEVEL IS NOT AN EDGE. Two nodes of one
+		-- region meeting at a 1 to 2.5 stud step are not neighbours (over
+		-- TERRAIN_FLUSH), so each has a face on the shared side -- but the corners
+		-- snap together (under TERRAIN_SPLIT), and the two faces then run over
+		-- the same two points in opposite directions: a two-face loop the walk
+		-- cannot leave (islands: r001's rim open at -8,40,-212). Both go.
+		local byRegion: { [any]: { [string]: any } } = {}
+		local function ek(a: Vector3, b: Vector3): string
+			return nodeKey(a) .. ">" .. nodeKey(b)
+		end
+		for _, te in ipairs(terrainEnds) do
+			local f = te.face
+			local r = f.cell.region
+			local t = byRegion[r]; if not t then t = {}; byRegion[r] = t end
+			t[ek(f.a, f.b)] = f
+		end
+		local dropFace: { [any]: boolean } = {}
+		for _, t in pairs(byRegion) do
+			for k, f in pairs(t) do
+				local twin = t[ek(f.b, f.a)]
+				if twin and not dropFace[f] then
+					dropFace[f] = true
+					dropFace[twin] = true
+				end
+			end
+		end
+		if next(dropFace) then
+			for r, list in pairs(out) do
+				local kept = {}
+				for _, f in ipairs(list) do
+					if not dropFace[f] then kept[#kept + 1] = f end
+				end
+				out[r] = kept
+			end
+			stats.terrainTwins = 0
+			for _ in pairs(dropFace) do stats.terrainTwins += 1 end
 		end
 	end
 	return out, stats, diag
@@ -595,6 +717,7 @@ end
 -- Greedy nearest, capped. Past the cap the gap is not a seam artefact and
 -- closing it would invent boundary, so the loop is left open and reported --
 -- the same call `PathSimplify.closeMaxGap` makes one stage later.
+Boundary.skipTerrain = true -- terrain regions go to TerrainMesh
 Boundary.bridgeMax = 4.0   -- studs between the two ends; refuse beyond this
 
 function Boundary.bridge(faces: {any}, ids: {any}, step: number)
@@ -698,12 +821,20 @@ function Boundary.chain(faces: {any}, ids: {any}, cw: boolean?)
 		-- a pinch: keep the diagonally touching cells together by turning as
 		-- little as possible
 		local best, bestAng = nil, nil
+		-- the turn is measured IN THE PLANE ACROSS `up`: a terrain face climbs
+		-- with the ground, and an uphill direction read unflattened put the
+		-- angular successor on the wrong face (islands: 26 loops broken with
+		-- every node balanced). A part face already lies in that plane.
+		local dinF = din - up * din:Dot(up)
+		if dinF.Magnitude < 1e-6 then dinF = din end
+		dinF = dinF.Unit
 		for _, i in ipairs(cand) do
 			local f = faces[i]
 			local dout = (f.b - f.a)
+			dout -= up * dout:Dot(up)
 			if dout.Magnitude > 1e-9 then
 				dout = dout.Unit
-				local rev = -din
+				local rev = -dinF
 				local ang = math.atan2(rev:Cross(dout):Dot(up), rev:Dot(dout))
 				if ang <= 1e-9 then ang += 2 * math.pi end
 				if cw then ang = 2 * math.pi - ang end
@@ -1398,7 +1529,19 @@ function Boundary.trace(data: any, cfg: any?)
 		faces = fstats.faces, borderCells = fstats.cells,
 		wall = fstats.wall, drop = fstats.drop, edge = fstats.edge,
 		unlabelled = fstats.none, adjacency = fstats.pairs_, asymmetric = fstats.asymmetric }
+	-- terrain regions are meshed by TerrainMesh, not traced
+	local terrainRegion = {}
+	if Boundary.skipTerrain then
+		for _, g in ipairs(data.grids) do
+			if g.terrain then
+				for _, c in ipairs(g.cells) do
+					if c.region then terrainRegion[c.region] = true end
+				end
+			end
+		end
+	end
 	for r, faces in pairs(byRegion) do
+		if terrainRegion[r] then continue end
 		local ids, wstats = Boundary.weld(faces, step)
 		local bridged, loose = Boundary.bridge(faces, ids, step)
 		local loops, broken = Boundary.chain(faces, ids, cw)

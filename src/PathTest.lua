@@ -662,21 +662,33 @@ function PathTest.draw(result: any, path: any, opts: any?): (Folder, { Vector3 }
 		-- crossing on. Matched against the whole route, a 22 stud ridge bar took
 		-- its crossing off the stairs 20 studs below it (same plan position), and
 		-- the line kinked back to reach it.
+		-- THE FIRST CROSSING within barTol, and a bar the route does not cross
+		-- leaves the cursor where it was. Over terrain the route is pulled across
+		-- polygons, most chain portals lie off it, and each one moved the cursor
+		-- to wherever it came nearest -- once to the route's last stretch, so
+		-- every stair seam after it went unpinned and the line ran through
+		-- case4's wall.
 		local cursor = 2
 		local function nearOnBar(a: Vector3, b: Vector3): (Vector3, number)
 			local best, bd, bk = a, math.huge, cursor
-			for i = 0, 20 do
-				local q = a:Lerp(b, i / 20)
-				for k2 = cursor, #pts do
-					local p0, p1 = pts[k2 - 1], pts[k2]
-					local d = flatV(p1 - p0)
-					local dd = d:Dot(d)
+			for k2 = cursor, #pts do
+				local p0, p1 = pts[k2 - 1], pts[k2]
+				local d = flatV(p1 - p0)
+				local dd = d:Dot(d)
+				local sBest, sd = a, math.huge
+				for i = 0, 20 do
+					local q = a:Lerp(b, i / 20)
 					local t = dd > 1e-9 and math.clamp(flatV(q - p0):Dot(d) / dd, 0, 1) or 0
 					local dist = (flatV(p0 + (p1 - p0) * t) - flatV(q)).Magnitude
-					if dist < bd - 1e-6 or (math.abs(dist - bd) <= 1e-6 and k2 < bk) then best, bd, bk = q, dist, k2 end
+					if dist < sd - 1e-6 then sBest, sd = q, dist end
 				end
+				if sd <= PathTest.barTol then
+					best, bd, bk = sBest, sd, k2
+					break
+				end
+				if sd < bd - 1e-6 then best, bd, bk = sBest, sd, k2 end
 			end
-			cursor = bk
+			if bd <= PathTest.barTol then cursor = bk end
 			return best, bd
 		end
 		stepped = { pts[1] }

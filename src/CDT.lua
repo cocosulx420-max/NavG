@@ -1080,285 +1080,306 @@ function CDT.build(loops: { any }, data: any?): any
 		stats.regions += 1
 		local idxs = byRegion[r]
 
-		local outer, holes = nil, {}
+		local outers, allHoles = {}, {}
 		for _, i in ipairs(idxs) do
 			local L = loops[i]
 			if L.kind == "outer" then
-				if outer then outer = false elseif outer == nil then outer = i end
+				outers[#outers + 1] = i
 			elseif L.kind == "hole" then
-				holes[#holes + 1] = i
+				allHoles[#allHoles + 1] = i
 			end
 		end
-		if outer == nil or outer == false then
+		if #outers == 0 then
 			stats.skipped += 1
-			complaints[#complaints + 1] = (outer == false)
-				and ("r%03d: more than one outer rim, not meshed"):format(r)
-				or ("r%03d: no outer rim, not meshed"):format(r)
+			complaints[#complaints + 1] = ("r%03d: no outer rim, not meshed"):format(r)
 			continue
 		end
-
-		local up = loops[outer].regionUp or loops[outer].up
-		local e1, e2 = Rings.basis(up)
-		local origin = loops[outer].pts[1]
-
-		local m = newMesh()
-		local ringIdx = {}
-		local loX, loY, hiX, hiY = math.huge, math.huge, -math.huge, -math.huge
-		local uniq, seen = {}, {}
-
-		-- Flattened first, inserted second. The super-triangle has to be sized
-		-- off the finished extent, and the mesh's own vertex numbering only
-		-- exists once points start going in, so the rings are held here as
-		-- indices into `uniq` and remapped afterwards.
-		local function addRing(L: any)
-			local src = (CDT.collinear > 0)
-				and Triangulate.straighten(L.pts, CDT.collinear) or L.pts
-			stats.straightened += #L.pts - #src
-			local ring = {}
-			for _, p in ipairs(src) do
-				local d = p - origin
-				local x, y = d:Dot(e1), d:Dot(e2)
-				-- Coincident corners would make a zero-length constraint, and a
-				-- zero-length segment has no direction to insert along.
-				local key = ("%.5f,%.5f"):format(x, y)
-				local k = seen[key]
-				if not k then
-					uniq[#uniq + 1] = { x, y, p }
-					k = #uniq
-					seen[key] = k
-				end
-				ring[#ring + 1] = k
-				if x < loX then loX = x end
-				if y < loY then loY = y end
-				if x > hiX then hiX = x end
-				if y > hiY then hiY = y end
+		-- ONE MESH PER OUTER RIM. A region can have several: a patch of floor
+		-- inside a hole of its own region, reached some other way (terrain
+		-- islands: a ledge in a pit, joined round the side). Each rim is meshed
+		-- with the holes Rings put inside it; refusing the region lost a whole
+		-- island.
+		local groups = {}
+		if #outers == 1 then
+			groups[1] = { outer = outers[1], holes = allHoles }
+		else
+			stats.multiRim = (stats.multiRim or 0) + 1
+			local byOuter = {}
+			for _, o in ipairs(outers) do
+				byOuter[o] = { outer = o, holes = {} }
+				groups[#groups + 1] = byOuter[o]
 			end
-			ringIdx[#ringIdx + 1] = ring
-			return ring
+			for _, h in ipairs(allHoles) do
+				local par = loops[h].parent
+				if par and byOuter[par] then table.insert(byOuter[par].holes, h) end
+			end
 		end
+		for _, grp in ipairs(groups) do
+			local outer, holes = grp.outer, grp.holes
 
-		addRing(loops[outer])
-		for _, i in ipairs(holes) do
-			addRing(loops[i])
-			stats.holes += 1
-		end
+			local up = loops[outer].regionUp or loops[outer].up
+			local e1, e2 = Rings.basis(up)
+			local origin = loops[outer].pts[1]
 
-		-- A RING THAT CROSSES ITSELF IS A TRACE DEFECT AND IS SAID OUT LOUD.
-		-- The parity fill still returns something for one -- it has to, the
-		-- crossings make the two lobes read as inside and outside -- and that
-		-- something is a mesh that does not match the map. Reported here rather
-		-- than repaired, same rule as Rings.
-		for ri, ring in ipairs(ringIdx) do
-			local n = #ring
-			for i = 1, n do
-				for j = i + 2, n do
-					if not (i == 1 and j == n) then
-						local a, b = uniq[ring[i]], uniq[ring[i % n + 1]]
-						local c, d = uniq[ring[j]], uniq[ring[j % n + 1]]
-						local d1 = cross2(c[1], c[2], d[1], d[2], a[1], a[2])
-						local d2 = cross2(c[1], c[2], d[1], d[2], b[1], b[2])
-						local d3 = cross2(a[1], a[2], b[1], b[2], c[1], c[2])
-						local d4 = cross2(a[1], a[2], b[1], b[2], d[1], d[2])
-						if ((d1 > 0) ~= (d2 > 0)) and ((d3 > 0) ~= (d4 > 0)) then
-							stats.selfCross += 1
-							complaints[#complaints + 1] =
-								("r%03d ring%d: edge %d crosses edge %d, the ring is not simple")
-									:format(r, ri, i, j)
+			local m = newMesh()
+			local ringIdx = {}
+			local loX, loY, hiX, hiY = math.huge, math.huge, -math.huge, -math.huge
+			local uniq, seen = {}, {}
+
+			-- Flattened first, inserted second. The super-triangle has to be sized
+			-- off the finished extent, and the mesh's own vertex numbering only
+			-- exists once points start going in, so the rings are held here as
+			-- indices into `uniq` and remapped afterwards.
+			local function addRing(L: any)
+				local src = (CDT.collinear > 0)
+					and Triangulate.straighten(L.pts, CDT.collinear) or L.pts
+				stats.straightened += #L.pts - #src
+				local ring = {}
+				for _, p in ipairs(src) do
+					local d = p - origin
+					local x, y = d:Dot(e1), d:Dot(e2)
+					-- Coincident corners would make a zero-length constraint, and a
+					-- zero-length segment has no direction to insert along.
+					local key = ("%.5f,%.5f"):format(x, y)
+					local k = seen[key]
+					if not k then
+						uniq[#uniq + 1] = { x, y, p }
+						k = #uniq
+						seen[key] = k
+					end
+					ring[#ring + 1] = k
+					if x < loX then loX = x end
+					if y < loY then loY = y end
+					if x > hiX then hiX = x end
+					if y > hiY then hiY = y end
+				end
+				ringIdx[#ringIdx + 1] = ring
+				return ring
+			end
+
+			addRing(loops[outer])
+			for _, i in ipairs(holes) do
+				addRing(loops[i])
+				stats.holes += 1
+			end
+
+			-- A RING THAT CROSSES ITSELF IS A TRACE DEFECT AND IS SAID OUT LOUD.
+			-- The parity fill still returns something for one -- it has to, the
+			-- crossings make the two lobes read as inside and outside -- and that
+			-- something is a mesh that does not match the map. Reported here rather
+			-- than repaired, same rule as Rings.
+			for ri, ring in ipairs(ringIdx) do
+				local n = #ring
+				for i = 1, n do
+					for j = i + 2, n do
+						if not (i == 1 and j == n) then
+							local a, b = uniq[ring[i]], uniq[ring[i % n + 1]]
+							local c, d = uniq[ring[j]], uniq[ring[j % n + 1]]
+							local d1 = cross2(c[1], c[2], d[1], d[2], a[1], a[2])
+							local d2 = cross2(c[1], c[2], d[1], d[2], b[1], b[2])
+							local d3 = cross2(a[1], a[2], b[1], b[2], c[1], c[2])
+							local d4 = cross2(a[1], a[2], b[1], b[2], d[1], d[2])
+							if ((d1 > 0) ~= (d2 > 0)) and ((d3 > 0) ~= (d4 > 0)) then
+								stats.selfCross += 1
+								complaints[#complaints + 1] =
+									("r%03d ring%d: edge %d crosses edge %d, the ring is not simple")
+										:format(r, ri, i, j)
+							end
 						end
 					end
 				end
 			end
-		end
 
-		-- A super-triangle big enough that no input point is ever near its
-		-- circumcircle, sized off the region's own extent.
-		local ctrX, ctrY = (loX + hiX) * 0.5, (loY + hiY) * 0.5
-		local rad = math.max(hiX - loX, hiY - loY, 1) * 8
-		local s1 = addVertex(m, ctrX, ctrY + rad * 2, nil)
-		local s2 = addVertex(m, ctrX - rad * 2, ctrY - rad, nil)
-		local s3 = addVertex(m, ctrX + rad * 2, ctrY - rad, nil)
-		local root = newTri(m, s1, s2, s3)
+			-- A super-triangle big enough that no input point is ever near its
+			-- circumcircle, sized off the region's own extent.
+			local ctrX, ctrY = (loX + hiX) * 0.5, (loY + hiY) * 0.5
+			local rad = math.max(hiX - loX, hiY - loY, 1) * 8
+			local s1 = addVertex(m, ctrX, ctrY + rad * 2, nil)
+			local s2 = addVertex(m, ctrX - rad * 2, ctrY - rad, nil)
+			local s3 = addVertex(m, ctrX + rad * 2, ctrY - rad, nil)
+			local root = newTri(m, s1, s2, s3)
 
-		-- INSERTION ASSIGNS THE VERTEX NUMBER. `insertPoint` creates the vertex
-		-- it inserts, so the rings are remapped onto what it hands back; naming
-		-- a vertex before it is in the mesh leaves the rings pointing at
-		-- orphans that no triangle holds.
-		local hint = root
-		local vid = table.create(#uniq)
-		for k, u in ipairs(uniq) do
-			local p = insertPoint(m, u[1], u[2], u[3], hint)
-			vid[k] = p
-			if p then hint = m.vt[p] end
-		end
-		for _, ring in ipairs(ringIdx) do
-			for i = #ring, 1, -1 do
-				local p = vid[ring[i]]
-				if p then ring[i] = p else table.remove(ring, i) end
+			-- INSERTION ASSIGNS THE VERTEX NUMBER. `insertPoint` creates the vertex
+			-- it inserts, so the rings are remapped onto what it hands back; naming
+			-- a vertex before it is in the mesh leaves the rings pointing at
+			-- orphans that no triangle holds.
+			local hint = root
+			local vid = table.create(#uniq)
+			for k, u in ipairs(uniq) do
+				local p = insertPoint(m, u[1], u[2], u[3], hint)
+				vid[k] = p
+				if p then hint = m.vt[p] end
 			end
-		end
-
-		-- The ring vertices went in as points; now they become EDGES. Until this
-		-- runs the mesh knows nothing about which side of a wall is floor.
-		local failed = 0
-		for _, ring in ipairs(ringIdx) do
-			local n = #ring
-			for i = 1, n do
-				if not forceSegment(m, ring[i], ring[i % n + 1], 0) then failed += 1 end
+			for _, ring in ipairs(ringIdx) do
+				for i = #ring, 1, -1 do
+					local p = vid[ring[i]]
+					if p then ring[i] = p else table.remove(ring, i) end
+				end
 			end
-		end
-		if failed > 0 then
-			stats.unconstrained += failed
-			complaints[#complaints + 1] =
-				("r%03d: %d boundary edges could not be forced into the mesh"):format(r, failed)
-		end
 
-		markInside(m, s1)
-		-- PARITY NEEDS CLOSED CURVES. With an edge missing, the flood walks
-		-- through the gap without counting a crossing and every answer past it
-		-- inverts: case6's r001 lost two edges on one hole and got a missing
-		-- polygon of real floor plus triangles filling an inlet under a solid
-		-- strip 140 studs away. So when anything failed, ask each triangle's
-		-- centroid of the rings themselves -- inside the outer, in no hole.
-		if failed > 0 then
-			local function inRing(ring: { number }, x: number, y: number): boolean
-				local c, n = false, #ring
+			-- The ring vertices went in as points; now they become EDGES. Until this
+			-- runs the mesh knows nothing about which side of a wall is floor.
+			local failed = 0
+			for _, ring in ipairs(ringIdx) do
+				local n = #ring
 				for i = 1, n do
-					local a, b = ring[i], ring[i % n + 1]
-					local ay, by = m.py[a], m.py[b]
-					if (ay > y) ~= (by > y) then
-						local ax, bx = m.px[a], m.px[b]
-						if x < (bx - ax) * (y - ay) / (by - ay) + ax then c = not c end
+					if not forceSegment(m, ring[i], ring[i % n + 1], 0) then failed += 1 end
+				end
+			end
+			if failed > 0 then
+				stats.unconstrained += failed
+				complaints[#complaints + 1] =
+					("r%03d: %d boundary edges could not be forced into the mesh"):format(r, failed)
+			end
+
+			markInside(m, s1)
+			-- PARITY NEEDS CLOSED CURVES. With an edge missing, the flood walks
+			-- through the gap without counting a crossing and every answer past it
+			-- inverts: case6's r001 lost two edges on one hole and got a missing
+			-- polygon of real floor plus triangles filling an inlet under a solid
+			-- strip 140 studs away. So when anything failed, ask each triangle's
+			-- centroid of the rings themselves -- inside the outer, in no hole.
+			if failed > 0 then
+				local function inRing(ring: { number }, x: number, y: number): boolean
+					local c, n = false, #ring
+					for i = 1, n do
+						local a, b = ring[i], ring[i % n + 1]
+						local ay, by = m.py[a], m.py[b]
+						if (ay > y) ~= (by > y) then
+							local ax, bx = m.px[a], m.px[b]
+							if x < (bx - ax) * (y - ay) / (by - ay) + ax then c = not c end
+						end
 					end
+					return c
+				end
+				for t = 1, m.nt do
+					if not m.dead[t] then
+						local T = m.tri[t]
+						if T[1] == s1 or T[2] == s1 or T[3] == s1 or T[1] == s2 or T[2] == s2
+							or T[3] == s2 or T[1] == s3 or T[2] == s3 or T[3] == s3 then
+							m.inside[t] = false
+						else
+							local x = (m.px[T[1]] + m.px[T[2]] + m.px[T[3]]) / 3
+							local y = (m.py[T[1]] + m.py[T[2]] + m.py[T[3]]) / 3
+							local inside = inRing(ringIdx[1], x, y)
+							if inside then
+								for k = 2, #ringIdx do
+									if inRing(ringIdx[k], x, y) then inside = false; break end
+								end
+							end
+							m.inside[t] = inside
+						end
+					end
+				end
+				stats.parityRepaired = (stats.parityRepaired or 0) + 1
+			end
+			if CDT.refine and not refine(m, stats) then
+				stats.stalled += 1
+				complaints[#complaints + 1] =
+					("r%03d: refinement hit the %d operation cap, bounds not met")
+						:format(r, CDT.maxRefine)
+			end
+
+			local faces = {}
+			for t = 1, m.nt do
+				if m.inside[t] and not m.dead[t] then
+					local T = m.tri[t]
+					faces[#faces + 1] = { T[1], T[2], T[3] }
+					local a, maxL = quality(m, T[1], T[2], T[3])
+					if a < stats.minAngle then stats.minAngle = a end
+					if a < 15 then stats.slivers += 1 end
+					local b = math.min(8, math.max(1, math.floor(maxL / 0.5) + 1))
+					stats.edgeHist[b] = (stats.edgeHist[b] or 0) + 1
+				end
+			end
+			stats.tris += #faces
+
+			local pts2 = table.create(m.nv)
+			for i = 1, m.nv do pts2[i] = { x = m.px[i], y = m.py[i] } end
+			-- MERGE AND DECIMATE UNTIL NEITHER MOVES. One merge can make a vertex's
+			-- link convex and one removal can make two faces mergeable, so running
+			-- either to exhaustion on its own leaves work on the table.
+			local merged = faces
+			local settled = false
+			for round = 1, CDT.maxRounds do
+				local mg, f2 = mergeFaces(m, merged, pts2)
+				local rm, f3 = decimate(m, f2)
+				stats.merges += mg
+				stats.removed += rm
+				merged = f3
+				if mg == 0 and rm == 0 then
+					stats.rounds = math.max(stats.rounds, round)
+					settled = true
+					break
+				end
+			end
+			if not settled then
+				stats.rounds = math.max(stats.rounds, CDT.maxRounds)
+				stats.unsettled += 1
+				complaints[#complaints + 1] =
+					("r%03d: merge and decimation hit the %d round cap, still moving")
+						:format(r, CDT.maxRounds)
+			end
+
+			-- Lift. Traced corners keep the exact Vector3 they were traced at, and
+			-- segment midpoints keep the interpolation of theirs; only interior
+			-- Steiner points are reconstructed, onto the region's own floor plane.
+			local h = planeOffset(cellsOf and (cellsOf :: any)[r], origin, up)
+			local base = origin + up * h
+			local cache = {}
+			local function W(i: number): Vector3
+				local w = m.world[i]
+				if w then return w end
+				local c = cache[i]
+				if not c then
+					c = base + e1 * m.px[i] + e2 * m.py[i]
+					cache[i] = c
 				end
 				return c
 			end
-			for t = 1, m.nt do
-				if not m.dead[t] then
-					local T = m.tri[t]
-					if T[1] == s1 or T[2] == s1 or T[3] == s1 or T[1] == s2 or T[2] == s2
-						or T[3] == s2 or T[1] == s3 or T[2] == s3 or T[3] == s3 then
-						m.inside[t] = false
-					else
-						local x = (m.px[T[1]] + m.px[T[2]] + m.px[T[3]]) / 3
-						local y = (m.py[T[1]] + m.py[T[2]] + m.py[T[3]]) / 3
-						local inside = inRing(ringIdx[1], x, y)
-						if inside then
-							for k = 2, #ringIdx do
-								if inRing(ringIdx[k], x, y) then inside = false; break end
-							end
+
+			local made = 0
+			for _, f in ipairs(merged) do
+				local n = #f
+				local verts = table.create(n)
+				for i = 1, n do verts[i] = W(f[i]) end
+
+				-- Area and centroid by fanning from the first corner. For a CONVEX
+				-- face the fan stays inside, so the area-weighted centroid is the
+				-- real one, and the centroid is the search node.
+				local area, acc = 0, Vector3.zero
+				for i = 2, n - 1 do
+					local A, B, C = verts[1], verts[i], verts[i + 1]
+					local a = 0.5 * (B - A):Cross(C - A).Magnitude
+					area += a
+					acc += (A + B + C) / 3 * a
+				end
+				if area >= Triangulate.minArea then
+					local worst = 180
+					for i = 1, n do
+						local a = verts[((i - 2) % n) + 1]
+						local b = verts[i]
+						local c = verts[(i % n) + 1]
+						local u1, u2 = a - b, c - b
+						local m1, m2 = u1.Magnitude, u2.Magnitude
+						if m1 > 1e-9 and m2 > 1e-9 then
+							local deg = math.deg(math.acos(
+								math.clamp(u1:Dot(u2) / (m1 * m2), -1, 1)))
+							if deg < worst then worst = deg end
 						end
-						m.inside[t] = inside
 					end
+					stats.byN[n] = (stats.byN[n] or 0) + 1
+					polys[#polys + 1] = { verts = verts, n = n, region = r, up = up,
+						area = area, centre = acc / area, minAngle = worst,
+						-- kept so anything still expecting a triangle keeps working
+						a = verts[1], b = verts[2], c = verts[3] }
+					stats.area += area
+					made += 1
 				end
 			end
-			stats.parityRepaired = (stats.parityRepaired or 0) + 1
+			stats.polys += made
+			if made > 0 then stats.done += 1 end
 		end
-		if CDT.refine and not refine(m, stats) then
-			stats.stalled += 1
-			complaints[#complaints + 1] =
-				("r%03d: refinement hit the %d operation cap, bounds not met")
-					:format(r, CDT.maxRefine)
-		end
-
-		local faces = {}
-		for t = 1, m.nt do
-			if m.inside[t] and not m.dead[t] then
-				local T = m.tri[t]
-				faces[#faces + 1] = { T[1], T[2], T[3] }
-				local a, maxL = quality(m, T[1], T[2], T[3])
-				if a < stats.minAngle then stats.minAngle = a end
-				if a < 15 then stats.slivers += 1 end
-				local b = math.min(8, math.max(1, math.floor(maxL / 0.5) + 1))
-				stats.edgeHist[b] = (stats.edgeHist[b] or 0) + 1
-			end
-		end
-		stats.tris += #faces
-
-		local pts2 = table.create(m.nv)
-		for i = 1, m.nv do pts2[i] = { x = m.px[i], y = m.py[i] } end
-		-- MERGE AND DECIMATE UNTIL NEITHER MOVES. One merge can make a vertex's
-		-- link convex and one removal can make two faces mergeable, so running
-		-- either to exhaustion on its own leaves work on the table.
-		local merged = faces
-		local settled = false
-		for round = 1, CDT.maxRounds do
-			local mg, f2 = mergeFaces(m, merged, pts2)
-			local rm, f3 = decimate(m, f2)
-			stats.merges += mg
-			stats.removed += rm
-			merged = f3
-			if mg == 0 and rm == 0 then
-				stats.rounds = math.max(stats.rounds, round)
-				settled = true
-				break
-			end
-		end
-		if not settled then
-			stats.rounds = math.max(stats.rounds, CDT.maxRounds)
-			stats.unsettled += 1
-			complaints[#complaints + 1] =
-				("r%03d: merge and decimation hit the %d round cap, still moving")
-					:format(r, CDT.maxRounds)
-		end
-
-		-- Lift. Traced corners keep the exact Vector3 they were traced at, and
-		-- segment midpoints keep the interpolation of theirs; only interior
-		-- Steiner points are reconstructed, onto the region's own floor plane.
-		local h = planeOffset(cellsOf and (cellsOf :: any)[r], origin, up)
-		local base = origin + up * h
-		local cache = {}
-		local function W(i: number): Vector3
-			local w = m.world[i]
-			if w then return w end
-			local c = cache[i]
-			if not c then
-				c = base + e1 * m.px[i] + e2 * m.py[i]
-				cache[i] = c
-			end
-			return c
-		end
-
-		local made = 0
-		for _, f in ipairs(merged) do
-			local n = #f
-			local verts = table.create(n)
-			for i = 1, n do verts[i] = W(f[i]) end
-
-			-- Area and centroid by fanning from the first corner. For a CONVEX
-			-- face the fan stays inside, so the area-weighted centroid is the
-			-- real one, and the centroid is the search node.
-			local area, acc = 0, Vector3.zero
-			for i = 2, n - 1 do
-				local A, B, C = verts[1], verts[i], verts[i + 1]
-				local a = 0.5 * (B - A):Cross(C - A).Magnitude
-				area += a
-				acc += (A + B + C) / 3 * a
-			end
-			if area >= Triangulate.minArea then
-				local worst = 180
-				for i = 1, n do
-					local a = verts[((i - 2) % n) + 1]
-					local b = verts[i]
-					local c = verts[(i % n) + 1]
-					local u1, u2 = a - b, c - b
-					local m1, m2 = u1.Magnitude, u2.Magnitude
-					if m1 > 1e-9 and m2 > 1e-9 then
-						local deg = math.deg(math.acos(
-							math.clamp(u1:Dot(u2) / (m1 * m2), -1, 1)))
-						if deg < worst then worst = deg end
-					end
-				end
-				stats.byN[n] = (stats.byN[n] or 0) + 1
-				polys[#polys + 1] = { verts = verts, n = n, region = r, up = up,
-					area = area, centre = acc / area, minAngle = worst,
-					-- kept so anything still expecting a triangle keeps working
-					a = verts[1], b = verts[2], c = verts[3] }
-				stats.area += area
-				made += 1
-			end
-		end
-		stats.polys += made
-		if made > 0 then stats.done += 1 end
 	end
 
 	return { tris = polys, stats = stats, complaints = complaints }
