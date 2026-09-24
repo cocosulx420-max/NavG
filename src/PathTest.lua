@@ -261,6 +261,125 @@ local function segment(a: Vector3, b: Vector3, colour: Color3, thick: number, pa
 	p.Parent = parent
 end
 
+-- STRAIGHTENING ACROSS THE MESH. The funnel is the shortest line through the
+-- polygons A* picked, and no shorter: where a better polygon sat next to the
+-- chosen one (a wide gate beside a sliver's pinhole) the line still bends
+-- through the pinhole. So each stretch is tried as a straight line walked
+-- across the mesh itself, polygon to polygon through WALK links only -- the
+-- way Detour's raycast smooths a path -- and kept where it holds. Drops and
+-- jumps are never shortcut through.
+local WALK = { shared = true, seam = true, bridge = true }
+local function inPoly(f: any, p: Vector3, tol: number): boolean
+	local v = f.verts
+	local n = #v
+	for k = 1, n do
+		local a, b = v[k], v[k % n + 1]
+		local cross = (b.X - a.X) * (p.Z - a.Z) - (b.Z - a.Z) * (p.X - a.X)
+		local len = math.sqrt((b.X - a.X) ^ 2 + (b.Z - a.Z) ^ 2)
+		if cross > tol * math.max(len, 1e-6) then return false end
+	end
+	return true
+end
+local function heightOn(f: any, p: Vector3): number
+	local c, up = f.centre, f.up
+	if math.abs(up.Y) < 1e-3 then return c.Y end
+	return c.Y - ((p.X - c.X) * up.X + (p.Z - c.Z) * up.Z) / up.Y
+end
+-- where segment a->b (plan) crosses segment u->w, as params along each
+local function cross2(a: Vector3, b: Vector3, u: Vector3, w: Vector3): (number?, number?)
+	local dx, dz = b.X - a.X, b.Z - a.Z
+	local ex, ez = w.X - u.X, w.Z - u.Z
+	local den = dx * ez - dz * ex
+	if math.abs(den) < 1e-9 then return nil, nil end
+	local s = ((u.X - a.X) * ez - (u.Z - a.Z) * ex) / den
+	local r = ((u.X - a.X) * dz - (u.Z - a.Z) * dx) / den
+	return s, r
+end
+local function walkRay(mesh: any, adj: any, from: number, a: Vector3, b: Vector3, targets: { [number]: boolean },
+	prof: any?, banned: any?, visited: { number }): boolean
+	local cur, t = from, 0
+	for _ = 1, 512 do
+		if targets[cur] then return true end
+		local v = mesh.tris[cur].verts
+		local n = #v
+		-- the edge the ray leaves through: first crossing past t, going outward
+		local tExit = math.huge
+		for k = 1, n do
+			local u, w = v[k], v[k % n + 1]
+			local sR, rE = cross2(a, b, u, w)
+			if sR and sR > t + 1e-6 and rE >= -1e-4 and rE <= 1 + 1e-4 then
+				-- outward: the ray heads to the edge's positive side, which is outside
+				-- (interior is the negative side, as in locate)
+				local outward = ((w.X - u.X) * (b.Z - a.Z) - (w.Z - u.Z) * (b.X - a.X)) > 0
+				if outward and sR < tExit then tExit = sR end
+			end
+		end
+		if tExit >= 1 then return false end -- ends in a polygon that is not the target
+		local x = a:Lerp(b, tExit)
+		local nextPoly, nextT = nil, nil
+		for _, e in ipairs(adj[cur] or {}) do
+			local L = e.L
+			if WALK[L.kind] and usable(mesh, e, prof, banned) then
+				local near1, near2 = L.left, L.right
+				local far1, far2 = L.bLeft, L.bRight
+				if e.reverse and far1 and far2 then near1, near2, far1, far2 = far1, far2, near1, near2 end
+				local sN, rN = cross2(a, b, near1, near2)
+				if sN and math.abs(sN - tExit) < 0.02 and rN >= -0.02 and rN <= 1.02 then
+					if far1 and far2 then
+						local sF, rF = cross2(a, b, far1, far2)
+						if sF and sF >= tExit - 1e-3 and sF < 1 and rF >= -0.02 and rF <= 1.02 then
+							nextPoly, nextT = e.to, sF
+						end
+					else
+						nextPoly, nextT = e.to, tExit
+					end
+					if nextPoly then break end
+				end
+			end
+		end
+		if not nextPoly then return false end
+		visited[#visited + 1] = nextPoly
+		cur, t = nextPoly, nextT :: number
+	end
+	return false
+end
+local function straighten(mesh: any, adj: any, pts: { Vector3 }, corridor: { number }, prof: any?, banned: any?): ({ Vector3 }, { number })
+	if #pts <= 2 then return pts, {} end
+	-- which corridor polygons hold each point
+	local holds = {}
+	for k, p in ipairs(pts) do
+		local t = {}
+		for _, i in ipairs(corridor) do
+			local f = mesh.tris[i]
+			if inPoly(f, p, 0.05) and math.abs(heightOn(f, p) - p.Y) < 1.0 then t[i] = true end
+		end
+		holds[k] = t
+	end
+	local out, seen = { pts[1] }, {}
+	local i = 1
+	while i < #pts do
+		local jBest = i + 1
+		for j = #pts, i + 2, -1 do
+			local ok = false
+			local visited = {}
+			for start in pairs(holds[i]) do
+				table.clear(visited)
+				if walkRay(mesh, adj, start, pts[i], pts[j], holds[j], prof, banned, visited) then ok = true break end
+			end
+			if ok then
+				jBest = j
+				for _, pv in ipairs(visited) do seen[pv] = true end
+				break
+			end
+		end
+		out[#out + 1] = pts[jBest]
+		i = jBest
+	end
+	local extra = {}
+	for pv in pairs(seen) do extra[#extra + 1] = pv end
+	return out, extra
+end
+
 function PathTest.solve(result: any, sp: Vector3, gp: Vector3, prof: any?, banned: any?): (any, string)
 	local mesh, res = result.mesh, result.portals
 	result._pathAdj = result._pathAdj or graph(res)
@@ -275,6 +394,10 @@ function PathTest.solve(result: any, sp: Vector3, gp: Vector3, prof: any?, banne
 			:format(s, mesh.tris[s].region, g, mesh.tris[g].region)
 	end
 	local pts = funnel(sFloor, gFloor, portalsOf(mesh, chain))
+	local corridor = { s }
+	for _, st in ipairs(chain) do corridor[#corridor + 1] = st.e.to end
+	local extra
+	pts, extra = straighten(mesh, result._pathAdj, pts, corridor, prof, banned)
 	local len = 0
 	for k = 2, #pts do len += (pts[k] - pts[k - 1]).Magnitude end
 	local kinds = {}
@@ -282,7 +405,7 @@ function PathTest.solve(result: any, sp: Vector3, gp: Vector3, prof: any?, banne
 	local ks = {}
 	for k, v in pairs(kinds) do ks[#ks + 1] = k .. " " .. v end
 	table.sort(ks)
-	return { points = pts, chain = chain, from = s, to = g },
+	return { points = pts, chain = chain, from = s, to = g, extra = extra },
 		("%d polygons, %d portals (%s), %d corners, %.1f studs")
 			:format(#chain + 1, #chain, table.concat(ks, ", "), #pts, len)
 end
@@ -300,6 +423,8 @@ function PathTest.draw(result: any, path: any): Folder
 	local mesh = result.mesh
 	local corridor = { path.from }
 	for _, st in ipairs(path.chain) do corridor[#corridor + 1] = st.e.to end
+	-- and the polygons a straightened stretch crossed
+	for _, pv in ipairs(path.extra or {}) do corridor[#corridor + 1] = pv end
 	local function surfaceAt(p: Vector3): Vector3
 		for _, i in ipairs(corridor) do
 			local poly = mesh.tris[i]
