@@ -42,6 +42,30 @@ local DIAG = { {1,1}, {-1,1}, {-1,-1}, {1,-1} }
 -- agent's shoulders and prunes handrails at the CELL level; this gate decides
 -- whether a surviving region is worth tracing, and a crawl space is narrower
 -- than shoulders by definition.
+-- A REGION TOO SMALL TO STAND ON IS FLOOR YOU CROSS. Trims, lips and strip
+-- ends of a few cells meshed into slivers and pinhole gates: on case6, 933
+-- regions under 4 sq studs, and every route over an eave threaded a chain of
+-- them. Below minArea a region is left untraced, like one too narrow, and the
+-- portals bridge across it. nil turns this off.
+Boundary.minArea = 4.0 :: number?
+
+local function areaOk(data: any, out: { [number]: boolean }): { [number]: boolean }
+	local minA = Boundary.minArea
+	if not minA then return out end
+	local step = data.config.step or 0.5
+	local area: { [number]: number } = {}
+	for _, g in ipairs(data.grids) do
+		for _, cell in ipairs(g.cells) do
+			local r = cell.region
+			if r and out[r] then area[r] = (area[r] or 0) + (cell.su or step) * (cell.sv or step) end
+		end
+	end
+	for r in pairs(out) do
+		if (area[r] or 0) < minA then out[r] = nil end
+	end
+	return out
+end
+
 local function liveRegions(data: any): { [number]: boolean }
 	if data.liveCache then return data.liveCache end
 	local c = data.config
@@ -52,8 +76,8 @@ local function liveRegions(data: any): { [number]: boolean }
 	local out = {}
 	if k <= 1 then
 		for r in ipairs(data.stats.regionSizes or {}) do out[r] = true end
-		data.liveCache = out
-		return out
+		data.liveCache = areaOk(data, out)
+		return data.liveCache
 	end
 
 	for _, g in ipairs(data.grids) do
@@ -92,8 +116,8 @@ local function liveRegions(data: any): { [number]: boolean }
 			end
 		end
 	end
-	data.liveCache = out
-	return out
+	data.liveCache = areaOk(data, out)
+	return data.liveCache
 end
 Boundary.liveRegions = liveRegions
 
