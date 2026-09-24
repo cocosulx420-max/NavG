@@ -35,6 +35,7 @@ TerrainMesh.mergeDev = 1.5     -- studs a merged polygon's vertex may sit off it
 TerrainMesh.bumpTol = 0.5
 TerrainMesh.boundW = 2         -- weight of the rim's side planes, per stud of rim
 TerrainMesh.claimDrop = 2.0    -- studs a cell may sit off the polygon it is claimed into
+TerrainMesh.tile = 128         -- studs; terrain is simplified tile by tile
 -- THE RIM IS HELD, NOT WEIGHTED. The side-plane quadric alone let rim edges cut
 -- across the ground beside case4's walls. A rim vertex is removed only while
 -- every rim node it stood for stays within rimTol (plan) of the new rim edge.
@@ -74,7 +75,7 @@ end
 TerrainMesh.edgeLift = 0.5
 TerrainMesh.edgeTop = 2.5
 
-function TerrainMesh.triangulate(cells: { any }, step: number, exclude: { Instance }?, stats: any?): { { any } }
+function TerrainMesh.triangulate(cells: { any }, step: number, exclude: { Instance }?, stats: any?, onProgress: ((number, number?) -> ())?): { { any } }
 	local rp = RaycastParams.new()
 	rp.FilterType = Enum.RaycastFilterType.Exclude
 	local ex = { workspace.Terrain :: Instance }
@@ -126,7 +127,8 @@ function TerrainMesh.triangulate(cells: { any }, step: number, exclude: { Instan
 		return best
 	end
 	local tris = {}
-	for _, A in ipairs(cells) do
+	for ci, A in ipairs(cells) do
+		if onProgress and ci % 2000 == 0 then onProgress(ci, #cells) end
 		local bx, bz = math.floor(A.pos.X / step), math.floor(A.pos.Z / step)
 		local B, D = pick(A, bx + 1, bz), pick(A, bx, bz + 1)
 		local C = pick(A, bx + 1, bz + 1)
@@ -145,10 +147,20 @@ function TerrainMesh.triangulate(cells: { any }, step: number, exclude: { Instan
 				tris[#tris + 1] = { A, D, B }; tris[#tris + 1] = { B, D, C }
 			end
 		else
-			if ab and bc and ac then tris[#tris + 1] = { A, C, B } end
-			if ad and dc and ac then tris[#tris + 1] = { A, D, C } end
-			if ab and ad and bd and not (bc and dc) then tris[#tris + 1] = { A, D, B } end
-			if bc and dc and bd and not (ab and ad) then tris[#tris + 1] = { B, D, C } end
+			-- ONE DIAGONAL PER SQUARE. A triangle on each diagonal overlapped, and
+			-- the shared edge had three owners (4432 on the Dorne heightmap). The
+			-- diagonal that makes more triangles wins, the shorter on a tie.
+			local onAC = {}
+			if ac and ab and bc then onAC[#onAC + 1] = { A, C, B } end
+			if ac and ad and dc then onAC[#onAC + 1] = { A, D, C } end
+			local onBD = {}
+			if bd and ab and ad then onBD[#onBD + 1] = { A, D, B } end
+			if bd and bc and dc then onBD[#onBD + 1] = { B, D, C } end
+			local pickAC = #onAC > #onBD
+			if #onAC == #onBD and #onAC > 0 then
+				pickAC = (A.pos - C.pos).Magnitude <= (B.pos - D.pos).Magnitude
+			end
+			for _, t in ipairs(pickAC and onAC or onBD) do tris[#tris + 1] = t end
 		end
 	end
 	if stats then stats.edgesBlocked = nBlocked end
@@ -173,7 +185,8 @@ end
 -- Returns vertex positions, the node each vertex is, and the live triangles
 -- (vertex ids, wound with the interior on the negative side as elsewhere in
 -- NavG). Stats go in `stats`.
-function TerrainMesh.simplify(src: { { any } }, stats: any): ({ Vector3 }, { any }, { { number } })
+-- `locked`: nodes that may not be collapsed away (a tile's border, see build).
+function TerrainMesh.simplify(src: { { any } }, stats: any, locked: { [any]: boolean }?): ({ Vector3 }, { any }, { { number } }, { number })
 	local vid: { [any]: number } = {}
 	local pos: { Vector3 } = {}
 	local nodeOf: { any } = {}
@@ -192,7 +205,6 @@ function TerrainMesh.simplify(src: { { any } }, stats: any): ({ Vector3 }, { any
 	local nV = #pos
 	local band = table.create(nV, 0)
 	for i = 1, nV do band[i] = bandOf(nodeOf[i].clearance or math.huge) end
-	stats.band = band
 
 	local vtris: { { [number]: boolean } } = table.create(nV)
 	for i = 1, nV do vtris[i] = {} end
@@ -360,7 +372,7 @@ function TerrainMesh.simplify(src: { { any } }, stats: any): ({ Vector3 }, { any
 				local t = tris[ti]
 				if t[1] == v or t[2] == v or t[3] == v then shared[#shared + 1] = ti else onlyU[#onlyU + 1] = ti end
 			end
-			if #shared > 0 and band[u] == band[v] then
+			if #shared > 0 and band[u] == band[v] and not (locked and locked[nodeOf[u]]) then
 				-- link condition: the common neighbours are exactly the shared
 				-- triangles' third vertices, or the collapse pinches the surface
 				local nu, nv = {}, {}
@@ -428,17 +440,17 @@ function TerrainMesh.simplify(src: { { any } }, stats: any): ({ Vector3 }, { any
 	for _, t in ipairs(tris) do
 		if t.alive then live[#live + 1] = { t[1], t[2], t[3] } end
 	end
-	stats.triangles = #src
-	stats.collapses = collapses
-	stats.simplified = #live
-	return pos, nodeOf, live
+	stats.triangles = (stats.triangles or 0) + #src
+	stats.collapses = (stats.collapses or 0) + collapses
+	stats.simplified = (stats.simplified or 0) + #live
+	return pos, nodeOf, live, band
 end
 
 -- ------------------------------------------------------------ 3. merge
 -- CONVEX BOTH WAYS: from above (what the pathfinder's in-polygon tests use) and
 -- in the polygon's own plane. From above alone let 24 of 612 through that
 -- turned back up to 11.5 degrees on their slope.
-function TerrainMesh.merge(pos: { Vector3 }, tris: { { number } }, stats: any, band: { number }?): { any }
+function TerrainMesh.merge(pos: { Vector3 }, tris: { { number } }, stats: any, band: { number }?, fixed: { [number]: boolean }?): { any }
 	local cosAngle = math.cos(math.rad(TerrainMesh.mergeAngle))
 	local polys = {}
 	for _, t in ipairs(tris) do
@@ -518,7 +530,7 @@ function TerrainMesh.merge(pos: { Vector3 }, tris: { { number } }, stats: any, b
 	end
 	local out = {}
 	for _, p in ipairs(polys) do if not p.dead then out[#out + 1] = p end end
-	stats.merges = merged
+	stats.merges = (stats.merges or 0) + merged
 	-- A STRAIGHT RIM IS ONE EDGE. A vertex no other polygon uses, in line with
 	-- its neighbours, is dropped: headroom bands along an eave left a straight
 	-- wall's rim in 2 stud pieces. Only unshared vertices, so every shared edge
@@ -534,7 +546,7 @@ function TerrainMesh.merge(pos: { Vector3 }, tris: { { number } }, stats: any, b
 			local a, b, c = pos[vs[(k - 2) % n + 1]], pos[vs[k]], pos[vs[k % n + 1]]
 			local ac = c - a
 			local t = ac:Dot(ac) > 1e-9 and math.clamp((b - a):Dot(ac) / ac:Dot(ac), 0, 1) or 0
-			if uses[vs[k]] == 1 and (a + ac * t - b).Magnitude <= 0.05 then
+			if uses[vs[k]] == 1 and not (fixed and fixed[vs[k]]) and (a + ac * t - b).Magnitude <= 0.05 then
 				table.remove(vs, k)
 				dropped += 1
 			else
@@ -542,7 +554,7 @@ function TerrainMesh.merge(pos: { Vector3 }, tris: { { number } }, stats: any, b
 			end
 		end
 	end
-	stats.collinearDropped = dropped
+	stats.collinearDropped = (stats.collinearDropped or 0) + dropped
 	return out
 end
 
@@ -572,10 +584,66 @@ function TerrainMesh.build(data: any, mesh: any): any
 		local x = workspace:FindFirstChild(n)
 		if x then ex[#ex + 1] = x end
 	end
-	local tris = TerrainMesh.triangulate(cells, step, ex, stats)
-	local pos, nodeOf, live = TerrainMesh.simplify(tris, stats)
-	local polys = TerrainMesh.merge(pos, live, stats, stats.band)
-	stats.band = nil
+	local onProgress = data.config and data.config.onProgress
+	local tris = TerrainMesh.triangulate(cells, step, ex, stats, onProgress)
+
+	-- TILES, THEN THE WHOLE. One pass over a whole map held every triangle,
+	-- quadric and heap entry at once -- a 2 km heightmap is ~2 million
+	-- triangles. Each tile is simplified first with its border nodes LOCKED
+	-- (a node whose triangles fall in two tiles), which removes most of them;
+	-- the survivors, a fraction of the count, are then simplified and merged
+	-- as one mesh, so the tile borders collapse too and leave no seam.
+	local T = TerrainMesh.tile
+	local byTile: { [string]: { any } } = {}
+	local tileOrder: { string } = {}
+	local tileOfNode: { [any]: string } = {}
+	local locked: { [any]: boolean } = {}
+	for _, t in ipairs(tris) do
+		local cx = (t[1].pos.X + t[2].pos.X + t[3].pos.X) / 3
+		local cz = (t[1].pos.Z + t[2].pos.Z + t[3].pos.Z) / 3
+		local k = math.floor(cx / T) .. ":" .. math.floor(cz / T)
+		local b = byTile[k]
+		if not b then b = {}; byTile[k] = b; tileOrder[#tileOrder + 1] = k end
+		b[#b + 1] = t
+		for j = 1, 3 do
+			local c = t[j]
+			local was = tileOfNode[c]
+			if not was then tileOfNode[c] = k elseif was ~= k then locked[c] = true end
+		end
+	end
+	stats.tiles = #tileOrder
+	local nTris = #tris
+	tris = nil :: any
+	local reduced: { { any } } = {}
+	for ti, k in ipairs(tileOrder) do
+		local _, nodeOf, live = TerrainMesh.simplify(byTile[k], stats, locked)
+		byTile[k] = nil
+		for _, t in ipairs(live) do reduced[#reduced + 1] = { nodeOf[t[1]], nodeOf[t[2]], nodeOf[t[3]] } end
+		if onProgress then onProgress(ti, #tileOrder) end
+	end
+	stats.tileTris = #reduced
+	local whole: any = {}
+	local pos0, nodeOf0, live0, band0 = TerrainMesh.simplify(reduced, whole, nil)
+	reduced = nil :: any
+	stats.triangles = nTris
+	stats.collapses = (stats.collapses or 0) + (whole.collapses or 0)
+	stats.simplified = #live0
+	if onProgress then onProgress(0, nil) end
+	local polys: { any } = {}
+	for _, p in ipairs(TerrainMesh.merge(pos0, live0, stats, band0)) do
+		local vs = table.create(#p.verts)
+		for j, id in ipairs(p.verts) do vs[j] = nodeOf0[id] end
+		polys[#polys + 1] = { verts = vs, n = p.n }
+	end
+	local nodeId: { [any]: number } = {}
+	local pos: { Vector3 } = {}
+	for _, p in ipairs(polys) do
+		for j, c in ipairs(p.verts) do
+			local id = nodeId[c]
+			if not id then id = #pos + 1; nodeId[c] = id; pos[id] = c.pos end
+			p.verts[j] = id
+		end
+	end
 
 	-- regions: one per mesh-connected piece, numbered past every region in use
 	local maxRegion = 0
@@ -675,7 +743,8 @@ function TerrainMesh.build(data: any, mesh: any): any
 	end
 	local polyOf: { [any]: number } = {}
 	local orphan = nil
-	for _, c in ipairs(cells) do
+	for ci, c in ipairs(cells) do
+		if onProgress and ci % 5000 == 0 then onProgress(ci, #cells) end
 		local p = c.pos
 		local hit, hd, hp = nil, math.huge, math.huge
 		for _, i in ipairs(buck[math.floor(p.X / B) .. ":" .. math.floor(p.Z / B)] or {}) do
@@ -707,9 +776,9 @@ end
 function TerrainMesh.report(mesh: any): string
 	local s = mesh.terrain
 	if not s or s.cells == 0 then return "terrain   none" end
-	return ("terrain   %d nodes -> %d tris -> %d after %d collapses -> %d polys (%d merges), %d regions; cells %d inside, %d nearby, %d unclaimed; %d edges through parts refused, %d in-line rim vertices dropped (%.2fs)")
+	return ("terrain   %d nodes -> %d tris -> %d after %d collapses -> %d polys (%d merges), %d regions; %d tiles; cells %d inside, %d nearby, %d unclaimed; %d edges through parts refused, %d in-line rim vertices dropped (%.2fs)")
 		:format(s.cells, s.triangles, s.simplified, s.collapses, s.polys, s.merges, s.regions,
-			s.claimed, s.nearby, s.unclaimed, s.edgesBlocked or 0, s.collinearDropped or 0, s.seconds)
+			s.tiles or 1, s.claimed, s.nearby, s.unclaimed, s.edgesBlocked or 0, s.collinearDropped or 0, s.seconds)
 end
 
 return TerrainMesh

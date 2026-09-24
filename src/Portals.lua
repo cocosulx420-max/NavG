@@ -223,6 +223,9 @@ local function claimCells(mesh: any, data: any, stats: any): { [any]: number }
 
 	local of: { [any]: number } = {}
 	for _, grid in ipairs(data.grids) do
+		-- terrain cells are claimed by TerrainMesh, from above; tried here each
+		-- one scanned every polygon of its region, ~10^10 tests on a heightmap
+		if grid.terrain then continue end
 		for _, cell in ipairs(grid.cells) do
 			local r = cell.region
 			local g = r and byRegion[r]

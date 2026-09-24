@@ -309,11 +309,13 @@ function Leaps.build(mesh: any, data: any, res: any, debugExclude: { Instance }?
 				continue
 			end
 			-- a landing on polygon j: the way down must be open, up to the HEAD at
-			-- the pass. To the feet only, a drop off a stair tread's side into the
-			-- space under the next tread passed, and its reverse was a jump up
-			-- through the staircase (case4, Cocosulx).
+			-- the pass -- the top of the blade `passes` swept, no higher. To the feet
+			-- only, a drop off a stair tread's side into the space under the next
+			-- tread passed, and its reverse was a jump up through the staircase
+			-- (case4). 0.4 above the blade refused case6's drops under a 3.3 beam.
 			local land = hit.Position
-			if ray(land + UP * 0.05, from + UP * body - (land + UP * 0.05)) then return nil, nil, nil, nil, 0 end
+			local head = from + UP * (body - 0.1 - Leaps.lift)
+			if ray(land + UP * 0.05, head - (land + UP * 0.05)) then return nil, nil, nil, nil, 0 end
 			-- too close to something the body would catch on: try further out
 			if not fallClear(from, land, outward) then stats.caught += 1; crossed = true; continue end
 			if joinedNear(i, j, p) then

@@ -315,6 +315,7 @@ end
 -- Probes between yields when a caller opts into progress. Small enough that one
 -- chunk is a frame's worth of work, large enough that the yield is not the cost.
 SVO.probeBudget = 2000
+SVO.maxProbe = 2048 -- studs; Roblox's largest part size
 
 -- WHY THIS ONE CALL CAN WEDGE STUDIO, and what was done about it.
 --
@@ -367,6 +368,11 @@ function SVO:insertPartPrecise(part: BasePart, worldRoot: WorldRoot?, onYield: (
 	local n = 0
 	local function overlaps(nc: Vector3, nh: number): boolean
 		if not obbHitsCube(obb, nc, nh) then return false end
+		-- A PART IS AT MOST 2048 ON A SIDE, so a bigger probe is silently shrunk
+		-- to the middle of the cube and misses anything off-centre. A 4096 root
+		-- (a 2 km heightmap) dropped every mesh away from the map's centre. Too
+		-- big to probe: the box test above decides, and the descent goes on.
+		if nh * 2 > SVO.maxProbe then return true end
 		if onYield then
 			n += 1
 			if n >= SVO.probeBudget then n = 0; onYield() end

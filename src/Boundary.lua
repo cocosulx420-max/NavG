@@ -314,6 +314,9 @@ function Boundary.faces(data: any)
 		pairs_ = 0, asymmetric = 0, diagonals = 0 }
 
 	for _, g in ipairs(data.grids) do
+		-- terrain gets no faces when TerrainMesh meshes it (skipTerrain): its
+		-- cells stay in `live` above, so part faces still see them
+		if Boundary.skipTerrain and g.terrain then continue end
 		for _, cell in ipairs(g.cells) do
 			if cell.region and keep[cell.region] then
 				for bit, d in ipairs(DIR4) do
@@ -385,6 +388,9 @@ function Boundary.faces(data: any)
 		-- X x Z is DOWN: a world-aligned grid traced every loop backwards, outer
 		-- rims read as holes and holes as rims. Terrain faces use world up.
 		if g.terrain then up = Vector3.yAxis end
+		-- and none are emitted: skipping only the neighbour pass above made
+		-- every side of every terrain cell a face (4.65 million on a heightmap)
+		if Boundary.skipTerrain and g.terrain then continue end
 		for _, cell in ipairs(g.cells) do
 			local r = cell.region
 			if r and keep[r] then
